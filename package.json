@@ -1,0 +1,16 @@
+{
+  "name": "acl-worker",
+  "version": "1.0.0",
+  "description": "Worker de procesamiento asíncrono — Auditoría Cívica Liberal",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "dev": "node worker.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
