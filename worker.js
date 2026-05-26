@@ -38,13 +38,48 @@ app.post('/procesar', async (req, res) => {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
   }
 
-  // Responder inmediatamente — no hacemos esperar a Netlify
   res.json({ mensaje: 'Recibido, procesando en segundo plano', auditoria_id });
 
-  // Lanzar el proceso largo sin await — corre solo
   procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id).catch(err => {
     console.error(`❌ [${auditoria_id}] Error no capturado:`, err.message);
   });
+});
+
+// ── Verificar sesión de NotebookLM ───────────────────────────────────────────
+
+app.get('/verificar-sesion', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  console.log('\n🔍 Verificando sesión de NotebookLM...');
+  const rutaSesion = '/tmp/sesion-test.json';
+
+  try {
+    fs.writeFileSync(rutaSesion, process.env.SESION_GOOGLE, 'utf8');
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ storageState: rutaSesion });
+    const page = await context.newPage();
+
+    await page.goto('https://notebooklm.google.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(5000);
+
+    const url = page.url();
+    const viva = !url.includes('accounts.google.com');
+
+    await browser.close();
+    fs.unlinkSync(rutaSesion);
+
+    console.log(`   URL final: ${url}`);
+    console.log(`   Sesión: ${viva ? '✅ VIVA' : '❌ MUERTA'}`);
+
+    res.json({ viva, url, timestamp: new Date().toISOString() });
+
+  } catch (error) {
+    console.error('   Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ── Función principal ────────────────────────────────────────────────────────
@@ -64,19 +99,16 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
 
   try {
 
-    // PASO 1 — Descargar PDF original desde Drive
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando PDF de Drive...`);
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
     await descargarPDF(drive, pdf_drive_id, rutaPDF);
     console.log(`✅ [${auditoria_id}] PDF descargado`);
 
-    // PASO 2 — Leer configuración doctrinal desde la BD
     console.log(`📖 [${auditoria_id}] PASO 2: Leyendo configuración doctrinal...`);
     const config = await obtenerConfigDoctrinal();
     console.log(`✅ [${auditoria_id}] Usando prompt versión ${config.version}`);
 
-    // PASO 3 — Analizar con Claude y generar reporte
     console.log(`🧠 [${auditoria_id}] PASO 3: Analizando con Claude...`);
     await actualizarEstado(auditoria_id, 'analizando');
     const reporte = await analizarConClaude(rutaPDF, config);
@@ -88,26 +120,23 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
       [reporte, config.version, auditoria_id]
     );
 
-    // PASO 4 — NotebookLM: podcast, presentación y mapa mental
     console.log(`🎙️  [${auditoria_id}] PASO 4: Generando paquetes en NotebookLM...`);
     await actualizarEstado(auditoria_id, 'generando_paquetes');
     fs.writeFileSync(rutaSesion, process.env.SESION_GOOGLE, 'utf8');
     await ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlides, rutaMapa, auditoria_id);
     console.log(`✅ [${auditoria_id}] Paquetes generados`);
 
-    // PASO 5 — Subir archivos a Drive
     console.log(`☁️  [${auditoria_id}] PASO 5: Subiendo a Drive...`);
     await actualizarEstado(auditoria_id, 'subiendo_archivos');
     const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
 
     const links = {};
-    links.reporte = await subirArchivo(drive, rutaReporte, 'reporte.txt',        'text/plain',          carpetaId);
-    links.podcast = await subirArchivo(drive, rutaPodcast, 'podcast.wav',         'audio/wav',           carpetaId);
-    links.slides  = await subirArchivo(drive, rutaSlides,  'presentacion.pptx',   'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
-    links.mapa    = await subirArchivo(drive, rutaMapa,    'mapa-mental.png',      'image/png',           carpetaId);
+    links.reporte = await subirArchivo(drive, rutaReporte, 'reporte.txt',       'text/plain',          carpetaId);
+    links.podcast = await subirArchivo(drive, rutaPodcast, 'podcast.wav',        'audio/wav',           carpetaId);
+    links.slides  = await subirArchivo(drive, rutaSlides,  'presentacion.pptx',  'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
+    links.mapa    = await subirArchivo(drive, rutaMapa,    'mapa-mental.png',     'image/png',           carpetaId);
     console.log(`✅ [${auditoria_id}] Archivos subidos`);
 
-    // PASO 6 — Marcar como completada en la BD
     await db.query(
       `UPDATE auditorias
        SET estado = 'completada', link_podcast = $1, link_presentacion = $2, link_mapa = $3, completada_en = NOW()
@@ -115,7 +144,6 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
       [links.podcast, links.slides, links.mapa, auditoria_id]
     );
 
-    // PASO 7 — Email al ciudadano
     console.log(`✉️  [${auditoria_id}] PASO 7: Enviando email...`);
     await enviarEmail(ciudadano_email, auditoria_id, links);
 
@@ -187,14 +215,12 @@ async function ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlid
   const page = await context.newPage();
 
   try {
-    // Verificar sesión
     await page.goto('https://notebooklm.google.com');
     await page.waitForTimeout(5000);
     if (page.url().includes('accounts.google.com')) {
       throw new Error('Sesión de NotebookLM expirada. Renovar SESION_GOOGLE en Railway.');
     }
 
-    // Crear cuaderno y subir reporte
     await page.locator('text=Crear cuaderno nuevo').click();
     await page.waitForTimeout(5000);
     const [fileChooser] = await Promise.all([
@@ -207,7 +233,6 @@ async function ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlid
     if (await botonInsertar.isVisible().catch(() => false)) await botonInsertar.click();
     await page.waitForTimeout(5000);
 
-    // Generar y esperar podcast
     const cerrarModal = page.locator('button').filter({ hasText: 'close' }).last();
     if (await cerrarModal.isVisible().catch(() => false)) { await cerrarModal.click(); await page.waitForTimeout(1500); }
     await page.locator('button[aria-label="Personalizar el resumen de audio"]').click();
@@ -222,7 +247,6 @@ async function ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlid
     }
     console.log(`   [${auditoria_id}] Audio listo`);
 
-    // Generar presentación
     await page.keyboard.press('Escape'); await page.waitForTimeout(1000);
     await page.locator('button[aria-label="Personalizar la presentación de diapositivas"]').click();
     await page.waitForTimeout(2000);
@@ -235,7 +259,6 @@ async function ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlid
       await page.waitForTimeout(30000);
     }
 
-    // Descargar presentación
     let pptxOk = false;
     for (const btn of await page.locator('button[aria-label="Más"]').all()) {
       await btn.click().catch(() => {}); await page.waitForTimeout(800);
@@ -247,7 +270,6 @@ async function ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlid
     }
     if (!pptxOk) throw new Error('No se encontró opción PowerPoint');
 
-    // Descargar podcast
     let podcastOk = false;
     for (const btn of await page.locator('button[aria-label="Más"]').all()) {
       await btn.click().catch(() => {}); await page.waitForTimeout(800);
@@ -259,7 +281,6 @@ async function ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlid
     }
     if (!podcastOk) throw new Error('No se encontró opción Descargar para podcast');
 
-    // Generar mapa mental
     await page.keyboard.press('Escape'); await page.waitForTimeout(1000);
     await page.locator('button[aria-label="Personalizar mapa mental"]').click();
     await page.waitForTimeout(2000);
@@ -272,7 +293,6 @@ async function ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlid
       await page.waitForTimeout(30000);
     }
 
-    // Descargar mapa mental
     await page.locator('button[aria-label="Personalizar mapa mental"]').click();
     await page.waitForTimeout(5000);
     const cerrarMapa = page.locator('button').filter({ hasText: 'close' }).last();
