@@ -192,7 +192,7 @@ async function obtenerConfigDoctrinal() {
 async function analizarConClaude(rutaPDF, config) {
   const pdfBase64 = fs.readFileSync(rutaPDF).toString('base64');
   const respuesta = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: 8000,
     system: config.prompt_sistema,
     messages: [{
