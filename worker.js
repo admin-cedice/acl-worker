@@ -74,6 +74,11 @@ app.get('/verificar-sesion', async (req, res) => {
     console.log(`   URL final: ${url}`);
     console.log(`   Sesión: ${viva ? '✅ VIVA' : '❌ MUERTA'}`);
 
+    // Si la sesión está muerta, notificar a los admins
+    if (!viva) {
+      await alertarSesionExpirada();
+    }
+
     res.json({ viva, url, timestamp: new Date().toISOString() });
 
   } catch (error) {
@@ -371,6 +376,47 @@ async function enviarEmail(email, auditoria_id, links) {
   });
   if (!res.ok) throw new Error(`Error enviando email: ${await res.text()}`);
   console.log(`   ✅ Email enviado a ${email}`);
+}
+
+async function alertarSesionExpirada() {
+  try {
+    const result = await db.query(
+      `SELECT email FROM configuracion_alertas
+       WHERE tipo = 'sesion_notebooklm' AND activo = true`
+    );
+
+    const destinatarios = result.rows.map(r => r.email);
+    if (destinatarios.length === 0) {
+      console.log('   ⚠️  Sesión muerta pero no hay destinatarios de alerta configurados');
+      return;
+    }
+
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`
+      },
+      body: JSON.stringify({
+        from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+        to: destinatarios,
+        subject: '⚠️ Sesión de NotebookLM expirada',
+        html: `
+          <p>La sesión de NotebookLM ha expirado.</p>
+          <p>Las auditorías en cola fallarán hasta que se renueve.</p>
+          <p><strong>Acción requerida:</strong> Actualizar la variable
+          <code>SESION_GOOGLE</code> en Railway con una sesión fresca.</p>
+          <p><small>Aviso automático — ${new Date().toISOString()}</small></p>
+        `
+      })
+    });
+
+    if (!res.ok) throw new Error(await res.text());
+    console.log(`   📧 Alerta de sesión expirada enviada a: ${destinatarios.join(', ')}`);
+
+  } catch (err) {
+    console.error('   ❌ Error enviando alerta de sesión:', err.message);
+  }
 }
 
 // ── Arrancar servidor ────────────────────────────────────────────────────────
