@@ -109,8 +109,8 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     const config = await obtenerConfigDoctrinal();
     console.log(`✅ [${auditoria_id}] Usando prompt versión ${config.version}`);
 
-    console.log(`🧠 [${auditoria_id}] PASO 3: Analizando con Claude...`);
-    await actualizarEstado(auditoria_id, 'analizando');
+    console.log(`🧠 [${auditoria_id}] PASO 3: procesando con Claude...`);
+    await actualizarEstado(auditoria_id, 'procesando');
     const reporte = await analizarConClaude(rutaPDF, config);
     fs.writeFileSync(rutaReporte, reporte, 'utf8');
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} caracteres)`);
@@ -121,13 +121,13 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     );
 
     console.log(`🎙️  [${auditoria_id}] PASO 4: Generando paquetes en NotebookLM...`);
-    await actualizarEstado(auditoria_id, 'generando_paquetes');
+    await actualizarEstado(auditoria_id, 'empaquetando');
     fs.writeFileSync(rutaSesion, process.env.SESION_GOOGLE, 'utf8');
     await ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlides, rutaMapa, auditoria_id);
     console.log(`✅ [${auditoria_id}] Paquetes generados`);
 
     console.log(`☁️  [${auditoria_id}] PASO 5: Subiendo a Drive...`);
-    await actualizarEstado(auditoria_id, 'subiendo_archivos');
+    await actualizarEstado(auditoria_id, 'empaquetando');
     const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
 
     const links = {};
