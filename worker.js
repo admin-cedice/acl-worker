@@ -9,6 +9,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { Pool } = require('pg');
 const fs = require('fs');
 const path = require('path');
+const pdfParse = require('pdf-parse');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -94,8 +95,9 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
   const dirAuditoria = path.join(DIRECTORIO_TEMP, auditoria_id);
   fs.mkdirSync(dirAuditoria, { recursive: true });
 
-  const rutaPDF       = path.join(dirAuditoria, 'original.pdf');
-  const rutaReporte   = path.join(dirAuditoria, 'reporte.txt');
+  const rutaPDF        = path.join(dirAuditoria, 'original.pdf');
+  const rutaTXT        = path.join(dirAuditoria, 'original.txt');
+  const rutaReporte    = path.join(dirAuditoria, 'reporte.txt');
   const rutaReportePDF = path.join(dirAuditoria, 'reporte.pdf');
   const rutaPodcast = path.join(dirAuditoria, 'podcast.wav');
   const rutaSlides  = path.join(dirAuditoria, 'presentacion.pptx');
@@ -110,23 +112,31 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     await descargarPDF(drive, pdf_drive_id, rutaPDF);
     console.log(`✅ [${auditoria_id}] PDF descargado`);
 
-    console.log(`📖 [${auditoria_id}] PASO 2: Leyendo configuración doctrinal...`);
+    console.log(`📝 [${auditoria_id}] PASO 2: Extrayendo texto del PDF...`);
+    const textoPDF = await extraerTextoPDF(rutaPDF);
+    fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
+    console.log(`✅ [${auditoria_id}] Texto extraído (${textoPDF.length} caracteres)`);
+
+    console.log(`📖 [${auditoria_id}] PASO 3: Leyendo configuración doctrinal...`);
     const config = await obtenerConfigDoctrinal();
     console.log(`✅ [${auditoria_id}] Usando prompt versión ${config.version}`);
 
-    console.log(`🏷️  [${auditoria_id}] PASO 3: Extrayendo metadatos con Claude...`);
+    console.log(`🏷️  [${auditoria_id}] PASO 4: Extrayendo metadatos con Claude...`);
     await actualizarEstado(auditoria_id, 'procesando');
-    const metadatos = await extraerMetadatos(rutaPDF);
+    const metadatos = await extraerMetadatos(textoPDF);
     console.log(`✅ [${auditoria_id}] Metadatos: "${metadatos.titulo}" | ${metadatos.pais} | ${metadatos.categoria}`);
-    // Pausa para respetar el rate limit de tokens por minuto
-    await new Promise(resolve => setTimeout(resolve, 91000));
+
     await db.query(
       `UPDATE auditorias SET titulo_documento = $1, pais = $2, categoria = $3 WHERE id = $4`,
       [metadatos.titulo, metadatos.pais, metadatos.categoria, auditoria_id]
     );
 
-    console.log(`🧠 [${auditoria_id}] PASO 4: Analizando con Claude...`);
-    const reporte = await analizarConClaude(rutaPDF, config);
+    // Pausa para respetar el rate limit de tokens por minuto
+    console.log(`⏳ [${auditoria_id}] Esperando ventana de rate limit...`);
+    await new Promise(resolve => setTimeout(resolve, 90000));
+
+    console.log(`🧠 [${auditoria_id}] PASO 5: Analizando con Claude...`);
+    const reporte = await analizarConClaude(textoPDF, config);
     fs.writeFileSync(rutaReporte, reporte, 'utf8');
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} caracteres)`);
 
@@ -139,13 +149,13 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     await convertirTXTaPDF(rutaReporte, rutaReportePDF, metadatos.titulo);
     console.log(`✅ [${auditoria_id}] PDF del reporte generado`);
 
-    console.log(`🎙️  [${auditoria_id}] PASO 5: Generando paquetes en NotebookLM...`);
+    console.log(`🎙️  [${auditoria_id}] PASO 6: Generando paquetes en NotebookLM...`);
     await actualizarEstado(auditoria_id, 'empaquetando');
     fs.writeFileSync(rutaSesion, process.env.SESION_GOOGLE, 'utf8');
     await ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlides, rutaMapa, auditoria_id);
     console.log(`✅ [${auditoria_id}] Paquetes generados`);
 
-    console.log(`☁️  [${auditoria_id}] PASO 6: Subiendo a Drive...`);
+    console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo a Drive...`);
     await actualizarEstado(auditoria_id, 'empaquetando');
     const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
 
@@ -163,7 +173,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
       [links.reporte, links.podcast, links.slides, links.mapa, auditoria_id]
     );
 
-    console.log(`✉️  [${auditoria_id}] PASO 7: Enviando email...`);
+    console.log(`✉️  [${auditoria_id}] PASO 8: Enviando email...`);
     await enviarEmail(ciudadano_email, auditoria_id, links, metadatos.titulo);
 
     console.log(`\n🎉 [${auditoria_id}] Auditoría completada exitosamente`);
@@ -208,9 +218,18 @@ async function obtenerConfigDoctrinal() {
   return result.rows[0];
 }
 
-async function extraerMetadatos(rutaPDF) {
-  // Llamada rápida y enfocada: solo extrae título, país y categoría
-  const pdfBase64 = fs.readFileSync(rutaPDF).toString('base64');
+async function extraerTextoPDF(rutaPDF) {
+  const buffer = fs.readFileSync(rutaPDF);
+  const data = await pdfParse(buffer);
+  return data.text
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+async function extraerMetadatos(textoPDF) {
+  // Usar solo los primeros 3000 caracteres — suficiente para identificar el documento
+  const muestra = textoPDF.slice(0, 3000);
 
   const respuesta = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
@@ -219,16 +238,9 @@ async function extraerMetadatos(rutaPDF) {
 Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks, sin explicaciones.`,
     messages: [{
       role: 'user',
-      content: [
-        {
-          type: 'document',
-          source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 }
-        },
-        {
-          type: 'text',
-          text: `Analiza este documento y responde SOLO con este JSON:
+      content: `Analiza este fragmento de documento y responde SOLO con este JSON:
 {
-  "titulo": "título oficial completo del documento (sin siglas ni números de gaceta)",
+  "titulo": "título oficial completo del documento",
   "pais": "nombre del país al que se refiere, o 'Varios' si es comparativo, o 'General' si es doctrinal",
   "categoria": "pais" | "comparativo" | "doctrinal"
 }
@@ -236,9 +248,10 @@ Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks, sin e
 Reglas:
 - titulo: el nombre oficial del documento, limpio y completo. Ej: "Ley Orgánica de Hidrocarburos"
 - pais: si es una ley nacional, el país. Si compara varios países, "Varios". Si es un texto teórico/doctrinal sin país específico, "General"
-- categoria: "pais" si es normativa de un país, "comparativo" si compara países, "doctrinal" si es teórico`
-        }
-      ]
+- categoria: "pais" si es normativa de un país, "comparativo" si compara países, "doctrinal" si es teórico
+
+Fragmento del documento:
+${muestra}`
     }]
   });
 
@@ -257,18 +270,14 @@ Reglas:
   }
 }
 
-async function analizarConClaude(rutaPDF, config) {
-  const pdfBase64 = fs.readFileSync(rutaPDF).toString('base64');
+async function analizarConClaude(textoPDF, config) {
   const respuesta = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 8000,
     system: config.prompt_sistema,
     messages: [{
       role: 'user',
-      content: [
-        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 } },
-        { type: 'text', text: config.prompt_analisis }
-      ]
+      content: `${config.prompt_analisis}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}`
     }]
   });
   return respuesta.content[0].text;
