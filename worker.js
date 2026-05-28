@@ -119,7 +119,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     const metadatos = await extraerMetadatos(rutaPDF);
     console.log(`✅ [${auditoria_id}] Metadatos: "${metadatos.titulo}" | ${metadatos.pais} | ${metadatos.categoria}`);
     // Pausa para respetar el rate limit de tokens por minuto
-    await new Promise(resolve => setTimeout(resolve, 62000));
+    await new Promise(resolve => setTimeout(resolve, 91000));
     await db.query(
       `UPDATE auditorias SET titulo_documento = $1, pais = $2, categoria = $3 WHERE id = $4`,
       [metadatos.titulo, metadatos.pais, metadatos.categoria, auditoria_id]
