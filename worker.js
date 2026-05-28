@@ -74,7 +74,6 @@ app.get('/verificar-sesion', async (req, res) => {
     console.log(`   URL final: ${url}`);
     console.log(`   Sesión: ${viva ? '✅ VIVA' : '❌ MUERTA'}`);
 
-    // Si la sesión está muerta, notificar a los admins
     if (!viva) {
       await alertarSesionExpirada();
     }
@@ -114,8 +113,17 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     const config = await obtenerConfigDoctrinal();
     console.log(`✅ [${auditoria_id}] Usando prompt versión ${config.version}`);
 
-    console.log(`🧠 [${auditoria_id}] PASO 3: procesando con Claude...`);
+    console.log(`🏷️  [${auditoria_id}] PASO 3: Extrayendo metadatos con Claude...`);
     await actualizarEstado(auditoria_id, 'procesando');
+    const metadatos = await extraerMetadatos(rutaPDF);
+    console.log(`✅ [${auditoria_id}] Metadatos: "${metadatos.titulo}" | ${metadatos.pais} | ${metadatos.categoria}`);
+
+    await db.query(
+      `UPDATE auditorias SET titulo_documento = $1, pais = $2, categoria = $3 WHERE id = $4`,
+      [metadatos.titulo, metadatos.pais, metadatos.categoria, auditoria_id]
+    );
+
+    console.log(`🧠 [${auditoria_id}] PASO 4: Analizando con Claude...`);
     const reporte = await analizarConClaude(rutaPDF, config);
     fs.writeFileSync(rutaReporte, reporte, 'utf8');
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} caracteres)`);
@@ -125,32 +133,32 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
       [reporte, config.version, auditoria_id]
     );
 
-    console.log(`🎙️  [${auditoria_id}] PASO 4: Generando paquetes en NotebookLM...`);
+    console.log(`🎙️  [${auditoria_id}] PASO 5: Generando paquetes en NotebookLM...`);
     await actualizarEstado(auditoria_id, 'empaquetando');
     fs.writeFileSync(rutaSesion, process.env.SESION_GOOGLE, 'utf8');
     await ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlides, rutaMapa, auditoria_id);
     console.log(`✅ [${auditoria_id}] Paquetes generados`);
 
-    console.log(`☁️  [${auditoria_id}] PASO 5: Subiendo a Drive...`);
+    console.log(`☁️  [${auditoria_id}] PASO 6: Subiendo a Drive...`);
     await actualizarEstado(auditoria_id, 'empaquetando');
     const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
 
     const links = {};
-    links.reporte = await subirArchivo(drive, rutaReporte, 'reporte.txt',       'text/plain',          carpetaId);
-    links.podcast = await subirArchivo(drive, rutaPodcast, 'podcast.wav',        'audio/wav',           carpetaId);
-    links.slides  = await subirArchivo(drive, rutaSlides,  'presentacion.pptx',  'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
-    links.mapa    = await subirArchivo(drive, rutaMapa,    'mapa-mental.png',     'image/png',           carpetaId);
+    links.reporte = await subirArchivo(drive, rutaReporte, 'reporte.txt',      'text/plain',          carpetaId);
+    links.podcast = await subirArchivo(drive, rutaPodcast, 'podcast.wav',       'audio/wav',           carpetaId);
+    links.slides  = await subirArchivo(drive, rutaSlides,  'presentacion.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
+    links.mapa    = await subirArchivo(drive, rutaMapa,    'mapa-mental.png',    'image/png',           carpetaId);
     console.log(`✅ [${auditoria_id}] Archivos subidos`);
 
     await db.query(
       `UPDATE auditorias
-       SET estado = 'completada', link_podcast = $1, link_presentacion = $2, link_mapa = $3, completada_en = NOW()
-       WHERE id = $4`,
-      [links.podcast, links.slides, links.mapa, auditoria_id]
+       SET estado = 'completada', link_reporte = $1, link_podcast = $2, link_presentacion = $3, link_mapa = $4, completada_en = NOW()
+       WHERE id = $5`,
+      [links.reporte, links.podcast, links.slides, links.mapa, auditoria_id]
     );
 
     console.log(`✉️  [${auditoria_id}] PASO 7: Enviando email...`);
-    await enviarEmail(ciudadano_email, auditoria_id, links);
+    await enviarEmail(ciudadano_email, auditoria_id, links, metadatos.titulo);
 
     console.log(`\n🎉 [${auditoria_id}] Auditoría completada exitosamente`);
 
@@ -192,6 +200,55 @@ async function obtenerConfigDoctrinal() {
   );
   if (result.rows.length === 0) throw new Error('No hay configuración doctrinal activa');
   return result.rows[0];
+}
+
+async function extraerMetadatos(rutaPDF) {
+  // Llamada rápida y enfocada: solo extrae título, país y categoría
+  const pdfBase64 = fs.readFileSync(rutaPDF).toString('base64');
+
+  const respuesta = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 300,
+    system: `Eres un clasificador de documentos jurídicos y políticos.
+Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks, sin explicaciones.`,
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'document',
+          source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 }
+        },
+        {
+          type: 'text',
+          text: `Analiza este documento y responde SOLO con este JSON:
+{
+  "titulo": "título oficial completo del documento (sin siglas ni números de gaceta)",
+  "pais": "nombre del país al que se refiere, o 'Varios' si es comparativo, o 'General' si es doctrinal",
+  "categoria": "pais" | "comparativo" | "doctrinal"
+}
+
+Reglas:
+- titulo: el nombre oficial del documento, limpio y completo. Ej: "Ley Orgánica de Hidrocarburos"
+- pais: si es una ley nacional, el país. Si compara varios países, "Varios". Si es un texto teórico/doctrinal sin país específico, "General"
+- categoria: "pais" si es normativa de un país, "comparativo" si compara países, "doctrinal" si es teórico`
+        }
+      ]
+    }]
+  });
+
+  try {
+    const texto = respuesta.content[0].text.trim();
+    const limpio = texto.replace(/```json|```/g, '').trim();
+    const datos = JSON.parse(limpio);
+    return {
+      titulo: datos.titulo || 'Documento sin título',
+      pais: datos.pais || 'General',
+      categoria: ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria) ? datos.categoria : 'pais',
+    };
+  } catch (err) {
+    console.error(`   ⚠️  Error parseando metadatos:`, err.message);
+    return { titulo: 'Documento sin título', pais: 'General', categoria: 'pais' };
+  }
 }
 
 async function analizarConClaude(rutaPDF, config) {
@@ -355,7 +412,7 @@ async function actualizarEstado(auditoria_id, estado) {
   await db.query(`UPDATE auditorias SET estado = $1 WHERE id = $2`, [estado, auditoria_id]);
 }
 
-async function enviarEmail(email, auditoria_id, links) {
+async function enviarEmail(email, auditoria_id, links, titulo) {
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
@@ -364,13 +421,14 @@ async function enviarEmail(email, auditoria_id, links) {
       to: email,
       subject: '✅ Tu auditoría está lista',
       html: `
-        <p>Tu auditoría ha sido procesada. Aquí están tus materiales:</p>
+        <p>Tu auditoría de <strong>${titulo}</strong> ha sido procesada. Aquí están tus materiales:</p>
         <ul>
-          ${links.podcast ? `<li><a href="${links.podcast}">🎙️ Podcast</a></li>` : ''}
-          ${links.slides  ? `<li><a href="${links.slides}">📊 Presentación</a></li>` : ''}
-          ${links.mapa    ? `<li><a href="${links.mapa}">🗺️ Mapa Mental</a></li>` : ''}
+          ${links.reporte  ? `<li><a href="${links.reporte}">📋 Reporte de Auditoría</a></li>` : ''}
+          ${links.podcast  ? `<li><a href="${links.podcast}">🎙️ Podcast</a></li>` : ''}
+          ${links.slides   ? `<li><a href="${links.slides}">📊 Presentación</a></li>` : ''}
+          ${links.mapa     ? `<li><a href="${links.mapa}">🗺️ Mapa Mental</a></li>` : ''}
         </ul>
-        <p>Accede a todos tus análisis en <a href="https://liberalmente.app">liberalmente.app</a></p>
+        <p>Accede a todos tus análisis en <a href="https://liberalmente.app/biblioteca">liberalmente.app/biblioteca</a></p>
       `
     })
   });
@@ -381,41 +439,24 @@ async function enviarEmail(email, auditoria_id, links) {
 async function alertarSesionExpirada() {
   try {
     const result = await db.query(
-      `SELECT email FROM configuracion_alertas
-       WHERE tipo = 'sesion_notebooklm' AND activo = true`
+      `SELECT email FROM configuracion_alertas WHERE tipo = 'sesion_notebooklm' AND activo = true`
     );
-
     const destinatarios = result.rows.map(r => r.email);
-    if (destinatarios.length === 0) {
-      console.log('   ⚠️  Sesión muerta pero no hay destinatarios de alerta configurados');
-      return;
-    }
-
+    if (destinatarios.length === 0) { console.log('   ⚠️  Sesión muerta pero no hay destinatarios configurados'); return; }
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
       body: JSON.stringify({
         from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
         to: destinatarios,
         subject: '⚠️ Sesión de NotebookLM expirada',
-        html: `
-          <p>La sesión de NotebookLM ha expirado.</p>
-          <p>Las auditorías en cola fallarán hasta que se renueve.</p>
-          <p><strong>Acción requerida:</strong> Actualizar la variable
-          <code>SESION_GOOGLE</code> en Railway con una sesión fresca.</p>
-          <p><small>Aviso automático — ${new Date().toISOString()}</small></p>
-        `
+        html: `<p>La sesión de NotebookLM ha expirado.</p><p>Las auditorías en cola fallarán hasta que se renueve.</p><p><strong>Acción requerida:</strong> Actualizar <code>SESION_GOOGLE</code> en Railway.</p><p><small>${new Date().toISOString()}</small></p>`
       })
     });
-
     if (!res.ok) throw new Error(await res.text());
-    console.log(`   📧 Alerta de sesión expirada enviada a: ${destinatarios.join(', ')}`);
-
+    console.log(`   📧 Alerta enviada a: ${destinatarios.join(', ')}`);
   } catch (err) {
-    console.error('   ❌ Error enviando alerta de sesión:', err.message);
+    console.error('   ❌ Error enviando alerta:', err.message);
   }
 }
 
