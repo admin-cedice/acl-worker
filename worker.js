@@ -94,8 +94,9 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
   const dirAuditoria = path.join(DIRECTORIO_TEMP, auditoria_id);
   fs.mkdirSync(dirAuditoria, { recursive: true });
 
-  const rutaPDF     = path.join(dirAuditoria, 'original.pdf');
-  const rutaReporte = path.join(dirAuditoria, 'reporte.txt');
+  const rutaPDF       = path.join(dirAuditoria, 'original.pdf');
+  const rutaReporte   = path.join(dirAuditoria, 'reporte.txt');
+  const rutaReportePDF = path.join(dirAuditoria, 'reporte.pdf');
   const rutaPodcast = path.join(dirAuditoria, 'podcast.wav');
   const rutaSlides  = path.join(dirAuditoria, 'presentacion.pptx');
   const rutaMapa    = path.join(dirAuditoria, 'mapa-mental.png');
@@ -133,6 +134,10 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
       [reporte, config.version, auditoria_id]
     );
 
+    console.log(`📄 [${auditoria_id}] Convirtiendo reporte a PDF...`);
+    await convertirTXTaPDF(rutaReporte, rutaReportePDF, metadatos.titulo);
+    console.log(`✅ [${auditoria_id}] PDF del reporte generado`);
+
     console.log(`🎙️  [${auditoria_id}] PASO 5: Generando paquetes en NotebookLM...`);
     await actualizarEstado(auditoria_id, 'empaquetando');
     fs.writeFileSync(rutaSesion, process.env.SESION_GOOGLE, 'utf8');
@@ -144,7 +149,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
 
     const links = {};
-    links.reporte = await subirArchivo(drive, rutaReporte, 'reporte.txt',      'text/plain',          carpetaId);
+    links.reporte = await subirArchivo(drive, rutaReportePDF, 'reporte.pdf', 'application/pdf',     carpetaId);
     links.podcast = await subirArchivo(drive, rutaPodcast, 'podcast.wav',       'audio/wav',           carpetaId);
     links.slides  = await subirArchivo(drive, rutaSlides,  'presentacion.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
     links.mapa    = await subirArchivo(drive, rutaMapa,    'mapa-mental.png',    'image/png',           carpetaId);
@@ -434,6 +439,78 @@ async function enviarEmail(email, auditoria_id, links, titulo) {
   });
   if (!res.ok) throw new Error(`Error enviando email: ${await res.text()}`);
   console.log(`   ✅ Email enviado a ${email}`);
+}
+
+async function convertirTXTaPDF(rutaTXT, rutaPDF, titulo) {
+  const PDFDocument = require('pdfkit');
+  const texto = fs.readFileSync(rutaTXT, 'utf8');
+
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 72, size: 'LETTER' });
+    const stream = fs.createWriteStream(rutaPDF);
+
+    doc.pipe(stream);
+
+    // Encabezado
+    doc
+      .fontSize(9)
+      .fillColor('#888888')
+      .font('Helvetica')
+      .text('AUDITORÍA CÍVICA LIBERAL — liberalmente.app', { align: 'center' })
+      .moveDown(0.75);
+
+    // Título del documento
+    doc
+      .fontSize(17)
+      .fillColor('#1a1a1a')
+      .font('Helvetica-Bold')
+      .text(titulo, { align: 'center' })
+      .moveDown(0.5);
+
+    // Fecha
+    doc
+      .fontSize(9)
+      .fillColor('#888888')
+      .font('Helvetica')
+      .text(
+        `Generado el ${new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' })}`,
+        { align: 'center' }
+      )
+      .moveDown(1.5);
+
+    // Línea divisoria
+    doc
+      .moveTo(72, doc.y)
+      .lineTo(doc.page.width - 72, doc.y)
+      .strokeColor('#cccccc')
+      .lineWidth(0.5)
+      .stroke()
+      .moveDown(1.5);
+
+    // Cuerpo del reporte
+    doc
+      .fontSize(11)
+      .fillColor('#1a1a1a')
+      .font('Helvetica')
+      .text(texto, { lineGap: 5, paragraphGap: 10 });
+
+    // Pie de página en cada página
+    const totalPaginas = () => doc.bufferedPageRange().count;
+    doc.on('pageAdded', () => {
+      doc
+        .fontSize(8)
+        .fillColor('#aaaaaa')
+        .text(
+          `Auditoría Cívica Liberal · liberalmente.app`,
+          72, doc.page.height - 40,
+          { align: 'center', width: doc.page.width - 144 }
+        );
+    });
+
+    doc.end();
+    stream.on('finish', resolve);
+    stream.on('error', reject);
+  });
 }
 
 async function alertarSesionExpirada() {
