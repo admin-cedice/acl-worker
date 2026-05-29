@@ -21,6 +21,48 @@ const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectU
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const DIRECTORIO_TEMP = '/tmp/acl-worker';
 
+// ── Normalizar sesión Google ─────────────────────────────────────────────────
+// Acepta tanto Cookie-Editor JSON como Playwright storageState
+// y siempre devuelve el formato correcto para Playwright
+
+function normalizarSesionGoogle(sesionRaw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(sesionRaw);
+  } catch {
+    throw new Error('SESION_GOOGLE no es JSON válido');
+  }
+
+  // Ya está en formato Playwright storageState
+  if (parsed && parsed.cookies && Array.isArray(parsed.cookies)) {
+    return sesionRaw;
+  }
+
+  // Formato Cookie-Editor (array directo de cookies)
+  if (Array.isArray(parsed)) {
+    const cookies = parsed.map(c => ({
+      name:     c.name,
+      value:    c.value,
+      domain:   c.domain,
+      path:     c.path || '/',
+      expires:  c.expirationDate ? Math.floor(c.expirationDate) : -1,
+      httpOnly: c.httpOnly || false,
+      secure:   c.secure || false,
+      sameSite: (() => {
+        switch (c.sameSite) {
+          case 'no_restriction': return 'None';
+          case 'lax':            return 'Lax';
+          case 'strict':         return 'Strict';
+          default:               return 'None';
+        }
+      })(),
+    }));
+    return JSON.stringify({ cookies, origins: [] });
+  }
+
+  throw new Error('Formato de SESION_GOOGLE no reconocido');
+}
+
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
@@ -57,7 +99,8 @@ app.get('/verificar-sesion', async (req, res) => {
   const rutaSesion = '/tmp/sesion-test.json';
 
   try {
-    fs.writeFileSync(rutaSesion, process.env.SESION_GOOGLE, 'utf8');
+    const sesionNormalizada = normalizarSesionGoogle(process.env.SESION_GOOGLE);
+    fs.writeFileSync(rutaSesion, sesionNormalizada, 'utf8');
 
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({ storageState: rutaSesion });
@@ -87,6 +130,48 @@ app.get('/verificar-sesion', async (req, res) => {
   }
 });
 
+// ── Retomar auditorías en espera de sesión ───────────────────────────────────
+
+app.post('/retomar', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  try {
+    const result = await db.query(`
+      SELECT a.id, a.pdf_drive_id, c.email AS ciudadano_email, a.titulo_documento
+      FROM auditorias a
+      JOIN ciudadanos c ON c.id = a.ciudadano_id
+      WHERE a.estado = 'awaiting_session'
+      ORDER BY a.creada_en ASC
+    `);
+
+    const pendientes = result.rows;
+
+    if (pendientes.length === 0) {
+      return res.json({ mensaje: 'No hay auditorías en espera', retomadas: 0 });
+    }
+
+    console.log(`\n🔄 Retomando ${pendientes.length} auditoría(s) en espera...`);
+    res.json({ mensaje: `Retomando ${pendientes.length} auditoría(s)`, retomadas: pendientes.length });
+
+    // Procesar cada una en secuencia para no saturar NotebookLM
+    for (const a of pendientes) {
+      console.log(`\n▶️  Retomando [${a.id}]...`);
+      await retomarDesdeNotebookLM(a.id, a.ciudadano_email, a.pdf_drive_id)
+        .catch(err => console.error(`❌ Error retomando [${a.id}]:`, err.message));
+      // Pausa entre auditorías para no saturar
+      if (pendientes.indexOf(a) < pendientes.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+
+  } catch (error) {
+    console.error('Error en /retomar:', error.message);
+    if (!res.headersSent) res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Función principal ────────────────────────────────────────────────────────
 
 async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
@@ -99,13 +184,12 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
   const rutaTXT        = path.join(dirAuditoria, 'original.txt');
   const rutaReporte    = path.join(dirAuditoria, 'reporte.txt');
   const rutaReportePDF = path.join(dirAuditoria, 'reporte.pdf');
-  const rutaPodcast = path.join(dirAuditoria, 'podcast.wav');
-  const rutaSlides  = path.join(dirAuditoria, 'presentacion.pptx');
-  const rutaMapa    = path.join(dirAuditoria, 'mapa-mental.png');
-  const rutaSesion  = path.join(dirAuditoria, 'sesion-google.json');
+  const rutaPodcast    = path.join(dirAuditoria, 'podcast.wav');
+  const rutaSlides     = path.join(dirAuditoria, 'presentacion.pptx');
+  const rutaMapa       = path.join(dirAuditoria, 'mapa-mental.png');
+  const rutaSesion     = path.join(dirAuditoria, 'sesion-google.json');
 
   try {
-
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando PDF de Drive...`);
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
@@ -131,7 +215,6 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
       [metadatos.titulo, metadatos.pais, metadatos.categoria, auditoria_id]
     );
 
-    // Pausa para respetar el rate limit de tokens por minuto
     console.log(`⏳ [${auditoria_id}] Esperando ventana de rate limit...`);
     await new Promise(resolve => setTimeout(resolve, 90000));
 
@@ -151,41 +234,131 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
 
     console.log(`🎙️  [${auditoria_id}] PASO 6: Generando paquetes en NotebookLM...`);
     await actualizarEstado(auditoria_id, 'empaquetando');
-    fs.writeFileSync(rutaSesion, process.env.SESION_GOOGLE, 'utf8');
+    const sesionNorm1 = normalizarSesionGoogle(process.env.SESION_GOOGLE);
+    fs.writeFileSync(rutaSesion, sesionNorm1, 'utf8');
     await ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlides, rutaMapa, auditoria_id);
     console.log(`✅ [${auditoria_id}] Paquetes generados`);
 
-    console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo a Drive...`);
-    await actualizarEstado(auditoria_id, 'empaquetando');
-    const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
-
-    const links = {};
-    links.reporte = await subirArchivo(drive, rutaReportePDF, 'reporte.pdf', 'application/pdf',     carpetaId);
-    links.podcast = await subirArchivo(drive, rutaPodcast, 'podcast.wav',       'audio/wav',           carpetaId);
-    links.slides  = await subirArchivo(drive, rutaSlides,  'presentacion.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
-    links.mapa    = await subirArchivo(drive, rutaMapa,    'mapa-mental.png',    'image/png',           carpetaId);
-    console.log(`✅ [${auditoria_id}] Archivos subidos`);
-
-    await db.query(
-      `UPDATE auditorias
-       SET estado = 'completada', link_reporte = $1, link_podcast = $2, link_presentacion = $3, link_mapa = $4, completada_en = NOW()
-       WHERE id = $5`,
-      [links.reporte, links.podcast, links.slides, links.mapa, auditoria_id]
-    );
-
-    console.log(`✉️  [${auditoria_id}] PASO 8: Enviando email...`);
-    await enviarEmail(ciudadano_email, auditoria_id, links, metadatos.titulo);
-
-    console.log(`\n🎉 [${auditoria_id}] Auditoría completada exitosamente`);
+    await finalizarAuditoria(drive, auditoria_id, ciudadano_email, metadatos.titulo,
+      rutaReportePDF, rutaPodcast, rutaSlides, rutaMapa);
 
   } catch (error) {
-    console.error(`❌ [${auditoria_id}] Error:`, error.message);
-    await actualizarEstado(auditoria_id, 'error').catch(() => {});
-    await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`, [error.message, auditoria_id]).catch(() => {});
+    const esSesionExpirada = error.message.includes('Sesión de NotebookLM expirada');
+
+    if (esSesionExpirada) {
+      console.warn(`⏸️  [${auditoria_id}] Sesión expirada — en cola awaiting_session`);
+      await db.query(
+        `UPDATE auditorias SET estado = 'awaiting_session', error_mensaje = $1 WHERE id = $2`,
+        [error.message, auditoria_id]
+      ).catch(() => {});
+      await alertarSesionExpirada();
+    } else {
+      console.error(`❌ [${auditoria_id}] Error:`, error.message);
+      await actualizarEstado(auditoria_id, 'error').catch(() => {});
+      await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`,
+        [error.message, auditoria_id]).catch(() => {});
+    }
   } finally {
     fs.rmSync(dirAuditoria, { recursive: true, force: true });
     console.log(`🧹 [${auditoria_id}] Archivos temporales eliminados`);
   }
+}
+
+// ── Retomar desde el PASO 6 (NotebookLM) ────────────────────────────────────
+// Usado por /retomar — el reporte ya está en BD, solo falta el empaquetamiento
+
+async function retomarDesdeNotebookLM(auditoria_id, ciudadano_email, pdf_drive_id) {
+  const dirAuditoria = path.join(DIRECTORIO_TEMP, `retomar-${auditoria_id}`);
+  fs.mkdirSync(dirAuditoria, { recursive: true });
+
+  const rutaReporte    = path.join(dirAuditoria, 'reporte.txt');
+  const rutaReportePDF = path.join(dirAuditoria, 'reporte.pdf');
+  const rutaPodcast    = path.join(dirAuditoria, 'podcast.wav');
+  const rutaSlides     = path.join(dirAuditoria, 'presentacion.pptx');
+  const rutaMapa       = path.join(dirAuditoria, 'mapa-mental.png');
+  const rutaSesion     = path.join(dirAuditoria, 'sesion-google.json');
+
+  try {
+    // Leer reporte y metadatos desde la BD
+    const result = await db.query(
+      `SELECT reporte_texto, titulo_documento FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].reporte_texto) {
+      throw new Error('No se encontró el reporte en BD para retomar');
+    }
+
+    const { reporte_texto, titulo_documento } = result.rows[0];
+
+    fs.writeFileSync(rutaReporte, reporte_texto, 'utf8');
+
+    console.log(`📄 [${auditoria_id}] Reconvirtiendo reporte a PDF...`);
+    await convertirTXTaPDF(rutaReporte, rutaReportePDF, titulo_documento || 'Documento');
+    console.log(`✅ [${auditoria_id}] PDF regenerado`);
+
+    console.log(`🎙️  [${auditoria_id}] Generando paquetes en NotebookLM...`);
+    await actualizarEstado(auditoria_id, 'empaquetando');
+    const sesionNorm2 = normalizarSesionGoogle(process.env.SESION_GOOGLE);
+    fs.writeFileSync(rutaSesion, sesionNorm2, 'utf8');
+    await ejecutarPlaywright(rutaReporte, rutaSesion, rutaPodcast, rutaSlides, rutaMapa, auditoria_id);
+    console.log(`✅ [${auditoria_id}] Paquetes generados`);
+
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+
+    await finalizarAuditoria(drive, auditoria_id, ciudadano_email,
+      titulo_documento || 'Documento', rutaReportePDF, rutaPodcast, rutaSlides, rutaMapa);
+
+  } catch (error) {
+    const esSesionExpirada = error.message.includes('Sesión de NotebookLM expirada');
+
+    if (esSesionExpirada) {
+      console.warn(`⏸️  [${auditoria_id}] Sesión aún expirada — se mantiene en awaiting_session`);
+      await db.query(
+        `UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`,
+        [error.message, auditoria_id]
+      ).catch(() => {});
+    } else {
+      console.error(`❌ [${auditoria_id}] Error al retomar:`, error.message);
+      await actualizarEstado(auditoria_id, 'error').catch(() => {});
+      await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`,
+        [error.message, auditoria_id]).catch(() => {});
+    }
+  } finally {
+    fs.rmSync(dirAuditoria, { recursive: true, force: true });
+    console.log(`🧹 [${auditoria_id}] Archivos temporales de retoma eliminados`);
+  }
+}
+
+// ── Finalizar auditoría (subir a Drive + email) ──────────────────────────────
+
+async function finalizarAuditoria(drive, auditoria_id, ciudadano_email, titulo,
+  rutaReportePDF, rutaPodcast, rutaSlides, rutaMapa) {
+
+  console.log(`☁️  [${auditoria_id}] Subiendo a Drive...`);
+  await actualizarEstado(auditoria_id, 'empaquetando');
+  const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
+
+  const links = {};
+  links.reporte = await subirArchivo(drive, rutaReportePDF, 'reporte.pdf',       'application/pdf', carpetaId);
+  links.podcast = await subirArchivo(drive, rutaPodcast,    'podcast.wav',        'audio/wav',       carpetaId);
+  links.slides  = await subirArchivo(drive, rutaSlides,     'presentacion.pptx',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
+  links.mapa    = await subirArchivo(drive, rutaMapa,       'mapa-mental.png',    'image/png',       carpetaId);
+  console.log(`✅ [${auditoria_id}] Archivos subidos`);
+
+  await db.query(
+    `UPDATE auditorias
+     SET estado = 'completada', link_reporte = $1, link_podcast = $2,
+         link_presentacion = $3, link_mapa = $4, completada_en = NOW()
+     WHERE id = $5`,
+    [links.reporte, links.podcast, links.slides, links.mapa, auditoria_id]
+  );
+
+  console.log(`✉️  [${auditoria_id}] Enviando email...`);
+  await enviarEmail(ciudadano_email, auditoria_id, links, titulo);
+  console.log(`\n🎉 [${auditoria_id}] Auditoría completada exitosamente`);
 }
 
 // ── Funciones auxiliares ─────────────────────────────────────────────────────
@@ -228,7 +401,6 @@ async function extraerTextoPDF(rutaPDF) {
 }
 
 async function extraerMetadatos(textoPDF) {
-  // Usar solo los primeros 3000 caracteres — suficiente para identificar el documento
   const muestra = textoPDF.slice(0, 3000);
 
   const respuesta = await anthropic.messages.create({
@@ -461,60 +633,29 @@ async function convertirTXTaPDF(rutaTXT, rutaPDF, titulo) {
 
     doc.pipe(stream);
 
-    // Encabezado
-    doc
-      .fontSize(9)
-      .fillColor('#888888')
-      .font('Helvetica')
+    doc.fontSize(9).fillColor('#888888').font('Helvetica')
       .text('AUDITORÍA CÍVICA LIBERAL — liberalmente.app', { align: 'center' })
       .moveDown(0.75);
 
-    // Título del documento
-    doc
-      .fontSize(17)
-      .fillColor('#1a1a1a')
-      .font('Helvetica-Bold')
+    doc.fontSize(17).fillColor('#1a1a1a').font('Helvetica-Bold')
       .text(titulo, { align: 'center' })
       .moveDown(0.5);
 
-    // Fecha
-    doc
-      .fontSize(9)
-      .fillColor('#888888')
-      .font('Helvetica')
-      .text(
-        `Generado el ${new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' })}`,
-        { align: 'center' }
-      )
+    doc.fontSize(9).fillColor('#888888').font('Helvetica')
+      .text(`Generado el ${new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' })}`, { align: 'center' })
       .moveDown(1.5);
 
-    // Línea divisoria
-    doc
-      .moveTo(72, doc.y)
-      .lineTo(doc.page.width - 72, doc.y)
-      .strokeColor('#cccccc')
-      .lineWidth(0.5)
-      .stroke()
-      .moveDown(1.5);
+    doc.moveTo(72, doc.y).lineTo(doc.page.width - 72, doc.y)
+      .strokeColor('#cccccc').lineWidth(0.5).stroke().moveDown(1.5);
 
-    // Cuerpo del reporte
-    doc
-      .fontSize(11)
-      .fillColor('#1a1a1a')
-      .font('Helvetica')
+    doc.fontSize(11).fillColor('#1a1a1a').font('Helvetica')
       .text(texto, { lineGap: 5, paragraphGap: 10 });
 
-    // Pie de página en cada página
-    const totalPaginas = () => doc.bufferedPageRange().count;
     doc.on('pageAdded', () => {
-      doc
-        .fontSize(8)
-        .fillColor('#aaaaaa')
-        .text(
-          `Auditoría Cívica Liberal · liberalmente.app`,
+      doc.fontSize(8).fillColor('#aaaaaa')
+        .text('Auditoría Cívica Liberal · liberalmente.app',
           72, doc.page.height - 40,
-          { align: 'center', width: doc.page.width - 144 }
-        );
+          { align: 'center', width: doc.page.width - 144 });
     });
 
     doc.end();
@@ -529,7 +670,10 @@ async function alertarSesionExpirada() {
       `SELECT email FROM configuracion_alertas WHERE tipo = 'sesion_notebooklm' AND activo = true`
     );
     const destinatarios = result.rows.map(r => r.email);
-    if (destinatarios.length === 0) { console.log('   ⚠️  Sesión muerta pero no hay destinatarios configurados'); return; }
+    if (destinatarios.length === 0) {
+      console.log('   ⚠️  Sesión muerta pero no hay destinatarios configurados');
+      return;
+    }
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
@@ -537,7 +681,14 @@ async function alertarSesionExpirada() {
         from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
         to: destinatarios,
         subject: '⚠️ Sesión de NotebookLM expirada',
-        html: `<p>La sesión de NotebookLM ha expirado.</p><p>Las auditorías en cola fallarán hasta que se renueve.</p><p><strong>Acción requerida:</strong> Actualizar <code>SESION_GOOGLE</code> en Railway.</p><p><small>${new Date().toISOString()}</small></p>`
+        html: `
+          <p>La sesión de NotebookLM ha expirado.</p>
+          <p>Las auditorías afectadas están en cola — <strong>no se perdió ningún trabajo</strong>.</p>
+          <p>Cuando renueves la sesión en Railway, llama a este endpoint para retomarlas:</p>
+          <pre>POST https://acl-worker-production.up.railway.app/retomar
+x-worker-secret: [tu secret]</pre>
+          <p><small>${new Date().toISOString()}</small></p>
+        `
       })
     });
     if (!res.ok) throw new Error(await res.text());
