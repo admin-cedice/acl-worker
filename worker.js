@@ -11,12 +11,43 @@ const { GoogleAuth } = require('google-auth-library');
 const Anthropic  = require('@anthropic-ai/sdk');
 const { Pool }   = require('pg');
 const pptxgen    = require('pptxgenjs');
+const { chromium } = require('playwright');
 const fs         = require('fs');
 const path       = require('path');
 const pdfParse   = require('pdf-parse');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
+
+// ── Normalizar sesión Google ─────────────────────────────────────────────────
+
+function normalizarSesionGoogle(sesionRaw) {
+  let parsed;
+  try { parsed = JSON.parse(sesionRaw); }
+  catch { throw new Error('SESION_GOOGLE no es JSON válido'); }
+  if (parsed && parsed.cookies && Array.isArray(parsed.cookies)) return sesionRaw;
+  if (Array.isArray(parsed)) {
+    const cookies = parsed.map(c => ({
+      name:     c.name,
+      value:    c.value,
+      domain:   c.domain,
+      path:     c.path || '/',
+      expires:  c.expirationDate ? Math.floor(c.expirationDate) : -1,
+      httpOnly: c.httpOnly || false,
+      secure:   c.secure || false,
+      sameSite: (() => {
+        switch (c.sameSite) {
+          case 'no_restriction': return 'None';
+          case 'lax':            return 'Lax';
+          case 'strict':         return 'Strict';
+          default:               return 'None';
+        }
+      })(),
+    }));
+    return JSON.stringify({ cookies, origins: [] });
+  }
+  throw new Error('Formato de SESION_GOOGLE no reconocido');
+}
 
 // ── Clientes globales ────────────────────────────────────────────────────────
 
@@ -189,47 +220,151 @@ async function nlmEliminarNotebook(notebookId) {
   }).catch(() => {});
 }
 
-// ── Pipeline NotebookLM completo ─────────────────────────────────────────────
+// ── Pipeline NotebookLM híbrido (API + Playwright) ───────────────────────────
+// Fase 1 (API): crear notebook, agregar fuente, disparar audio
+// Fase 2 (Playwright): esperar que esté listo, descargar
 
 async function ejecutarNotebookLMApi(reporteTexto, titulo, rutaPodcast, auditoria_id) {
   let notebookId = null;
   try {
+    // ── Fase 1: API ──────────────────────────────────────────────────────────
     console.log(`   [${auditoria_id}] Creando notebook en NotebookLM...`);
     notebookId = await nlmCrearNotebook(`ACL — ${titulo}`);
     console.log(`   [${auditoria_id}] Notebook creado: ${notebookId}`);
 
     console.log(`   [${auditoria_id}] Agregando reporte como fuente...`);
     const sourceId = await nlmAgregarFuente(notebookId, titulo, reporteTexto);
-    console.log(`   [${auditoria_id}] Fuente agregada (sourceId: ${sourceId})`);
+    console.log(`   [${auditoria_id}] Fuente agregada`);
 
-    // Breve pausa para que NotebookLM indexe el contenido
+    // Pausa para que NotebookLM indexe el contenido
     await new Promise(r => setTimeout(r, 10_000));
 
     console.log(`   [${auditoria_id}] Disparando generación de Audio Overview...`);
     const audioId = await nlmGenerarAudio(notebookId);
-    console.log(`   [${auditoria_id}] Audio en proceso: ${audioId}`);
-    if (!audioId) throw new Error('La API no devolvió audioOverviewId — ver log NLM para diagnóstico');
+    if (!audioId) throw new Error('La API no devolvió audioOverviewId');
+    console.log(`   [${auditoria_id}] Audio en generación: ${audioId}`);
 
-    console.log(`   [${auditoria_id}] Esperando que el audio esté listo...`);
-    const audioData = await nlmEsperarAudio(notebookId, audioId, auditoria_id);
-    console.log(`   [${auditoria_id}] Audio listo`);
+    // ── Fase 2: Playwright ───────────────────────────────────────────────────
+    // URL directa al notebook Enterprise (sin navegar desde la home)
+    const notebookUrl = `https://notebooklm.cloud.google.com/global/notebook/${notebookId}?project=${NLM_PROJECT}`;
+    console.log(`   [${auditoria_id}] Esperando 15 min antes de intentar descarga...`);
+    await new Promise(r => setTimeout(r, 15 * 60_000));
 
-    console.log(`   [${auditoria_id}] Descargando audio...`);
-    await nlmDescargarAudio(audioData, rutaPodcast);
-    console.log(`   [${auditoria_id}] Audio guardado en ${rutaPodcast}`);
+    await descargarAudioConPlaywright(notebookUrl, rutaPodcast, auditoria_id);
+    console.log(`   [${auditoria_id}] Audio descargado`);
 
-    // Eliminar notebook DESPUÉS de descargar el audio
+    // Limpiar notebook
     await nlmEliminarNotebook(notebookId);
     console.log(`   [${auditoria_id}] Notebook eliminado`);
     notebookId = null;
 
   } catch(err) {
-    // Asegurarse de limpiar el notebook si hay error
-    if (notebookId) {
-      await nlmEliminarNotebook(notebookId).catch(() => {});
-    }
+    if (notebookId) await nlmEliminarNotebook(notebookId).catch(() => {});
     throw err;
   }
+}
+
+// ── Descarga del audio via Playwright ────────────────────────────────────────
+// Entra directo al notebook por URL, espera el botón de descarga, descarga
+
+async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id) {
+  const ESPERA_ENTRE_REINTENTOS = 10 * 60_000; // 10 minutos
+  const MAX_INTENTOS = 5; // hasta 15 + 4*10 = 55 minutos total
+  const rutaSesion = '/tmp/sesion-notebooklm.json';
+
+  const sesionNorm = normalizarSesionGoogle(process.env.SESION_GOOGLE);
+  fs.writeFileSync(rutaSesion, sesionNorm, 'utf8');
+
+  for (let intento = 1; intento <= MAX_INTENTOS; intento++) {
+    console.log(`   [${auditoria_id}] Playwright intento ${intento}/${MAX_INTENTOS}...`);
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        storageState: rutaSesion,
+        acceptDownloads: true,
+      });
+      const page = await context.newPage();
+
+      // Verificar sesión
+      await page.goto('https://notebooklm.cloud.google.com', {
+        waitUntil: 'domcontentloaded', timeout: 30_000,
+      });
+      if (page.url().includes('accounts.google.com')) {
+        throw new Error('Sesión de NotebookLM expirada. Renovar SESION_GOOGLE.');
+      }
+
+      // Ir directo al notebook
+      console.log(`   [${auditoria_id}] Abriendo notebook: ${notebookUrl}`);
+      await page.goto(notebookUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await page.waitForTimeout(8000);
+
+      // Buscar botón de descarga del Audio Overview
+      // El botón aparece cuando el audio está listo
+      const selectorDescarga = 'button[aria-label="Más"][data-category="audio"],'
+        + ' button[aria-label="Download audio overview"],'
+        + ' button[aria-label="Descargar resumen de audio"]';
+
+      // Intentar también via menú "Más" del panel de Studio
+      let audioDescargado = false;
+
+      // Estrategia 1: botón directo de descarga
+      const btnDescarga = page.locator('button').filter({ hasText: /descargar|download/i }).first();
+      if (await btnDescarga.isVisible({ timeout: 5000 }).catch(() => false)) {
+        const [dl] = await Promise.all([
+          page.waitForEvent('download'),
+          btnDescarga.click(),
+        ]);
+        await dl.saveAs(rutaSalida);
+        audioDescargado = true;
+        console.log(`   [${auditoria_id}] Audio descargado (botón directo)`);
+      }
+
+      // Estrategia 2: menú "Más" en el panel de audio
+      if (!audioDescargado) {
+        for (const btn of await page.locator('button[aria-label="Más"]').all()) {
+          await btn.click().catch(() => {});
+          await page.waitForTimeout(800);
+          const itemDescarga = page.locator('[role="menuitem"]').filter({ hasText: /descargar|download/i }).first();
+          if (await itemDescarga.isVisible({ timeout: 2000 }).catch(() => false)) {
+            const [dl] = await Promise.all([
+              page.waitForEvent('download'),
+              itemDescarga.click(),
+            ]);
+            await dl.saveAs(rutaSalida);
+            audioDescargado = true;
+            console.log(`   [${auditoria_id}] Audio descargado (menú Más)`);
+            break;
+          }
+          await page.keyboard.press('Escape');
+          await page.waitForTimeout(400);
+        }
+      }
+
+      await browser.close();
+      fs.unlinkSync(rutaSesion);
+
+      if (audioDescargado) return;
+
+      // Audio aún no está listo
+      console.log(`   [${auditoria_id}] Audio aún no listo. Esperando ${ESPERA_ENTRE_REINTENTOS / 60000} min...`);
+      if (intento < MAX_INTENTOS) {
+        await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
+      }
+
+    } catch(err) {
+      await browser.close().catch(() => {});
+      if (err.message.includes('Sesión de NotebookLM expirada')) {
+        await alertarSesionExpirada();
+        throw err;
+      }
+      console.error(`   [${auditoria_id}] Error en intento ${intento}:`, err.message);
+      if (intento < MAX_INTENTOS) {
+        await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
+      }
+    }
+  }
+
+  throw new Error(`No se pudo descargar el audio tras ${MAX_INTENTOS} intentos`);
 }
 
 // ── Paleta institucional para PPTX ──────────────────────────────────────────
@@ -545,7 +680,30 @@ async function generarPresentacion(reporteTexto, titulo, rutaSalida, auditoria_i
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.1', timestamp: new Date().toISOString() });
+});
+
+app.get('/verificar-sesion', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const rutaSesion = '/tmp/sesion-test.json';
+  try {
+    const sesionNorm = normalizarSesionGoogle(process.env.SESION_GOOGLE);
+    fs.writeFileSync(rutaSesion, sesionNorm, 'utf8');
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({ storageState: rutaSesion });
+    const page    = await context.newPage();
+    await page.goto('https://notebooklm.google.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(5000);
+    const url  = page.url();
+    const viva = !url.includes('accounts.google.com');
+    await browser.close();
+    fs.unlinkSync(rutaSesion);
+    res.json({ viva, url, timestamp: new Date().toISOString() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/procesar', async (req, res) => {
@@ -890,11 +1048,35 @@ async function enviarEmail(email, auditoria_id, links, titulo) {
   console.log(`   ✅ Email enviado a ${email}`);
 }
 
+async function alertarSesionExpirada() {
+  try {
+    const result = await db.query(
+      `SELECT email FROM configuracion_alertas WHERE tipo = 'sesion_notebooklm' AND activo = true`
+    );
+    const destinatarios = result.rows.map(r => r.email);
+    if (destinatarios.length === 0) return;
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+        to: destinatarios,
+        subject: '⚠️ Sesión de NotebookLM expirada',
+        html: `<p>La sesión de NotebookLM ha expirado. Renovar SESION_GOOGLE en Railway.</p><p><small>${new Date().toISOString()}</small></p>`,
+      }),
+    });
+  } catch (err) {
+    console.error('   ❌ Error enviando alerta:', err.message);
+  }
+}
+
 // ── Arrancar servidor ────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.0 corriendo en puerto ${PORT}`);
-  console.log(`   Hemisferio derecho: NotebookLM Enterprise API`);
+  console.log(`\n⚙️  ACL Worker v3.1 corriendo en puerto ${PORT}`);
+  console.log(`   Hemisferio derecho: NotebookLM API + Playwright híbrido`);
   console.log(`   Listo para recibir auditorías\n`);
 });
+
+// (función agregada en v3.1 — necesaria para flujo híbrido)

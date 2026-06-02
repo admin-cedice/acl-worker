@@ -1,5 +1,5 @@
-# Imagen Node estándar — sin Playwright
-FROM node:20-slim
+# Imagen Microsoft con Playwright y dependencias incluidas
+FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
