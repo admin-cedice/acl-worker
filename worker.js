@@ -88,10 +88,9 @@ async function nlmAgregarFuente(notebookId, titulo, contenido) {
     {
       userContents: [
         {
-          rawContent: {
-            content: contenido,
-            mimeType: 'text/plain',
+          textContent: {
             sourceName: titulo,
+            content: contenido,
           },
         },
       ],
