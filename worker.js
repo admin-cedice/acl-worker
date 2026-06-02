@@ -110,13 +110,12 @@ async function nlmGenerarAudio(notebookId) {
     `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews`,
     null
   );
-  // Log completo para debug — ver qué campos devuelve la API
+  // Log completo para debug
   console.log('   [NLM] audioOverviews POST response:', JSON.stringify(data));
-  // La API puede devolver el ID en distintos campos según la versión
-  const audioId = data.audioOverviewId
+  // La respuesta tiene la estructura: { audioOverview: { audioOverviewId: "...", status: "..." } }
+  const audioId = data.audioOverview?.audioOverviewId
+    || data.audioOverviewId
     || data.name?.split('/').pop()
-    || data.id
-    || data.operationId
     || null;
   return audioId;
 }
@@ -133,13 +132,17 @@ async function nlmEsperarAudio(notebookId, audioId, auditoria_id) {
       `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews/${audioId}`
     );
 
-    const estado = data.state || data.status;
+    // La API devuelve { audioOverview: { status: "...", audioOverviewId: "..." } }
+    const overview = data.audioOverview || data;
+    const estado = overview.status || overview.state;
     console.log(`   [${auditoria_id}] Audio estado: ${estado}`);
 
-    if (estado === 'SUCCEEDED' || estado === 'ACTIVE' || data.audioData) {
-      return data;
+    if (estado === 'AUDIO_OVERVIEW_STATUS_SUCCEEDED'
+        || estado === 'SUCCEEDED' || estado === 'ACTIVE') {
+      return overview;
     }
-    if (estado === 'FAILED' || estado === 'ERROR') {
+    if (estado === 'AUDIO_OVERVIEW_STATUS_FAILED'
+        || estado === 'FAILED' || estado === 'ERROR') {
       throw new Error(`Audio Overview falló: ${JSON.stringify(data)}`);
     }
     if (Date.now() - t0 > TIMEOUT) {
@@ -207,11 +210,17 @@ async function ejecutarNotebookLMApi(reporteTexto, titulo, rutaPodcast, auditori
     await nlmDescargarAudio(audioData, rutaPodcast);
     console.log(`   [${auditoria_id}] Audio guardado en ${rutaPodcast}`);
 
-  } finally {
+    // Eliminar notebook DESPUÉS de descargar el audio
+    await nlmEliminarNotebook(notebookId);
+    console.log(`   [${auditoria_id}] Notebook eliminado`);
+    notebookId = null;
+
+  } catch(err) {
+    // Asegurarse de limpiar el notebook si hay error
     if (notebookId) {
-      await nlmEliminarNotebook(notebookId);
-      console.log(`   [${auditoria_id}] Notebook eliminado`);
+      await nlmEliminarNotebook(notebookId).catch(() => {});
     }
+    throw err;
   }
 }
 
