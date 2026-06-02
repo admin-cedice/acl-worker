@@ -110,7 +110,15 @@ async function nlmGenerarAudio(notebookId) {
     `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews`,
     null
   );
-  return data.audioOverviewId || data.name?.split('/').pop();
+  // Log completo para debug — ver qué campos devuelve la API
+  console.log('   [NLM] audioOverviews POST response:', JSON.stringify(data));
+  // La API puede devolver el ID en distintos campos según la versión
+  const audioId = data.audioOverviewId
+    || data.name?.split('/').pop()
+    || data.id
+    || data.operationId
+    || null;
+  return audioId;
 }
 
 // Esperar hasta que el Audio Overview esté listo (polling)
@@ -189,6 +197,7 @@ async function ejecutarNotebookLMApi(reporteTexto, titulo, rutaPodcast, auditori
     console.log(`   [${auditoria_id}] Disparando generación de Audio Overview...`);
     const audioId = await nlmGenerarAudio(notebookId);
     console.log(`   [${auditoria_id}] Audio en proceso: ${audioId}`);
+    if (!audioId) throw new Error('La API no devolvió audioOverviewId — ver log NLM para diagnóstico');
 
     console.log(`   [${auditoria_id}] Esperando que el audio esté listo...`);
     const audioData = await nlmEsperarAudio(notebookId, audioId, auditoria_id);
