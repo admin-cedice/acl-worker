@@ -296,22 +296,29 @@ async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id
       // Ir directo al notebook
       console.log(`   [${auditoria_id}] Abriendo notebook: ${notebookUrl}`);
       await page.goto(notebookUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-      await page.waitForTimeout(8000);
+      await page.waitForTimeout(10000);
 
-      // Buscar botón de descarga del Audio Overview
-      // El botón aparece cuando el audio está listo
-      const selectorDescarga = 'button[aria-label="Más"][data-category="audio"],'
-        + ' button[aria-label="Download audio overview"],'
-        + ' button[aria-label="Descargar resumen de audio"]';
+      // Screenshot para diagnóstico (solo primer intento)
+      if (intento === 1) {
+        const shotPath = `/tmp/nlm-screenshot-${auditoria_id}.png`;
+        await page.screenshot({ path: shotPath, fullPage: true });
+        console.log(`   [${auditoria_id}] Screenshot guardado en ${shotPath}`);
+        // Loguear todos los botones visibles para diagnóstico
+        const botones = await page.locator('button').allTextContents();
+        console.log(`   [${auditoria_id}] Botones en página:`, JSON.stringify(botones.slice(0, 30)));
+        const ariaLabels = await page.locator('button[aria-label]').evaluateAll(
+          els => els.map(e => e.getAttribute('aria-label'))
+        );
+        console.log(`   [${auditoria_id}] aria-labels:`, JSON.stringify(ariaLabels.slice(0, 30)));
+      }
 
-      // Intentar también via menú "Más" del panel de Studio
       let audioDescargado = false;
 
       // Estrategia 1: botón directo de descarga
       const btnDescarga = page.locator('button').filter({ hasText: /descargar|download/i }).first();
       if (await btnDescarga.isVisible({ timeout: 5000 }).catch(() => false)) {
         const [dl] = await Promise.all([
-          page.waitForEvent('download'),
+          page.waitForEvent('download', { timeout: 30_000 }),
           btnDescarga.click(),
         ]);
         await dl.saveAs(rutaSalida);
@@ -321,13 +328,13 @@ async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id
 
       // Estrategia 2: menú "Más" en el panel de audio
       if (!audioDescargado) {
-        for (const btn of await page.locator('button[aria-label="Más"]').all()) {
+        for (const btn of await page.locator('button[aria-label="Más"], button[aria-label="More options"], button[aria-label="more_vert"]').all()) {
           await btn.click().catch(() => {});
           await page.waitForTimeout(800);
           const itemDescarga = page.locator('[role="menuitem"]').filter({ hasText: /descargar|download/i }).first();
           if (await itemDescarga.isVisible({ timeout: 2000 }).catch(() => false)) {
             const [dl] = await Promise.all([
-              page.waitForEvent('download'),
+              page.waitForEvent('download', { timeout: 30_000 }),
               itemDescarga.click(),
             ]);
             await dl.saveAs(rutaSalida);
