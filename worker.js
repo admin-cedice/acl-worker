@@ -269,9 +269,10 @@ async function ejecutarNotebookLMApi(reporteTexto, titulo, rutaPodcast, auditori
 
 async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id) {
   const ESPERA_ENTRE_REINTENTOS = 10 * 60_000; // 10 minutos
-  const MAX_INTENTOS = 5; // hasta 15 + 4*10 = 55 minutos total
+  const MAX_INTENTOS = 5;
   const rutaSesion = '/tmp/sesion-notebooklm.json';
 
+  // Escribir sesión UNA SOLA VEZ — no eliminar entre intentos
   const sesionNorm = normalizarSesionGoogle(process.env.SESION_GOOGLE);
   fs.writeFileSync(rutaSesion, sesionNorm, 'utf8');
 
@@ -298,114 +299,112 @@ async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id
       await page.goto(notebookUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
       await page.waitForTimeout(10000);
 
-      // Screenshot para diagnóstico (solo primer intento)
-      if (intento === 1) {
-        const shotPath = `/tmp/nlm-screenshot-${auditoria_id}.png`;
-        await page.screenshot({ path: shotPath, fullPage: true });
-        console.log(`   [${auditoria_id}] Screenshot guardado en ${shotPath}`);
-        // Loguear todos los botones visibles para diagnóstico
-        const botones = await page.locator('button').allTextContents();
-        console.log(`   [${auditoria_id}] Botones en página:`, JSON.stringify(botones.slice(0, 30)));
-        const ariaLabels = await page.locator('button[aria-label]').evaluateAll(
-          els => els.map(e => e.getAttribute('aria-label'))
-        );
-        console.log(`   [${auditoria_id}] aria-labels:`, JSON.stringify(ariaLabels.slice(0, 30)));
-      }
-
       let audioDescargado = false;
 
-      // El audio está en el panel Studio como "Audio Overview"
-      // El botón de descarga está en el menú more_vert asociado al Audio Overview
-      // Estrategia: encontrar el contenedor del Audio Overview y hacer clic en su more_vert
-
-      // Estrategia 1: buscar el contenedor de Audio Overview y su menú
-      try {
-        // Hacer clic en el botón "Audio Overview" para expandir el panel si está colapsado
-        const btnAudio = page.locator('button').filter({ hasText: /audio overview/i }).first();
-        if (await btnAudio.isVisible({ timeout: 3000 }).catch(() => false)) {
-          await btnAudio.click();
-          await page.waitForTimeout(2000);
-          console.log(`   [${auditoria_id}] Panel Audio Overview expandido`);
-        }
-
-        // Buscar el botón Play — confirma que el audio está listo
-        const btnPlay = page.locator('button[aria-label="Play"], button[aria-label="Reproducir"]').first();
-        const audioListo = await btnPlay.isVisible({ timeout: 5000 }).catch(() => false);
-        console.log(`   [${auditoria_id}] ¿Audio listo (botón Play visible)? ${audioListo}`);
-
-        if (audioListo) {
-          // El more_vert del Audio Overview — probar cada uno
-          const moreBtns = await page.locator('button[aria-label="more_vert"], button[aria-label="Más"]').all();
-          console.log(`   [${auditoria_id}] Botones more_vert encontrados: ${moreBtns.length}`);
-
-          for (let i = 0; i < moreBtns.length; i++) {
-            await moreBtns[i].click().catch(() => {});
-            await page.waitForTimeout(1000);
-
-            // Loguear los items del menú para diagnóstico
-            const menuItems = await page.locator('[role="menuitem"]').allTextContents();
-            console.log(`   [${auditoria_id}] Menú ${i+1} items:`, JSON.stringify(menuItems));
-
-            const itemDescarga = page.locator('[role="menuitem"]').filter({
-              hasText: /descargar|download/i
-            }).first();
-
-            if (await itemDescarga.isVisible({ timeout: 2000 }).catch(() => false)) {
-              const [dl] = await Promise.all([
-                page.waitForEvent('download', { timeout: 60_000 }),
-                itemDescarga.click(),
-              ]);
-              await dl.saveAs(rutaSalida);
-              audioDescargado = true;
-              console.log(`   [${auditoria_id}] Audio descargado (menú more_vert ${i+1})`);
-              break;
-            }
-            await page.keyboard.press('Escape');
-            await page.waitForTimeout(500);
-          }
-        }
-      } catch(e) {
-        console.log(`   [${auditoria_id}] Estrategia 1 falló: ${e.message}`);
+      // Expandir panel Audio Overview si está colapsado
+      const btnAudio = page.locator('button').filter({ hasText: /audio overview/i }).first();
+      if (await btnAudio.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await btnAudio.click();
+        await page.waitForTimeout(3000);
+        console.log(`   [${auditoria_id}] Panel Audio Overview expandido`);
       }
 
-      // Estrategia 2: buscar link de descarga directo (<a download>)
-      if (!audioDescargado) {
-        const linkDescarga = page.locator('a[download], a[href*=".wav"], a[href*=".mp3"], a[href*="audio"]').first();
-        if (await linkDescarga.isVisible({ timeout: 3000 }).catch(() => false)) {
-          const [dl] = await Promise.all([
-            page.waitForEvent('download', { timeout: 60_000 }),
-            linkDescarga.click(),
-          ]);
-          await dl.saveAs(rutaSalida);
-          audioDescargado = true;
-          console.log(`   [${auditoria_id}] Audio descargado (link directo)`);
+      // Verificar que el audio está listo (botón Play visible)
+      const btnPlay = page.locator('button[aria-label="Play"], button[aria-label="Reproducir"]').first();
+      const audioListo = await btnPlay.isVisible({ timeout: 8000 }).catch(() => false);
+      console.log(`   [${auditoria_id}] Audio listo: ${audioListo}`);
+
+      if (!audioListo) {
+        console.log(`   [${auditoria_id}] Audio aún no generado. Esperando ${ESPERA_ENTRE_REINTENTOS / 60000} min...`);
+        await browser.close();
+        if (intento < MAX_INTENTOS) await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
+        continue;
+      }
+
+      // El log anterior confirmó que el menú 3 (índice 2) tiene "Download"
+      // Probar los botones more_vert en orden inverso (el último suele ser el del Audio Overview)
+      const moreBtns = await page.locator('button[aria-label="more_vert"], button[aria-label="Más"]').all();
+      console.log(`   [${auditoria_id}] Botones more_vert: ${moreBtns.length}`);
+
+      for (let i = moreBtns.length - 1; i >= 0; i--) {
+        await moreBtns[i].click().catch(() => {});
+        await page.waitForTimeout(1500);
+
+        const menuItems = await page.locator('[role="menuitem"]').allTextContents();
+        console.log(`   [${auditoria_id}] Menú ${i+1}:`, JSON.stringify(menuItems));
+
+        const itemDescarga = page.locator('[role="menuitem"]').filter({
+          hasText: /download|descargar|save_alt/i
+        }).first();
+
+        if (await itemDescarga.isVisible({ timeout: 2000 }).catch(() => false)) {
+          console.log(`   [${auditoria_id}] Encontrado item descarga en menú ${i+1}`);
+          try {
+            // Intentar capturar como evento download
+            const [dl] = await Promise.all([
+              page.waitForEvent('download', { timeout: 15_000 }),
+              itemDescarga.click(),
+            ]);
+            await dl.saveAs(rutaSalida);
+            audioDescargado = true;
+            console.log(`   [${auditoria_id}] ✅ Audio descargado vía evento download`);
+          } catch {
+            // Si no dispara evento download, puede abrir nueva pestaña con el archivo
+            console.log(`   [${auditoria_id}] Evento download no disparado — intentando vía nueva pestaña`);
+            const [newPage] = await Promise.all([
+              context.waitForEvent('page', { timeout: 10_000 }).catch(() => null),
+              itemDescarga.click().catch(() => {}),
+            ]);
+            if (newPage) {
+              await newPage.waitForLoadState('domcontentloaded').catch(() => {});
+              const url = newPage.url();
+              console.log(`   [${auditoria_id}] Nueva pestaña URL: ${url}`);
+              if (url && (url.includes('.wav') || url.includes('.mp3') || url.includes('audio') || url.startsWith('blob:'))) {
+                // Descargar desde URL directa
+                const token = await obtenerTokenGoogle();
+                const resp = await fetch(url, {
+                  headers: url.startsWith('blob:') ? {} : { 'Authorization': `Bearer ${token}` }
+                });
+                if (resp.ok) {
+                  const buffer = Buffer.from(await resp.arrayBuffer());
+                  fs.writeFileSync(rutaSalida, buffer);
+                  audioDescargado = true;
+                  console.log(`   [${auditoria_id}] ✅ Audio descargado vía nueva pestaña`);
+                }
+              }
+              await newPage.close().catch(() => {});
+            }
+          }
+          break;
         }
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(500);
       }
 
       await browser.close();
-      fs.unlinkSync(rutaSesion);
 
-      if (audioDescargado) return;
-
-      // Audio aún no está listo
-      console.log(`   [${auditoria_id}] Audio aún no listo. Esperando ${ESPERA_ENTRE_REINTENTOS / 60000} min...`);
-      if (intento < MAX_INTENTOS) {
-        await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
+      if (audioDescargado) {
+        // Limpiar sesión temporal solo si éxito
+        fs.unlinkSync(rutaSesion);
+        return;
       }
+
+      console.log(`   [${auditoria_id}] No se pudo descargar en intento ${intento}. Esperando ${ESPERA_ENTRE_REINTENTOS / 60000} min...`);
+      if (intento < MAX_INTENTOS) await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
 
     } catch(err) {
       await browser.close().catch(() => {});
       if (err.message.includes('Sesión de NotebookLM expirada')) {
         await alertarSesionExpirada();
+        fs.unlinkSync(rutaSesion);
         throw err;
       }
       console.error(`   [${auditoria_id}] Error en intento ${intento}:`, err.message);
-      if (intento < MAX_INTENTOS) {
-        await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
-      }
+      if (intento < MAX_INTENTOS) await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
     }
   }
 
+  fs.unlinkSync(rutaSesion);
   throw new Error(`No se pudo descargar el audio tras ${MAX_INTENTOS} intentos`);
 }
 
