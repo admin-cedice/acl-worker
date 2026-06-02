@@ -76,24 +76,39 @@ async function nlmCrearNotebook(titulo) {
   return data.notebookId;
 }
 
-// Agregar fuente (texto) al notebook
+// Agregar fuente (texto plano) al notebook via batchCreate
+// Devuelve el sourceId para usarlo en audioOverviews
 async function nlmAgregarFuente(notebookId, titulo, contenido) {
-  await nlmRequest(
+  const data = await nlmRequest(
     'POST',
-    `${NLM_PARENT}/notebooks/${notebookId}/sources`,
+    `${NLM_PARENT}/notebooks/${notebookId}/sources:batchCreate`,
     {
-      displayName: titulo,
-      corpus: { inlineSource: { content: contenido, mimeType: 'text/plain' } },
+      userContents: [
+        {
+          rawContent: {
+            content: contenido,
+            mimeType: 'text/plain',
+            sourceName: titulo,
+          },
+        },
+      ],
     }
   );
+  // La respuesta puede tener sources[0].sourceId o sources[0].name
+  const fuentes = data.sources || data.userContents || [];
+  const sourceId = fuentes[0]?.sourceId || fuentes[0]?.name?.split('/').pop() || null;
+  return sourceId;
 }
 
 // Disparar generación de Audio Overview
-async function nlmGenerarAudio(notebookId) {
+// sourceId es opcional — si es null se usan todas las fuentes del notebook
+async function nlmGenerarAudio(notebookId, sourceId) {
+  const body = { languageCode: 'es-US' };
+  if (sourceId) body.sourceIds = [{ id: sourceId }];
   const data = await nlmRequest(
     'POST',
     `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews`,
-    { language: 'es-US' }
+    body
   );
   return data.audioOverviewId || data.name?.split('/').pop();
 }
@@ -150,7 +165,9 @@ async function nlmDescargarAudio(audioData, rutaSalida) {
 
 // Eliminar notebook (limpieza)
 async function nlmEliminarNotebook(notebookId) {
-  await nlmRequest('DELETE', `${NLM_PARENT}/notebooks/${notebookId}`).catch(() => {});
+  await nlmRequest('POST', `${NLM_PARENT}/notebooks:batchDelete`, {
+    names: [`${NLM_PARENT}/notebooks/${notebookId}`],
+  }).catch(() => {});
 }
 
 // ── Pipeline NotebookLM completo ─────────────────────────────────────────────
@@ -163,14 +180,14 @@ async function ejecutarNotebookLMApi(reporteTexto, titulo, rutaPodcast, auditori
     console.log(`   [${auditoria_id}] Notebook creado: ${notebookId}`);
 
     console.log(`   [${auditoria_id}] Agregando reporte como fuente...`);
-    await nlmAgregarFuente(notebookId, titulo, reporteTexto);
-    console.log(`   [${auditoria_id}] Fuente agregada`);
+    const sourceId = await nlmAgregarFuente(notebookId, titulo, reporteTexto);
+    console.log(`   [${auditoria_id}] Fuente agregada (sourceId: ${sourceId})`);
 
     // Breve pausa para que NotebookLM indexe el contenido
     await new Promise(r => setTimeout(r, 10_000));
 
     console.log(`   [${auditoria_id}] Disparando generación de Audio Overview...`);
-    const audioId = await nlmGenerarAudio(notebookId);
+    const audioId = await nlmGenerarAudio(notebookId, sourceId);
     console.log(`   [${auditoria_id}] Audio en proceso: ${audioId}`);
 
     console.log(`   [${auditoria_id}] Esperando que el audio esté listo...`);
