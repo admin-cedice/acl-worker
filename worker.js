@@ -34,6 +34,9 @@ function obtenerGoogleAuth() {
   return new GoogleAuth({
     credentials: credenciales,
     scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+    clientOptions: {
+      subject: process.env.GOOGLE_IMPERSONATE_USER || 'admin@liberalmente.app',
+    },
   });
 }
 
