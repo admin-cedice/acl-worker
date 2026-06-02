@@ -314,36 +314,71 @@ async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id
 
       let audioDescargado = false;
 
-      // Estrategia 1: botón directo de descarga
-      const btnDescarga = page.locator('button').filter({ hasText: /descargar|download/i }).first();
-      if (await btnDescarga.isVisible({ timeout: 5000 }).catch(() => false)) {
-        const [dl] = await Promise.all([
-          page.waitForEvent('download', { timeout: 30_000 }),
-          btnDescarga.click(),
-        ]);
-        await dl.saveAs(rutaSalida);
-        audioDescargado = true;
-        console.log(`   [${auditoria_id}] Audio descargado (botón directo)`);
+      // El audio está en el panel Studio como "Audio Overview"
+      // El botón de descarga está en el menú more_vert asociado al Audio Overview
+      // Estrategia: encontrar el contenedor del Audio Overview y hacer clic en su more_vert
+
+      // Estrategia 1: buscar el contenedor de Audio Overview y su menú
+      try {
+        // Hacer clic en el botón "Audio Overview" para expandir el panel si está colapsado
+        const btnAudio = page.locator('button').filter({ hasText: /audio overview/i }).first();
+        if (await btnAudio.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await btnAudio.click();
+          await page.waitForTimeout(2000);
+          console.log(`   [${auditoria_id}] Panel Audio Overview expandido`);
+        }
+
+        // Buscar el botón Play — confirma que el audio está listo
+        const btnPlay = page.locator('button[aria-label="Play"], button[aria-label="Reproducir"]').first();
+        const audioListo = await btnPlay.isVisible({ timeout: 5000 }).catch(() => false);
+        console.log(`   [${auditoria_id}] ¿Audio listo (botón Play visible)? ${audioListo}`);
+
+        if (audioListo) {
+          // El more_vert del Audio Overview — probar cada uno
+          const moreBtns = await page.locator('button[aria-label="more_vert"], button[aria-label="Más"]').all();
+          console.log(`   [${auditoria_id}] Botones more_vert encontrados: ${moreBtns.length}`);
+
+          for (let i = 0; i < moreBtns.length; i++) {
+            await moreBtns[i].click().catch(() => {});
+            await page.waitForTimeout(1000);
+
+            // Loguear los items del menú para diagnóstico
+            const menuItems = await page.locator('[role="menuitem"]').allTextContents();
+            console.log(`   [${auditoria_id}] Menú ${i+1} items:`, JSON.stringify(menuItems));
+
+            const itemDescarga = page.locator('[role="menuitem"]').filter({
+              hasText: /descargar|download/i
+            }).first();
+
+            if (await itemDescarga.isVisible({ timeout: 2000 }).catch(() => false)) {
+              const [dl] = await Promise.all([
+                page.waitForEvent('download', { timeout: 60_000 }),
+                itemDescarga.click(),
+              ]);
+              await dl.saveAs(rutaSalida);
+              audioDescargado = true;
+              console.log(`   [${auditoria_id}] Audio descargado (menú more_vert ${i+1})`);
+              break;
+            }
+            await page.keyboard.press('Escape');
+            await page.waitForTimeout(500);
+          }
+        }
+      } catch(e) {
+        console.log(`   [${auditoria_id}] Estrategia 1 falló: ${e.message}`);
       }
 
-      // Estrategia 2: menú "Más" en el panel de audio
+      // Estrategia 2: buscar link de descarga directo (<a download>)
       if (!audioDescargado) {
-        for (const btn of await page.locator('button[aria-label="Más"], button[aria-label="More options"], button[aria-label="more_vert"]').all()) {
-          await btn.click().catch(() => {});
-          await page.waitForTimeout(800);
-          const itemDescarga = page.locator('[role="menuitem"]').filter({ hasText: /descargar|download/i }).first();
-          if (await itemDescarga.isVisible({ timeout: 2000 }).catch(() => false)) {
-            const [dl] = await Promise.all([
-              page.waitForEvent('download', { timeout: 30_000 }),
-              itemDescarga.click(),
-            ]);
-            await dl.saveAs(rutaSalida);
-            audioDescargado = true;
-            console.log(`   [${auditoria_id}] Audio descargado (menú Más)`);
-            break;
-          }
-          await page.keyboard.press('Escape');
-          await page.waitForTimeout(400);
+        const linkDescarga = page.locator('a[download], a[href*=".wav"], a[href*=".mp3"], a[href*="audio"]').first();
+        if (await linkDescarga.isVisible({ timeout: 3000 }).catch(() => false)) {
+          const [dl] = await Promise.all([
+            page.waitForEvent('download', { timeout: 60_000 }),
+            linkDescarga.click(),
+          ]);
+          await dl.saveAs(rutaSalida);
+          audioDescargado = true;
+          console.log(`   [${auditoria_id}] Audio descargado (link directo)`);
         }
       }
 
