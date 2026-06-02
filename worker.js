@@ -466,7 +466,7 @@ Reglas:
 
 async function extraerEstructuraPresentacion(reporteTexto) {
   const respuesta = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: 4000,
     system: PROMPT_EXTRACCION,
     messages: [{ role: 'user', content: `Extrae la estructura de este reporte:\n\n${reporteTexto}` }],
@@ -736,7 +736,7 @@ async function extraerTextoPDF(rutaPDF) {
 async function extraerMetadatos(textoPDF) {
   const muestra = textoPDF.slice(0, 3000);
   const respuesta = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: 300,
     system: `Eres un clasificador de documentos jurídicos. Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks.`,
     messages: [{
@@ -762,7 +762,7 @@ Fragmento:\n${muestra}`,
 
 async function analizarConClaude(textoPDF, config) {
   const respuesta = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: 8000,
     system: config.prompt_sistema,
     messages: [{ role: 'user', content: `${config.prompt_analisis}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}` }],
