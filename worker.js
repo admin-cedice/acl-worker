@@ -120,22 +120,29 @@ async function nlmGenerarAudio(notebookId) {
   return audioId;
 }
 
-// Esperar hasta que el Audio Overview esté listo (polling)
+// Esperar hasta que el Audio Overview esté listo
+// Polling via GET /notebooks/{id} — el audioOverview no tiene endpoint GET propio
 async function nlmEsperarAudio(notebookId, audioId, auditoria_id) {
   const INTERVALO = 30_000;  // 30 segundos
   const TIMEOUT   = 30 * 60_000; // 30 minutos
   const t0 = Date.now();
 
   while (true) {
+    // GET al notebook — incluye el estado del audioOverview
     const data = await nlmRequest(
       'GET',
-      `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews/${audioId}`
+      `${NLM_PARENT}/notebooks/${notebookId}`
     );
 
-    // La API devuelve { audioOverview: { status: "...", audioOverviewId: "..." } }
-    const overview = data.audioOverview || data;
-    const estado = overview.status || overview.state;
+    // El notebook puede incluir audioOverviews en su respuesta
+    const overviews = data.audioOverviews || [];
+    const overview  = overviews.find(o =>
+      o.audioOverviewId === audioId || o.name?.includes(audioId)
+    ) || overviews[0];
+
+    const estado = overview?.status || overview?.state || 'UNKNOWN';
     console.log(`   [${auditoria_id}] Audio estado: ${estado}`);
+    console.log(`   [NLM] notebook GET response keys: ${Object.keys(data).join(', ')}`);
 
     if (estado === 'AUDIO_OVERVIEW_STATUS_SUCCEEDED'
         || estado === 'SUCCEEDED' || estado === 'ACTIVE') {
@@ -143,7 +150,7 @@ async function nlmEsperarAudio(notebookId, audioId, auditoria_id) {
     }
     if (estado === 'AUDIO_OVERVIEW_STATUS_FAILED'
         || estado === 'FAILED' || estado === 'ERROR') {
-      throw new Error(`Audio Overview falló: ${JSON.stringify(data)}`);
+      throw new Error(`Audio Overview falló: ${JSON.stringify(overview)}`);
     }
     if (Date.now() - t0 > TIMEOUT) {
       throw new Error('Timeout: Audio Overview no terminó en 30 minutos');
