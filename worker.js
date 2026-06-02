@@ -340,59 +340,43 @@ async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id
         if (await itemDescarga.isVisible({ timeout: 2000 }).catch(() => false)) {
           console.log(`   [${auditoria_id}] Encontrado item descarga en menú ${i+1}`);
 
-          // Interceptar requests de red para capturar la URL del audio
-          const audioUrls = [];
-          page.on('request', req => {
-            const url = req.url();
-            if (url.includes('.wav') || url.includes('.mp3') || url.includes('audio')
-                || url.includes('download') || url.includes('storage.googleapis')) {
-              audioUrls.push(url);
-              console.log(`   [${auditoria_id}] Request interceptada: ${url.slice(0, 120)}`);
-            }
-          });
-          page.on('response', resp => {
-            const url = resp.url();
-            const ct  = resp.headers()['content-type'] || '';
-            if (ct.includes('audio') || url.includes('.wav') || url.includes('.mp3')) {
-              console.log(`   [${auditoria_id}] Response audio: ${url.slice(0, 120)} [${ct}]`);
-              audioUrls.push(url);
-            }
+          // Inyectar interceptor de Blob URLs ANTES del clic
+          await page.evaluate(() => {
+            window.__blobUrls = [];
+            const origCreateObjectURL = URL.createObjectURL.bind(URL);
+            URL.createObjectURL = function(obj) {
+              const url = origCreateObjectURL(obj);
+              window.__blobUrls.push({ url, type: obj.type || 'unknown', size: obj.size || 0 });
+              return url;
+            };
           });
 
-          // Hacer clic y esperar reacciones
-          await Promise.all([
-            page.waitForTimeout(5000),
-            itemDescarga.click().catch(() => {}),
-          ]);
+          // Hacer clic en Download
+          await itemDescarga.click().catch(() => {});
+          await page.waitForTimeout(3000);
 
-          console.log(`   [${auditoria_id}] URLs de audio capturadas: ${JSON.stringify(audioUrls)}`);
+          // Recuperar Blob URLs capturadas
+          const blobInfo = await page.evaluate(() => window.__blobUrls || []);
+          console.log(`   [${auditoria_id}] Blob URLs capturadas: ${JSON.stringify(blobInfo)}`);
 
-          // Verificar si apareció un elemento <audio> o <a> en la página
-          const audioSrc = await page.locator('audio[src], audio source').first()
-            .getAttribute('src').catch(() => null);
-          console.log(`   [${auditoria_id}] audio src en página: ${audioSrc}`);
-
-          // Ver si la URL cambió
-          console.log(`   [${auditoria_id}] URL actual: ${page.url()}`);
-
-          // Si hay URL de audio capturada, descargar con fetch
-          if (audioUrls.length > 0) {
-            const audioUrl = audioUrls[audioUrls.length - 1];
-            const token = await obtenerTokenGoogle();
-            const resp = await fetch(audioUrl, {
-              headers: { 'Authorization': `Bearer ${token}` }
-            });
-            console.log(`   [${auditoria_id}] Fetch respuesta: ${resp.status} ${resp.headers.get('content-type')}`);
-            if (resp.ok) {
-              const buffer = Buffer.from(await resp.arrayBuffer());
-              fs.writeFileSync(rutaSalida, buffer);
-              audioDescargado = true;
-              console.log(`   [${auditoria_id}] ✅ Audio descargado vía intercepción de red`);
-            }
-          }
-
-          if (!audioDescargado) {
-            // Intentar vía evento download con más tiempo
+          if (blobInfo.length > 0) {
+            // Descargar el blob desde dentro del contexto del browser
+            const blobUrl = blobInfo[blobInfo.length - 1].url;
+            console.log(`   [${auditoria_id}] Descargando blob: ${blobUrl}`);
+            const base64 = await page.evaluate(async (url) => {
+              const resp = await fetch(url);
+              const buf  = await resp.arrayBuffer();
+              const bytes = new Uint8Array(buf);
+              let binary = '';
+              for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+              return btoa(binary);
+            }, blobUrl);
+            const buffer = Buffer.from(base64, 'base64');
+            fs.writeFileSync(rutaSalida, buffer);
+            audioDescargado = true;
+            console.log(`   [${auditoria_id}] ✅ Audio descargado vía Blob URL (${buffer.length} bytes)`);
+          } else {
+            // Fallback: evento download estándar
             try {
               await page.keyboard.press('Escape');
               await page.waitForTimeout(500);
@@ -407,7 +391,7 @@ async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id
               audioDescargado = true;
               console.log(`   [${auditoria_id}] ✅ Audio descargado vía evento download`);
             } catch(e2) {
-              console.log(`   [${auditoria_id}] Evento download también falló: ${e2.message.slice(0, 80)}`);
+              console.log(`   [${auditoria_id}] Fallback también falló: ${e2.message.slice(0, 80)}`);
             }
           }
           break;
