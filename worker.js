@@ -103,14 +103,12 @@ async function nlmAgregarFuente(notebookId, titulo, contenido) {
 }
 
 // Disparar generación de Audio Overview
-// sourceId es opcional — si es null se usan todas las fuentes del notebook
-async function nlmGenerarAudio(notebookId, sourceId) {
-  const body = { languageCode: 'es-US' };
-  if (sourceId) body.sourceIds = [{ id: sourceId }];
+// Sin body — la API usa todas las fuentes del notebook por defecto
+async function nlmGenerarAudio(notebookId) {
   const data = await nlmRequest(
     'POST',
     `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews`,
-    body
+    null
   );
   return data.audioOverviewId || data.name?.split('/').pop();
 }
@@ -189,7 +187,7 @@ async function ejecutarNotebookLMApi(reporteTexto, titulo, rutaPodcast, auditori
     await new Promise(r => setTimeout(r, 10_000));
 
     console.log(`   [${auditoria_id}] Disparando generación de Audio Overview...`);
-    const audioId = await nlmGenerarAudio(notebookId, sourceId);
+    const audioId = await nlmGenerarAudio(notebookId);
     console.log(`   [${auditoria_id}] Audio en proceso: ${audioId}`);
 
     console.log(`   [${auditoria_id}] Esperando que el audio esté listo...`);
