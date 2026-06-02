@@ -121,28 +121,29 @@ async function nlmGenerarAudio(notebookId) {
 }
 
 // Esperar hasta que el Audio Overview esté listo
-// Polling via GET /notebooks/{id} — el audioOverview no tiene endpoint GET propio
+// Polling via GET /notebooks/{id}/audioOverviews (list)
 async function nlmEsperarAudio(notebookId, audioId, auditoria_id) {
   const INTERVALO = 30_000;  // 30 segundos
   const TIMEOUT   = 30 * 60_000; // 30 minutos
   const t0 = Date.now();
 
   while (true) {
-    // GET al notebook — incluye el estado del audioOverview
+    // GET lista de audioOverviews del notebook
     const data = await nlmRequest(
       'GET',
-      `${NLM_PARENT}/notebooks/${notebookId}`
+      `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews`
     );
 
-    // El notebook puede incluir audioOverviews en su respuesta
-    const overviews = data.audioOverviews || [];
-    const overview  = overviews.find(o =>
+    console.log(`   [NLM] audioOverviews list response: ${JSON.stringify(data)}`);
+
+    // La respuesta puede ser { audioOverviews: [...] } o { audioOverview: {...} }
+    const lista = data.audioOverviews || (data.audioOverview ? [data.audioOverview] : []);
+    const overview = lista.find(o =>
       o.audioOverviewId === audioId || o.name?.includes(audioId)
-    ) || overviews[0];
+    ) || lista[0];
 
     const estado = overview?.status || overview?.state || 'UNKNOWN';
     console.log(`   [${auditoria_id}] Audio estado: ${estado}`);
-    console.log(`   [NLM] notebook GET response keys: ${Object.keys(data).join(', ')}`);
 
     if (estado === 'AUDIO_OVERVIEW_STATUS_SUCCEEDED'
         || estado === 'SUCCEEDED' || estado === 'ACTIVE') {
