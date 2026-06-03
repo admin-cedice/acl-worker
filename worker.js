@@ -1,8 +1,8 @@
-// worker.js — ACL Worker v3.2
+// worker.js — ACL Worker v3.3
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
 // Hemisferio derecho: NotebookLM Enterprise API (flujo híbrido)
-// v3.2: eliminado Playwright · integrado PPTX · integrado mapa mental · endpoint /completar-audio
+// v3.3: conversión wav→mp3 · nombre descriptivo de audio · episodeFocus en español
 
 'use strict';
 
@@ -13,6 +13,7 @@ const Anthropic  = require('@anthropic-ai/sdk');
 const { Pool }   = require('pg');
 const pptxgen    = require('pptxgenjs');
 const sharp      = require('sharp');
+const ffmpeg     = require('fluent-ffmpeg');
 const fs         = require('fs');
 const path       = require('path');
 const pdfParse   = require('pdf-parse');
@@ -121,9 +122,6 @@ async function nlmEliminarNotebook(notebookId) {
 }
 
 // ── Fase API de NotebookLM (solo dispara — no espera ni descarga) ─────────────
-// Crea notebook, agrega fuente, dispara audio.
-// Devuelve el notebookId para que el editor acceda manualmente.
-// El notebook NO se elimina aquí — se elimina cuando el editor complete el audio.
 
 async function dispararNotebookLM(reporteTexto, titulo, auditoria_id) {
   console.log(`   [${auditoria_id}] Creando notebook en NotebookLM...`);
@@ -134,7 +132,6 @@ async function dispararNotebookLM(reporteTexto, titulo, auditoria_id) {
   await nlmAgregarFuente(notebookId, titulo, reporteTexto);
   console.log(`   [${auditoria_id}] Fuente agregada`);
 
-  // Pausa para que NotebookLM indexe el contenido antes de disparar el audio
   await new Promise(r => setTimeout(r, 10_000));
 
   console.log(`   [${auditoria_id}] Disparando generación de Audio Overview...`);
@@ -143,6 +140,30 @@ async function dispararNotebookLM(reporteTexto, titulo, auditoria_id) {
   console.log(`   [${auditoria_id}] Audio en generación: ${audioId}`);
 
   return notebookId;
+}
+
+// ── Utilidades de audio ──────────────────────────────────────────────────────
+
+function slugificar(texto) {
+  return texto
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .slice(0, 60);
+}
+
+async function convertirWavAMp3(rutaWav, rutaMp3) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(rutaWav)
+      .audioCodec('libmp3lame')
+      .audioBitrate('128k')
+      .output(rutaMp3)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
 }
 
 // ── Paleta institucional para PPTX ──────────────────────────────────────────
@@ -217,42 +238,34 @@ function footer(slide) {
   });
 }
 
-// ── Láminas PPTX ─────────────────────────────────────────────────────────────
-
 function laminaPortada(pres, d) {
   const slide = pres.addSlide();
   slide.background = { color: C.blanco };
   barraRoja(slide);
-
   slide.addText('AUDITORÍA CÍVICA LIBERAL · LIBERALMENTE.APP', {
     x: ML, y: MT, w: 7, h: 0.22,
     fontSize: 7.5, color: C.textoMuted, fontFace: 'Calibri', charSpacing: 1.5, margin: 0,
   });
   slide.addText(d.titulo, {
     x: ML, y: MT + 0.25, w: 7.1, h: 1.0,
-    fontSize: 22, color: C.texto, fontFace: 'Georgia', bold: true,
-    align: 'left', valign: 'top', margin: 0,
+    fontSize: 22, color: C.texto, fontFace: 'Georgia', bold: true, align: 'left', valign: 'top', margin: 0,
   });
   slide.addText(d.subtitulo || '', {
     x: ML, y: MT + 1.3, w: 7, h: 0.3,
     fontSize: 11, color: C.textoMid, fontFace: 'Calibri', margin: 0,
   });
   slide.addShape('rect', { x: ML, y: MT + 1.72, w: CW, h: 0.008, fill: { color: C.cremaBorde }, line: { color: C.cremaBorde, width: 0 } });
-
   slide.addImage({ data: iconGauge(d.puntaje), x: 7.8, y: MT - 0.05, w: 1.7, h: 1.7 });
   const colorRiesgo = d.nivelRiesgo === 'BAJO' ? C.rojo : d.nivelRiesgo === 'MODERADO' ? C.dorado : C.texto;
   slide.addShape('rect', { x: 7.85, y: MT + 1.65, w: 1.6, h: 0.28, fill: { color: colorRiesgo }, line: { color: colorRiesgo, width: 0 } });
   slide.addText(`RIESGO ${d.nivelRiesgo}`, {
     x: 7.85, y: MT + 1.65, w: 1.6, h: 0.28,
-    fontSize: 8, color: C.blanco, fontFace: 'Calibri', bold: true,
-    align: 'center', valign: 'middle', charSpacing: 1, margin: 0,
+    fontSize: 8, color: C.blanco, fontFace: 'Calibri', bold: true, align: 'center', valign: 'middle', charSpacing: 1, margin: 0,
   });
-
   slide.addText(`RESULTADOS POR CATEGORÍA — ${d.criterios_total || 28} CRITERIOS EVALUADOS`, {
     x: ML, y: MT + 1.88, w: CW, h: 0.22,
     fontSize: 7.5, color: C.textoMuted, fontFace: 'Calibri', charSpacing: 1.2, margin: 0,
   });
-
   const catW = 2.18, catH = 1.0, catGap = 0.07, catY = MT + 2.18;
   d.categorias.forEach((cat, i) => {
     const col = i % 4, row = Math.floor(i / 4);
@@ -273,14 +286,12 @@ function laminaPortada(pres, d) {
       slide.addText(`${cat.siMatiz} SÍ*`, { x: bx, y: badgeY, w: 0.5, h: 0.18, fontSize: 7.5, color: C.dorado, fontFace: 'Calibri', bold: true, align: 'center', valign: 'middle', margin: 0 });
     }
   });
-
   const totalCol = d.categorias.length % 4, totalRow = Math.floor(d.categorias.length / 4);
   const tx = ML + totalCol * (catW + catGap), ty = catY + totalRow * (catH + catGap);
   slide.addShape('rect', { x: tx, y: ty, w: catW, h: catH, fill: { color: C.rojo }, line: { color: C.rojo, width: 0 } });
   slide.addText('TOTAL', { x: tx, y: ty + 0.12, w: catW, h: 0.18, fontSize: 8, color: 'FFFFFF', fontFace: 'Calibri', align: 'center', charSpacing: 1.5, margin: 0 });
   slide.addText(`${d.siPlenos} SÍ · ${d.siMatiz} SÍ*`, { x: tx, y: ty + 0.34, w: catW, h: 0.28, fontSize: 13, color: C.blanco, fontFace: 'Calibri', bold: true, align: 'center', margin: 0 });
   slide.addText(`0 NO · 0 N/A`, { x: tx, y: ty + 0.65, w: catW, h: 0.18, fontSize: 9, color: 'FFFFFF', fontFace: 'Calibri', align: 'center', margin: 0 });
-
   footer(slide);
 }
 
@@ -288,11 +299,9 @@ function laminaCategoria(pres, cat) {
   const slide = pres.addSlide();
   slide.background = { color: C.blanco };
   barraRoja(slide);
-
   slide.addImage({ data: iconCategoria(cat.num), x: ML, y: MT, w: 0.38, h: 0.38 });
   slide.addText(`CATEGORÍA ${cat.num}`, { x: ML + 0.45, y: MT + 0.02, w: 5, h: 0.18, fontSize: 8, color: C.textoMuted, fontFace: 'Calibri', charSpacing: 1.5, margin: 0 });
   slide.addText(cat.nombre, { x: ML + 0.45, y: MT + 0.2, w: 6.5, h: 0.3, fontSize: 17, color: C.texto, fontFace: 'Georgia', bold: true, margin: 0 });
-
   let bx = W - MR - 1.85;
   if (cat.siPlenos > 0) {
     slide.addShape('rect', { x: bx, y: MT + 0.06, w: 0.9, h: 0.26, fill: { color: C.verdeBg }, line: { color: C.verdeBg, width: 0 } });
@@ -303,15 +312,12 @@ function laminaCategoria(pres, cat) {
     slide.addShape('rect', { x: bx, y: MT + 0.06, w: 0.95, h: 0.26, fill: { color: C.doradoBg }, line: { color: C.doradoBg, width: 0 } });
     slide.addText(`${cat.siMatiz} SÍ con matiz`, { x: bx, y: MT + 0.06, w: 0.95, h: 0.26, fontSize: 8, color: C.dorado, fontFace: 'Calibri', bold: true, align: 'center', valign: 'middle', margin: 0 });
   }
-
   slide.addShape('rect', { x: ML, y: MT + 0.6, w: CW, h: 0.008, fill: { color: C.cremaBorde }, line: { color: C.cremaBorde, width: 0 } });
-
   const n = cat.criterios.length;
   const cols = Math.min(n, 5), rows = Math.ceil(n / cols);
   const cW = (CW - (cols - 1) * 0.07) / cols;
   const cH = (H - MT - 0.85 - (rows - 1) * 0.07 - 0.3) / rows;
   const gridY = MT + 0.72;
-
   cat.criterios.forEach((crit, i) => {
     const col = i % cols, row = Math.floor(i / cols);
     const cx = ML + col * (cW + 0.07), cy = gridY + row * (cH + 0.07);
@@ -326,7 +332,6 @@ function laminaCategoria(pres, cat) {
     slide.addShape('rect', { x: cx + 0.1, y: cy + cH - 0.24, w: 0.38, h: 0.17, fill: { color: badgeBg }, line: { color: badgeBg, width: 0 } });
     slide.addText(badgeLabel, { x: cx + 0.1, y: cy + cH - 0.24, w: 0.38, h: 0.17, fontSize: 7.5, color: badgeColor, fontFace: 'Calibri', bold: true, align: 'center', valign: 'middle', margin: 0 });
   });
-
   footer(slide);
 }
 
@@ -334,7 +339,6 @@ function laminaAlerta(pres, alerta, numero, total) {
   const slide = pres.addSlide();
   slide.background = { color: C.blanco };
   barraRoja(slide);
-
   const colorGrav = alerta.gravedad === 'ALTA' ? C.rojo : alerta.gravedad === 'MODERADA-ALTA' ? C.dorado : C.teal;
   slide.addImage({ data: iconAlerta(alerta.gravedad), x: ML, y: MT, w: 0.52, h: 0.52 });
   slide.addText(`ALERTA ${numero} DE ${total}  ·  GRAVEDAD: ${alerta.gravedad}`, {
@@ -350,7 +354,6 @@ function laminaAlerta(pres, alerta, numero, total) {
     x: ML, y: MT + 1.0, w: CW * 0.72, h: 3.1,
     fontSize: 11, color: C.textoMid, fontFace: 'Calibri', align: 'left', valign: 'top', margin: 0,
   });
-
   if (alerta.criterios && alerta.criterios.length > 0) {
     slide.addText('CRITERIOS AFECTADOS', { x: ML, y: MT + 4.18, w: CW * 0.72, h: 0.18, fontSize: 7.5, color: C.textoMuted, fontFace: 'Calibri', charSpacing: 1.2, margin: 0 });
     let bx = ML;
@@ -360,13 +363,11 @@ function laminaAlerta(pres, alerta, numero, total) {
       bx += 0.66;
     });
   }
-
   const panelX = ML + CW * 0.76, panelW = CW * 0.24;
   slide.addShape('rect', { x: panelX, y: MT + 1.0, w: panelW, h: 3.6, fill: { color: 'FAFAF8' }, line: { color: C.cremaBorde, width: 0.5 } });
   slide.addShape('rect', { x: panelX, y: MT + 1.0, w: 0.04, h: 3.6, fill: { color: colorGrav }, line: { color: colorGrav, width: 0 } });
   slide.addText('IMPACTO LIBERAL', { x: panelX + 0.12, y: MT + 1.12, w: panelW - 0.18, h: 0.2, fontSize: 7.5, color: C.textoMuted, fontFace: 'Calibri', charSpacing: 1, margin: 0 });
   slide.addText(alerta.impacto || '', { x: panelX + 0.12, y: MT + 1.36, w: panelW - 0.22, h: 2.9, fontSize: 9.5, color: C.texto, fontFace: 'Calibri', align: 'left', valign: 'top', margin: 0 });
-
   footer(slide);
 }
 
@@ -425,143 +426,78 @@ async function extraerEstructura(reporteTexto) {
   return JSON.parse(limpio);
 }
 
-// ── Generar PPTX ─────────────────────────────────────────────────────────────
-
 async function generarPresentacion(reporteTexto, titulo, rutaSalida, auditoria_id) {
   console.log(`   [${auditoria_id}] Extrayendo estructura con Claude...`);
   const estructura = await extraerEstructura(reporteTexto);
   console.log(`   [${auditoria_id}] Estructura extraída: ${estructura.categorias.length} categorías · ${estructura.alertas.length} alertas`);
-
   const pres = new pptxgen();
   pres.layout  = 'LAYOUT_16x9';
   pres.author  = 'Auditoría Cívica Liberal — liberalmente.app';
   pres.title   = titulo;
   pres.subject = 'Auditoría Liberal · CEDICE / Friedrich Naumann';
-
   laminaPortada(pres, estructura);
   for (const cat of estructura.categorias) laminaCategoria(pres, cat);
   if (estructura.alertas?.length > 0) {
-    estructura.alertas.forEach((alerta, i) =>
-      laminaAlerta(pres, alerta, i + 1, estructura.alertas.length)
-    );
+    estructura.alertas.forEach((alerta, i) => laminaAlerta(pres, alerta, i + 1, estructura.alertas.length));
   }
-
   await pres.writeFile({ fileName: rutaSalida });
   console.log(`   [${auditoria_id}] PPTX generado: ${rutaSalida}`);
-  return estructura; // devolvemos la estructura para reutilizarla en el mapa mental
+  return estructura;
 }
-
-// ── Generar Mapa Mental (SVG → PNG via sharp) ────────────────────────────────
-// Estructura radial: nodo central → 7 ramas (categorías) → subnodos por criterio
 
 async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
   console.log(`   [${auditoria_id}] Generando mapa mental SVG...`);
-
   const ANCHO = 2400, ALTO = 2400;
   const CX = ANCHO / 2, CY = ALTO / 2;
-  const R_CENTRO = 120;
-  const R_CAT    = 340; // radio nodo categoría
-  const R_CRIT   = 580; // radio subnodos criterio
-
-  // Colores por resultado
+  const R_CENTRO = 120, R_CAT = 340, R_CRIT = 580;
   const colorResultado = {
     SI:       { fill: '#E8F5E9', stroke: '#2E7D32', texto: '#1B5E20' },
     SI_MATIZ: { fill: '#FFF8E1', stroke: '#B8860B', texto: '#7B5800' },
     NO:       { fill: '#FFEBEE', stroke: '#C41230', texto: '#8B0000' },
     NA:       { fill: '#F5F5F5', stroke: '#8A8478', texto: '#4A4A4A' },
   };
-
   const nCats = estructura.categorias.length;
-
-  // Acumular elementos SVG
   const lineas = [], nodos = [], textos = [];
-
   estructura.categorias.forEach((cat, i) => {
     const angulo = (2 * Math.PI * i / nCats) - Math.PI / 2;
     const catX   = CX + R_CAT * Math.cos(angulo);
     const catY   = CY + R_CAT * Math.sin(angulo);
-
-    // Línea centro → categoría
-    lineas.push(`<line x1="${CX}" y1="${CY}" x2="${catX}" y2="${catY}"
-      stroke="#C41230" stroke-width="3" stroke-opacity="0.4"/>`);
-
-    // Nodo categoría
+    lineas.push(`<line x1="${CX}" y1="${CY}" x2="${catX}" y2="${catY}" stroke="#C41230" stroke-width="3" stroke-opacity="0.4"/>`);
     const catColor = cat.siPlenos > 0 ? '#C41230' : cat.siMatiz > 0 ? '#B8860B' : '#4A4A4A';
-    nodos.push(`<circle cx="${catX}" cy="${catY}" r="52"
-      fill="white" stroke="${catColor}" stroke-width="3"/>`);
-    textos.push(`<text x="${catX}" y="${catY - 8}" text-anchor="middle"
-      font-size="18" font-weight="bold" fill="${catColor}" font-family="Arial,sans-serif">${cat.num}</text>`);
-    // Nombre corto de categoría (máx 12 chars)
+    nodos.push(`<circle cx="${catX}" cy="${catY}" r="52" fill="white" stroke="${catColor}" stroke-width="3"/>`);
+    textos.push(`<text x="${catX}" y="${catY - 8}" text-anchor="middle" font-size="18" font-weight="bold" fill="${catColor}" font-family="Arial,sans-serif">${cat.num}</text>`);
     const nombreCorto = cat.nombre.split(' ').slice(0, 2).join(' ');
-    textos.push(`<text x="${catX}" y="${catY + 14}" text-anchor="middle"
-      font-size="13" fill="#4A4A4A" font-family="Arial,sans-serif">${nombreCorto}</text>`);
-    // Badge conteo
+    textos.push(`<text x="${catX}" y="${catY + 14}" text-anchor="middle" font-size="13" fill="#4A4A4A" font-family="Arial,sans-serif">${nombreCorto}</text>`);
     const badge = cat.siPlenos > 0 ? `${cat.siPlenos}✓` : cat.siMatiz > 0 ? `${cat.siMatiz}~` : '—';
-    textos.push(`<text x="${catX}" y="${catY + 32}" text-anchor="middle"
-      font-size="13" fill="${catColor}" font-family="Arial,sans-serif" font-weight="bold">${badge}</text>`);
-
-    // Subnodos criterios
+    textos.push(`<text x="${catX}" y="${catY + 32}" text-anchor="middle" font-size="13" fill="${catColor}" font-family="Arial,sans-serif" font-weight="bold">${badge}</text>`);
     const nCrits = cat.criterios.length;
     cat.criterios.forEach((crit, j) => {
-      // Distribuir criterios en abanico alrededor del ángulo de la categoría
-      const spread   = Math.min(Math.PI * 0.55, (nCrits - 1) * 0.22);
-      const anguloC  = nCrits > 1
-        ? angulo - spread / 2 + (spread / (nCrits - 1)) * j
-        : angulo;
+      const spread  = Math.min(Math.PI * 0.55, (nCrits - 1) * 0.22);
+      const anguloC = nCrits > 1 ? angulo - spread / 2 + (spread / (nCrits - 1)) * j : angulo;
       const critX = CX + R_CRIT * Math.cos(anguloC);
       const critY = CY + R_CRIT * Math.sin(anguloC);
       const col   = colorResultado[crit.resultado] || colorResultado.NA;
-
-      // Línea categoría → criterio
-      lineas.push(`<line x1="${catX}" y1="${catY}" x2="${critX}" y2="${critY}"
-        stroke="#D4CFC4" stroke-width="1.5"/>`);
-
-      // Nodo criterio (rectángulo redondeado)
+      lineas.push(`<line x1="${catX}" y1="${catY}" x2="${critX}" y2="${critY}" stroke="#D4CFC4" stroke-width="1.5"/>`);
       const rw = 130, rh = 56;
-      nodos.push(`<rect x="${critX - rw/2}" y="${critY - rh/2}" width="${rw}" height="${rh}"
-        rx="4" fill="${col.fill}" stroke="${col.stroke}" stroke-width="2"/>`);
-      textos.push(`<text x="${critX}" y="${critY - 8}" text-anchor="middle"
-        font-size="14" font-weight="bold" fill="${col.texto}" font-family="Arial,sans-serif">${crit.id}</text>`);
-      // Resumen recortado a ~16 chars
-      const resCorto = crit.resumen.length > 16
-        ? crit.resumen.slice(0, 15) + '…'
-        : crit.resumen;
-      textos.push(`<text x="${critX}" y="${critY + 10}" text-anchor="middle"
-        font-size="11" fill="${col.texto}" font-family="Arial,sans-serif">${resCorto}</text>`);
+      nodos.push(`<rect x="${critX - rw/2}" y="${critY - rh/2}" width="${rw}" height="${rh}" rx="4" fill="${col.fill}" stroke="${col.stroke}" stroke-width="2"/>`);
+      textos.push(`<text x="${critX}" y="${critY - 8}" text-anchor="middle" font-size="14" font-weight="bold" fill="${col.texto}" font-family="Arial,sans-serif">${crit.id}</text>`);
+      const resCorto = crit.resumen.length > 16 ? crit.resumen.slice(0, 15) + '…' : crit.resumen;
+      textos.push(`<text x="${critX}" y="${critY + 10}" text-anchor="middle" font-size="11" fill="${col.texto}" font-family="Arial,sans-serif">${resCorto}</text>`);
     });
   });
-
-  // Nodo central
-  nodos.push(`<circle cx="${CX}" cy="${CY}" r="${R_CENTRO}"
-    fill="#C41230" stroke="#9B0D24" stroke-width="4"/>`);
-  textos.push(`<text x="${CX}" y="${CY - 28}" text-anchor="middle"
-    font-size="22" font-weight="bold" fill="white" font-family="Georgia,serif">AUDITORÍA</text>`);
-  textos.push(`<text x="${CX}" y="${CY}" text-anchor="middle"
-    font-size="22" font-weight="bold" fill="white" font-family="Georgia,serif">LIBERAL</text>`);
-  textos.push(`<text x="${CX}" y="${CY + 30}" text-anchor="middle"
-    font-size="36" font-weight="bold" fill="white" font-family="Arial,sans-serif">${estructura.puntaje}%</text>`);
-  textos.push(`<text x="${CX}" y="${CY + 58}" text-anchor="middle"
-    font-size="16" fill="#FFCDD2" font-family="Arial,sans-serif" letter-spacing="1">ÍNDICE LIBERAL</text>`);
-
-  // Título y leyenda
-  const tituloCorto = estructura.titulo.length > 60
-    ? estructura.titulo.slice(0, 58) + '…'
-    : estructura.titulo;
-
+  nodos.push(`<circle cx="${CX}" cy="${CY}" r="${R_CENTRO}" fill="#C41230" stroke="#9B0D24" stroke-width="4"/>`);
+  textos.push(`<text x="${CX}" y="${CY - 28}" text-anchor="middle" font-size="22" font-weight="bold" fill="white" font-family="Georgia,serif">AUDITORÍA</text>`);
+  textos.push(`<text x="${CX}" y="${CY}" text-anchor="middle" font-size="22" font-weight="bold" fill="white" font-family="Georgia,serif">LIBERAL</text>`);
+  textos.push(`<text x="${CX}" y="${CY + 30}" text-anchor="middle" font-size="36" font-weight="bold" fill="white" font-family="Arial,sans-serif">${estructura.puntaje}%</text>`);
+  textos.push(`<text x="${CX}" y="${CY + 58}" text-anchor="middle" font-size="16" fill="#FFCDD2" font-family="Arial,sans-serif" letter-spacing="1">ÍNDICE LIBERAL</text>`);
+  const tituloCorto = estructura.titulo.length > 60 ? estructura.titulo.slice(0, 58) + '…' : estructura.titulo;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${ANCHO}" height="${ALTO}" viewBox="0 0 ${ANCHO} ${ALTO}">
   <rect width="${ANCHO}" height="${ALTO}" fill="white"/>
-  <!-- Título -->
-  <text x="${CX}" y="52" text-anchor="middle"
-    font-size="28" font-weight="bold" fill="#1A1A1A" font-family="Georgia,serif">${tituloCorto}</text>
-  <text x="${CX}" y="82" text-anchor="middle"
-    font-size="18" fill="#8A8478" font-family="Arial,sans-serif">Mapa Mental · Auditoría Cívica Liberal · liberalmente.app</text>
-  <!-- Líneas -->
+  <text x="${CX}" y="52" text-anchor="middle" font-size="28" font-weight="bold" fill="#1A1A1A" font-family="Georgia,serif">${tituloCorto}</text>
+  <text x="${CX}" y="82" text-anchor="middle" font-size="18" fill="#8A8478" font-family="Arial,sans-serif">Mapa Mental · Auditoría Cívica Liberal · liberalmente.app</text>
   ${lineas.join('\n  ')}
-  <!-- Nodos -->
   ${nodos.join('\n  ')}
-  <!-- Textos -->
   ${textos.join('\n  ')}
-  <!-- Leyenda -->
   <rect x="40" y="${ALTO - 90}" width="16" height="16" rx="2" fill="#E8F5E9" stroke="#2E7D32" stroke-width="2"/>
   <text x="64" y="${ALTO - 77}" font-size="18" fill="#4A4A4A" font-family="Arial,sans-serif">SÍ pleno</text>
   <rect x="160" y="${ALTO - 90}" width="16" height="16" rx="2" fill="#FFF8E1" stroke="#B8860B" stroke-width="2"/>
@@ -571,23 +507,16 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
   <rect x="400" y="${ALTO - 90}" width="16" height="16" rx="2" fill="#F5F5F5" stroke="#8A8478" stroke-width="2"/>
   <text x="424" y="${ALTO - 77}" font-size="18" fill="#4A4A4A" font-family="Arial,sans-serif">N/A</text>
 </svg>`;
-
-  // SVG → PNG via sharp
-  const svgBuffer = Buffer.from(svg);
-  await sharp(svgBuffer)
-    .png({ quality: 95 })
-    .toFile(rutaSalida);
-
+  await sharp(Buffer.from(svg)).png({ quality: 95 }).toFile(rutaSalida);
   console.log(`   [${auditoria_id}] Mapa mental generado: ${rutaSalida}`);
 }
 
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.2', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.3', timestamp: new Date().toISOString() });
 });
 
-// Endpoint principal: recibe una auditoría y la procesa
 app.post('/procesar', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -602,18 +531,17 @@ app.post('/procesar', async (req, res) => {
   });
 });
 
-// Endpoint para que el dashboard complete una auditoría con el audio ya subido
-// POST /completar-audio { auditoria_id, audio_drive_link }
-app.post('/completar-audio', async (req, res) => {
+// Recibe el archivo .wav binario, convierte a .mp3 y completa la auditoría
+app.post('/completar-audio', express.raw({ type: '*/*', limit: '200mb' }), async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
   }
-  const { auditoria_id, audio_drive_link } = req.body;
-  if (!auditoria_id || !audio_drive_link) {
-    return res.status(400).json({ error: 'Faltan auditoria_id y audio_drive_link' });
+  const auditoria_id = req.headers['x-auditoria-id'];
+  if (!auditoria_id || !req.body?.length) {
+    return res.status(400).json({ error: 'Faltan auditoria_id o archivo de audio' });
   }
-  res.json({ mensaje: 'Audio recibido, completando auditoría', auditoria_id });
-  completarConAudio(auditoria_id, audio_drive_link).catch(err => {
+  res.json({ mensaje: 'Audio recibido, procesando', auditoria_id });
+  completarConAudio(auditoria_id, req.body).catch(err => {
     console.error(`❌ [${auditoria_id}] Error al completar con audio:`, err.message);
   });
 });
@@ -622,7 +550,6 @@ app.post('/completar-audio', async (req, res) => {
 
 async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
   console.log(`\n🚀 [${auditoria_id}] Iniciando procesamiento`);
-
   const dir            = path.join(DIRECTORIO_TEMP, auditoria_id);
   const rutaPDF        = path.join(dir, 'original.pdf');
   const rutaTXT        = path.join(dir, 'original.txt');
@@ -630,29 +557,23 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
   const rutaReportePDF = path.join(dir, 'reporte.pdf');
   const rutaSlides     = path.join(dir, 'presentacion.pptx');
   const rutaMapa       = path.join(dir, 'mapa.png');
-
   fs.mkdirSync(dir, { recursive: true });
-
   try {
-    // PASO 1 — Descargar PDF original
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando PDF...`);
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
     await descargarPDF(drive, pdf_drive_id, rutaPDF);
     console.log(`✅ [${auditoria_id}] PDF descargado`);
 
-    // PASO 2 — Extraer texto
     console.log(`📝 [${auditoria_id}] PASO 2: Extrayendo texto...`);
     const textoPDF = await extraerTextoPDF(rutaPDF);
     fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
     console.log(`✅ [${auditoria_id}] Texto extraído (${textoPDF.length} chars)`);
 
-    // PASO 3 — Configuración doctrinal
     console.log(`📖 [${auditoria_id}] PASO 3: Leyendo configuración doctrinal...`);
     const config = await obtenerConfigDoctrinal();
     console.log(`✅ [${auditoria_id}] Prompt versión ${config.version}`);
 
-    // PASO 4 — Metadatos
     console.log(`🏷️  [${auditoria_id}] PASO 4: Extrayendo metadatos...`);
     await actualizarEstado(auditoria_id, 'procesando');
     const metadatos = await extraerMetadatos(textoPDF);
@@ -662,11 +583,9 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     );
     console.log(`✅ [${auditoria_id}] Metadatos: "${metadatos.titulo}"`);
 
-    // Pausa rate limit
     console.log(`⏳ [${auditoria_id}] Esperando ventana de rate limit...`);
     await new Promise(r => setTimeout(r, 90_000));
 
-    // PASO 5 — Análisis Claude
     console.log(`🧠 [${auditoria_id}] PASO 5: Analizando con Claude...`);
     const reporte = await analizarConClaude(textoPDF, config);
     fs.writeFileSync(rutaReporte, reporte, 'utf8');
@@ -676,81 +595,63 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     );
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} chars)`);
 
-    // PASO 6 — PDF del reporte
     console.log(`📄 [${auditoria_id}] PASO 6: Generando PDF del reporte...`);
     await convertirTXTaPDF(rutaReporte, rutaReportePDF, metadatos.titulo);
     console.log(`✅ [${auditoria_id}] PDF del reporte generado`);
 
-    // PASO 7 — NotebookLM: disparar audio (no espera descarga)
     console.log(`🎙️  [${auditoria_id}] PASO 7: Disparando Audio Overview en NotebookLM...`);
     await actualizarEstado(auditoria_id, 'empaquetando');
     const notebookId = await dispararNotebookLM(reporte, metadatos.titulo, auditoria_id);
-    await db.query(
-      `UPDATE auditorias SET notebook_id = $1 WHERE id = $2`,
-      [notebookId, auditoria_id]
-    );
+    await db.query(`UPDATE auditorias SET notebook_id = $1 WHERE id = $2`, [notebookId, auditoria_id]);
     console.log(`✅ [${auditoria_id}] Audio disparado. NotebookID: ${notebookId}`);
 
-    // PASO 8 — Presentación PPTX
     console.log(`📊 [${auditoria_id}] PASO 8: Generando presentación PPTX...`);
     const estructura = await generarPresentacion(reporte, metadatos.titulo, rutaSlides, auditoria_id);
     console.log(`✅ [${auditoria_id}] Presentación generada`);
 
-    // PASO 9 — Mapa mental PNG
     console.log(`🗺️  [${auditoria_id}] PASO 9: Generando mapa mental...`);
     await generarMapaMental(estructura, rutaMapa, auditoria_id);
     console.log(`✅ [${auditoria_id}] Mapa mental generado`);
 
-    // PASO 10 — Subir archivos a Drive y marcar parcialmente_completada
     console.log(`☁️  [${auditoria_id}] PASO 10: Subiendo archivos a Drive...`);
-    const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
-
-    // Subir PDF original
+    const carpetaId    = await obtenerCarpetaAuditoria(drive, auditoria_id);
     const linkOriginal = await subirArchivo(drive, rutaPDF, 'documento-original.pdf', 'application/pdf', carpetaId);
-    // Subir reporte PDF
     const linkReporte  = await subirArchivo(drive, rutaReportePDF, 'reporte.pdf', 'application/pdf', carpetaId);
-    // Subir PPTX
     const linkSlides   = await subirArchivo(drive, rutaSlides, 'presentacion.pptx',
       'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
-    // Subir mapa mental
     const linkMapa     = await subirArchivo(drive, rutaMapa, 'mapa-mental.png', 'image/png', carpetaId);
 
     await db.query(
       `UPDATE auditorias
        SET estado = 'parcialmente_completada',
-           link_original = $1,
-           link_reporte  = $2,
-           link_presentacion = $3,
-           link_mapa = $4,
+           link_original = $1, link_reporte = $2,
+           link_presentacion = $3, link_mapa = $4,
            drive_carpeta_id = $5
        WHERE id = $6`,
       [linkOriginal, linkReporte, linkSlides, linkMapa, carpetaId, auditoria_id]
     );
-
     console.log(`\n⏳ [${auditoria_id}] Auditoría parcialmente completada. Esperando audio del editor.`);
 
   } catch (error) {
     console.error(`❌ [${auditoria_id}] Error:`, error.message);
     await actualizarEstado(auditoria_id, 'error').catch(() => {});
-    await db.query(
-      `UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`,
-      [error.message, auditoria_id]
-    ).catch(() => {});
+    await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`, [error.message, auditoria_id]).catch(() => {});
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(`🧹 [${auditoria_id}] Archivos temporales eliminados`);
   }
 }
 
-// ── Completar auditoría cuando el editor sube el audio ───────────────────────
+// ── Completar auditoría con audio ────────────────────────────────────────────
 
-async function completarConAudio(auditoria_id, audio_drive_link) {
+async function completarConAudio(auditoria_id, audioBuffer) {
   console.log(`\n🎙️  [${auditoria_id}] Completando auditoría con audio...`);
-
+  const dir = path.join(DIRECTORIO_TEMP, `audio-${auditoria_id}`);
+  fs.mkdirSync(dir, { recursive: true });
   try {
-    // Recuperar datos de la auditoría
     const result = await db.query(
-      `SELECT a.titulo_documento, a.notebook_id, c.email AS ciudadano_email,
+      `SELECT a.titulo_documento, a.notebook_id, a.drive_carpeta_id,
+              c.email AS ciudadano_email,
               a.link_original, a.link_reporte, a.link_presentacion, a.link_mapa
        FROM auditorias a
        JOIN ciudadanos c ON c.id = a.ciudadano_id
@@ -758,40 +659,56 @@ async function completarConAudio(auditoria_id, audio_drive_link) {
       [auditoria_id]
     );
     if (!result.rows[0]) throw new Error('Auditoría no encontrada');
-    const { titulo_documento, notebook_id, ciudadano_email,
-            link_original, link_reporte, link_presentacion, link_mapa } = result.rows[0];
+    const { titulo_documento, notebook_id, drive_carpeta_id,
+            ciudadano_email, link_original, link_reporte,
+            link_presentacion, link_mapa } = result.rows[0];
 
-    // Actualizar BD con el link del podcast y marcar como completada
+    // Guardar .wav recibido
+    const rutaWav = path.join(dir, 'audio.wav');
+    fs.writeFileSync(rutaWav, audioBuffer);
+    console.log(`   [${auditoria_id}] .wav guardado (${audioBuffer.length} bytes)`);
+
+    // Convertir a .mp3 con nombre descriptivo
+    const nombreMp3 = `podcast-${slugificar(titulo_documento || auditoria_id)}.mp3`;
+    const rutaMp3   = path.join(dir, nombreMp3);
+    console.log(`   [${auditoria_id}] Convirtiendo a MP3: ${nombreMp3}...`);
+    await convertirWavAMp3(rutaWav, rutaMp3);
+    console.log(`   [${auditoria_id}] Conversión completada`);
+
+    // Subir .mp3 a Drive
+    const driveAuth  = autenticarDrive();
+    const drive      = google.drive({ version: 'v3', auth: driveAuth });
+    const linkPodcast = await subirArchivo(drive, rutaMp3, nombreMp3, 'audio/mpeg', drive_carpeta_id);
+    console.log(`   [${auditoria_id}] Audio subido a Drive`);
+
+    // Actualizar BD
     await db.query(
-      `UPDATE auditorias
-       SET estado = 'completada',
-           link_podcast = $1,
-           completada_en = NOW()
-       WHERE id = $2`,
-      [audio_drive_link, auditoria_id]
+      `UPDATE auditorias SET estado = 'completada', link_podcast = $1, completada_en = NOW() WHERE id = $2`,
+      [linkPodcast, auditoria_id]
     );
 
-    // Eliminar el notebook de NotebookLM (ya no se necesita)
+    // Eliminar notebook de NotebookLM
     if (notebook_id) {
       await nlmEliminarNotebook(notebook_id).catch(() => {});
       console.log(`   [${auditoria_id}] Notebook eliminado`);
     }
 
-    // Email final al ciudadano con los 5 links
-    const links = {
+    // Email final con los 5 links
+    await enviarEmailFinal(ciudadano_email, titulo_documento, auditoria_id, {
       original:     link_original,
       reporte:      link_reporte,
-      podcast:      audio_drive_link,
+      podcast:      linkPodcast,
       presentacion: link_presentacion,
       mapa:         link_mapa,
-    };
-    await enviarEmailFinal(ciudadano_email, titulo_documento, auditoria_id, links);
+    });
 
     console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
 
   } catch (error) {
     console.error(`❌ [${auditoria_id}] Error al completar con audio:`, error.message);
     throw error;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -819,9 +736,7 @@ async function descargarPDF(drive, fileId, destino) {
 
 async function obtenerConfigDoctrinal() {
   const result = await db.query(
-    `SELECT version, prompt_sistema, prompt_analisis
-     FROM configuracion_doctrinal WHERE activo = true
-     ORDER BY version DESC LIMIT 1`
+    `SELECT version, prompt_sistema, prompt_analisis FROM configuracion_doctrinal WHERE activo = true ORDER BY version DESC LIMIT 1`
   );
   if (result.rows.length === 0) throw new Error('No hay configuración doctrinal activa');
   return result.rows[0];
@@ -853,8 +768,7 @@ Fragmento:\n${muestra}`,
     return {
       titulo:    datos.titulo    || 'Documento sin título',
       pais:      datos.pais      || 'General',
-      categoria: ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria)
-        ? datos.categoria : 'pais',
+      categoria: ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria) ? datos.categoria : 'pais',
     };
   } catch {
     return { titulo: 'Documento sin título', pais: 'General', categoria: 'pais' };
@@ -883,16 +797,12 @@ async function convertirTXTaPDF(rutaTXT, rutaPDF, titulo) {
     doc.fontSize(17).fillColor('#1a1a1a').font('Helvetica-Bold')
       .text(titulo, { align: 'center' }).moveDown(0.5);
     doc.fontSize(9).fillColor('#888888').font('Helvetica')
-      .text(`Generado el ${new Date().toLocaleDateString('es-VE',
-        { year: 'numeric', month: 'long', day: 'numeric' })}`, { align: 'center' }).moveDown(1.5);
-    doc.moveTo(72, doc.y).lineTo(doc.page.width - 72, doc.y)
-      .strokeColor('#cccccc').lineWidth(0.5).stroke().moveDown(1.5);
-    doc.fontSize(11).fillColor('#1a1a1a').font('Helvetica')
-      .text(texto, { lineGap: 5, paragraphGap: 10 });
+      .text(`Generado el ${new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' })}`, { align: 'center' }).moveDown(1.5);
+    doc.moveTo(72, doc.y).lineTo(doc.page.width - 72, doc.y).strokeColor('#cccccc').lineWidth(0.5).stroke().moveDown(1.5);
+    doc.fontSize(11).fillColor('#1a1a1a').font('Helvetica').text(texto, { lineGap: 5, paragraphGap: 10 });
     doc.on('pageAdded', () => {
       doc.fontSize(8).fillColor('#aaaaaa')
-        .text('Auditoría Cívica Liberal · liberalmente.app', 72, doc.page.height - 40,
-          { align: 'center', width: doc.page.width - 144 });
+        .text('Auditoría Cívica Liberal · liberalmente.app', 72, doc.page.height - 40, { align: 'center', width: doc.page.width - 144 });
     });
     doc.end();
     stream.on('finish', resolve);
@@ -914,19 +824,13 @@ async function obtenerCarpetaAuditoria(drive, auditoria_id) {
 }
 
 async function subirArchivo(drive, ruta, nombre, mime, carpetaId) {
-  if (!fs.existsSync(ruta)) {
-    console.log(`   ⚠️  Omitiendo ${nombre} (no encontrado)`);
-    return null;
-  }
+  if (!fs.existsSync(ruta)) { console.log(`   ⚠️  Omitiendo ${nombre} (no encontrado)`); return null; }
   const res = await drive.files.create({
     requestBody: { name: nombre, parents: [carpetaId] },
     media: { mimeType: mime, body: fs.createReadStream(ruta) },
     fields: 'id, webViewLink',
   });
-  await drive.permissions.create({
-    fileId: res.data.id,
-    requestBody: { role: 'reader', type: 'anyone' },
-  });
+  await drive.permissions.create({ fileId: res.data.id, requestBody: { role: 'reader', type: 'anyone' } });
   console.log(`   ✅ ${nombre} subido`);
   return res.data.webViewLink;
 }
@@ -935,38 +839,10 @@ async function actualizarEstado(auditoria_id, estado) {
   await db.query(`UPDATE auditorias SET estado = $1 WHERE id = $2`, [estado, auditoria_id]);
 }
 
-// Email 1: confirmación de recepción (se envía al terminar el procesamiento automático)
-async function enviarEmailRecepcion(email, titulo, auditoria_id) {
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-    },
-    body: JSON.stringify({
-      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
-      to: email,
-      subject: '✅ Recibimos tu auditoría — te avisamos cuando esté lista',
-      html: `
-        <p>Ciudadano,</p>
-        <p>Recibimos tu documento <strong>${titulo}</strong> y ya comenzamos a auditarlo.</p>
-        <p>En los próximos minutos estaremos generando tu paquete completo: reporte, presentación, mapa mental y podcast. Te avisamos por correo cuando todo esté listo.</p>
-        <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>
-      `,
-    }),
-  });
-  if (!res.ok) console.error(`   ⚠️  Error enviando email de recepción: ${await res.text()}`);
-  else console.log(`   ✅ Email de recepción enviado a ${email}`);
-}
-
-// Email 2: email final con los 5 links (se envía cuando el editor completa el audio)
 async function enviarEmailFinal(email, titulo, auditoria_id, links) {
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-    },
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
     body: JSON.stringify({
       from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
       to: email,
@@ -994,8 +870,9 @@ async function enviarEmailFinal(email, titulo, auditoria_id, links) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.2 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.3 corriendo en puerto ${PORT}`);
   console.log(`   Hemisferio derecho: NotebookLM API + flujo híbrido`);
+  console.log(`   Audio: wav→mp3 con fluent-ffmpeg · nombre descriptivo`);
   console.log(`   Pasos automáticos: 1-10 (PDF→análisis→PPTX→mapa→Drive→parcialmente_completada)`);
   console.log(`   Paso manual: editor sube audio → POST /completar-audio → email final\n`);
 });
