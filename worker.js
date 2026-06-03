@@ -415,7 +415,7 @@ Reglas:
 async function extraerEstructura(reporteTexto) {
   const respuesta = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 4000,
+    max_tokens: 8000,
     system: PROMPT_EXTRACCION,
     messages: [{ role: 'user', content: `Extrae la estructura de este reporte:\n\n${reporteTexto}` }],
   });
@@ -724,9 +724,6 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
        WHERE id = $6`,
       [linkOriginal, linkReporte, linkSlides, linkMapa, carpetaId, auditoria_id]
     );
-
-    // Email 1 al ciudadano: confirmación de recepción y aviso de que el audio está en proceso
-    await enviarEmailRecepcion(ciudadano_email, metadatos.titulo, auditoria_id);
 
     console.log(`\n⏳ [${auditoria_id}] Auditoría parcialmente completada. Esperando audio del editor.`);
 
