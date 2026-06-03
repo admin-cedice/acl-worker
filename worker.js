@@ -1,7 +1,8 @@
-// worker.js — ACL Worker v3.0
+// worker.js — ACL Worker v3.2
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
-// Hemisferio derecho: NotebookLM Enterprise API (sin Playwright)
+// Hemisferio derecho: NotebookLM Enterprise API (flujo híbrido)
+// v3.2: eliminado Playwright · integrado PPTX · integrado mapa mental · endpoint /completar-audio
 
 'use strict';
 
@@ -11,43 +12,13 @@ const { GoogleAuth } = require('google-auth-library');
 const Anthropic  = require('@anthropic-ai/sdk');
 const { Pool }   = require('pg');
 const pptxgen    = require('pptxgenjs');
-const { chromium } = require('playwright');
+const sharp      = require('sharp');
 const fs         = require('fs');
 const path       = require('path');
 const pdfParse   = require('pdf-parse');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
-
-// ── Normalizar sesión Google ─────────────────────────────────────────────────
-
-function normalizarSesionGoogle(sesionRaw) {
-  let parsed;
-  try { parsed = JSON.parse(sesionRaw); }
-  catch { throw new Error('SESION_GOOGLE no es JSON válido'); }
-  if (parsed && parsed.cookies && Array.isArray(parsed.cookies)) return sesionRaw;
-  if (Array.isArray(parsed)) {
-    const cookies = parsed.map(c => ({
-      name:     c.name,
-      value:    c.value,
-      domain:   c.domain,
-      path:     c.path || '/',
-      expires:  c.expirationDate ? Math.floor(c.expirationDate) : -1,
-      httpOnly: c.httpOnly || false,
-      secure:   c.secure || false,
-      sameSite: (() => {
-        switch (c.sameSite) {
-          case 'no_restriction': return 'None';
-          case 'lax':            return 'Lax';
-          case 'strict':         return 'Strict';
-          default:               return 'None';
-        }
-      })(),
-    }));
-    return JSON.stringify({ cookies, origins: [] });
-  }
-  throw new Error('Formato de SESION_GOOGLE no reconocido');
-}
 
 // ── Clientes globales ────────────────────────────────────────────────────────
 
@@ -57,8 +28,6 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
 const DIRECTORIO_TEMP = '/tmp/acl-worker';
 
 // ── Autenticación Google Cloud (cuenta de servicio) ──────────────────────────
-// GOOGLE_SERVICE_ACCOUNT_JSON debe contener el contenido del archivo JSON
-// de la cuenta de servicio acl-notebooklm-worker
 
 function obtenerGoogleAuth() {
   const credenciales = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
@@ -104,14 +73,11 @@ async function nlmRequest(method, endpoint, body = null) {
   return res.json();
 }
 
-// Crear notebook vacío
 async function nlmCrearNotebook(titulo) {
   const data = await nlmRequest('POST', `${NLM_PARENT}/notebooks`, { title: titulo });
   return data.notebookId;
 }
 
-// Agregar fuente (texto plano) al notebook via batchCreate
-// Devuelve el sourceId para usarlo en audioOverviews
 async function nlmAgregarFuente(notebookId, titulo, contenido) {
   const data = await nlmRequest(
     'POST',
@@ -127,23 +93,18 @@ async function nlmAgregarFuente(notebookId, titulo, contenido) {
       ],
     }
   );
-  // La respuesta puede tener sources[0].sourceId o sources[0].name
-  const fuentes = data.sources || data.userContents || [];
+  const fuentes  = data.sources || data.userContents || [];
   const sourceId = fuentes[0]?.sourceId || fuentes[0]?.name?.split('/').pop() || null;
   return sourceId;
 }
 
-// Disparar generación de Audio Overview
-// Sin body — la API usa todas las fuentes del notebook por defecto
 async function nlmGenerarAudio(notebookId) {
   const data = await nlmRequest(
     'POST',
     `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews`,
     null
   );
-  // Log completo para debug
   console.log('   [NLM] audioOverviews POST response:', JSON.stringify(data));
-  // La respuesta tiene la estructura: { audioOverview: { audioOverviewId: "...", status: "..." } }
   const audioId = data.audioOverview?.audioOverviewId
     || data.audioOverviewId
     || data.name?.split('/').pop()
@@ -151,280 +112,35 @@ async function nlmGenerarAudio(notebookId) {
   return audioId;
 }
 
-// Esperar hasta que el Audio Overview esté listo
-// Polling via GET /notebooks/{id}/audioOverviews (list)
-async function nlmEsperarAudio(notebookId, audioId, auditoria_id) {
-  const INTERVALO = 30_000;  // 30 segundos
-  const TIMEOUT   = 30 * 60_000; // 30 minutos
-  const t0 = Date.now();
-
-  while (true) {
-    // GET lista de audioOverviews del notebook
-    const data = await nlmRequest(
-      'GET',
-      `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews`
-    );
-
-    console.log(`   [NLM] audioOverviews list response: ${JSON.stringify(data)}`);
-
-    // La respuesta puede ser { audioOverviews: [...] } o { audioOverview: {...} }
-    const lista = data.audioOverviews || (data.audioOverview ? [data.audioOverview] : []);
-    const overview = lista.find(o =>
-      o.audioOverviewId === audioId || o.name?.includes(audioId)
-    ) || lista[0];
-
-    const estado = overview?.status || overview?.state || 'UNKNOWN';
-    console.log(`   [${auditoria_id}] Audio estado: ${estado}`);
-
-    if (estado === 'AUDIO_OVERVIEW_STATUS_SUCCEEDED'
-        || estado === 'SUCCEEDED' || estado === 'ACTIVE') {
-      return overview;
-    }
-    if (estado === 'AUDIO_OVERVIEW_STATUS_FAILED'
-        || estado === 'FAILED' || estado === 'ERROR') {
-      throw new Error(`Audio Overview falló: ${JSON.stringify(overview)}`);
-    }
-    if (Date.now() - t0 > TIMEOUT) {
-      throw new Error('Timeout: Audio Overview no terminó en 30 minutos');
-    }
-    await new Promise(r => setTimeout(r, INTERVALO));
-  }
-}
-
-// Descargar el audio a un archivo local
-async function nlmDescargarAudio(audioData, rutaSalida) {
-  // La API puede devolver el audio como base64 en audioData.audioContent
-  // o como URL en audioData.audioUri
-  if (audioData.audioContent) {
-    const buffer = Buffer.from(audioData.audioContent, 'base64');
-    fs.writeFileSync(rutaSalida, buffer);
-    return;
-  }
-  if (audioData.audioUri) {
-    const token = await obtenerTokenGoogle();
-    const res   = await fetch(audioData.audioUri, {
-      headers: { 'Authorization': `Bearer ${token}` },
-    });
-    if (!res.ok) throw new Error(`Error descargando audio: ${res.status}`);
-    const buffer = Buffer.from(await res.arrayBuffer());
-    fs.writeFileSync(rutaSalida, buffer);
-    return;
-  }
-  throw new Error('Audio Overview completado pero sin datos de audio en la respuesta');
-}
-
-// Eliminar notebook (limpieza)
 async function nlmEliminarNotebook(notebookId) {
   await nlmRequest('POST', `${NLM_PARENT}/notebooks:batchDelete`, {
     names: [`${NLM_PARENT}/notebooks/${notebookId}`],
   }).catch(() => {});
 }
 
-// ── Pipeline NotebookLM híbrido (API + Playwright) ───────────────────────────
-// Fase 1 (API): crear notebook, agregar fuente, disparar audio
-// Fase 2 (Playwright): esperar que esté listo, descargar
+// ── Fase API de NotebookLM (solo dispara — no espera ni descarga) ─────────────
+// Crea notebook, agrega fuente, dispara audio.
+// Devuelve el notebookId para que el editor acceda manualmente.
+// El notebook NO se elimina aquí — se elimina cuando el editor complete el audio.
 
-async function ejecutarNotebookLMApi(reporteTexto, titulo, rutaPodcast, auditoria_id) {
-  let notebookId = null;
-  try {
-    // ── Fase 1: API ──────────────────────────────────────────────────────────
-    console.log(`   [${auditoria_id}] Creando notebook en NotebookLM...`);
-    notebookId = await nlmCrearNotebook(`ACL — ${titulo}`);
-    console.log(`   [${auditoria_id}] Notebook creado: ${notebookId}`);
+async function dispararNotebookLM(reporteTexto, titulo, auditoria_id) {
+  console.log(`   [${auditoria_id}] Creando notebook en NotebookLM...`);
+  const notebookId = await nlmCrearNotebook(`ACL — ${titulo}`);
+  console.log(`   [${auditoria_id}] Notebook creado: ${notebookId}`);
 
-    console.log(`   [${auditoria_id}] Agregando reporte como fuente...`);
-    const sourceId = await nlmAgregarFuente(notebookId, titulo, reporteTexto);
-    console.log(`   [${auditoria_id}] Fuente agregada`);
+  console.log(`   [${auditoria_id}] Agregando reporte como fuente...`);
+  await nlmAgregarFuente(notebookId, titulo, reporteTexto);
+  console.log(`   [${auditoria_id}] Fuente agregada`);
 
-    // Pausa para que NotebookLM indexe el contenido
-    await new Promise(r => setTimeout(r, 10_000));
+  // Pausa para que NotebookLM indexe el contenido antes de disparar el audio
+  await new Promise(r => setTimeout(r, 10_000));
 
-    console.log(`   [${auditoria_id}] Disparando generación de Audio Overview...`);
-    const audioId = await nlmGenerarAudio(notebookId);
-    if (!audioId) throw new Error('La API no devolvió audioOverviewId');
-    console.log(`   [${auditoria_id}] Audio en generación: ${audioId}`);
+  console.log(`   [${auditoria_id}] Disparando generación de Audio Overview...`);
+  const audioId = await nlmGenerarAudio(notebookId);
+  if (!audioId) throw new Error('La API no devolvió audioOverviewId');
+  console.log(`   [${auditoria_id}] Audio en generación: ${audioId}`);
 
-    // ── Fase 2: Playwright ───────────────────────────────────────────────────
-    // URL directa al notebook Enterprise (sin navegar desde la home)
-    const notebookUrl = `https://notebooklm.cloud.google.com/global/notebook/${notebookId}?project=${NLM_PROJECT}`;
-    console.log(`   [${auditoria_id}] Esperando 15 min antes de intentar descarga...`);
-    await new Promise(r => setTimeout(r, 15 * 60_000));
-
-    await descargarAudioConPlaywright(notebookUrl, rutaPodcast, auditoria_id);
-    console.log(`   [${auditoria_id}] Audio descargado`);
-
-    // Limpiar notebook
-    await nlmEliminarNotebook(notebookId);
-    console.log(`   [${auditoria_id}] Notebook eliminado`);
-    notebookId = null;
-
-  } catch(err) {
-    if (notebookId) await nlmEliminarNotebook(notebookId).catch(() => {});
-    throw err;
-  }
-}
-
-// ── Descarga del audio via Playwright ────────────────────────────────────────
-// Entra directo al notebook por URL, espera el botón de descarga, descarga
-
-async function descargarAudioConPlaywright(notebookUrl, rutaSalida, auditoria_id) {
-  const ESPERA_ENTRE_REINTENTOS = 10 * 60_000; // 10 minutos
-  const MAX_INTENTOS = 5;
-  const rutaSesion = '/tmp/sesion-notebooklm.json';
-
-  // Escribir sesión UNA SOLA VEZ — no eliminar entre intentos
-  const sesionNorm = normalizarSesionGoogle(process.env.SESION_GOOGLE);
-  fs.writeFileSync(rutaSesion, sesionNorm, 'utf8');
-
-  for (let intento = 1; intento <= MAX_INTENTOS; intento++) {
-    console.log(`   [${auditoria_id}] Playwright intento ${intento}/${MAX_INTENTOS}...`);
-    const browser = await chromium.launch({ headless: true });
-    try {
-      const context = await browser.newContext({
-        storageState: rutaSesion,
-        acceptDownloads: true,
-      });
-      const page = await context.newPage();
-
-      // Verificar sesión
-      await page.goto('https://notebooklm.cloud.google.com', {
-        waitUntil: 'domcontentloaded', timeout: 30_000,
-      });
-      if (page.url().includes('accounts.google.com')) {
-        throw new Error('Sesión de NotebookLM expirada. Renovar SESION_GOOGLE.');
-      }
-
-      // Ir directo al notebook
-      console.log(`   [${auditoria_id}] Abriendo notebook: ${notebookUrl}`);
-      await page.goto(notebookUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-      await page.waitForTimeout(10000);
-
-      let audioDescargado = false;
-
-      // Expandir panel Audio Overview si está colapsado
-      const btnAudio = page.locator('button').filter({ hasText: /audio overview/i }).first();
-      if (await btnAudio.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await btnAudio.click();
-        await page.waitForTimeout(3000);
-        console.log(`   [${auditoria_id}] Panel Audio Overview expandido`);
-      }
-
-      // Verificar que el audio está listo (botón Play visible)
-      const btnPlay = page.locator('button[aria-label="Play"], button[aria-label="Reproducir"]').first();
-      const audioListo = await btnPlay.isVisible({ timeout: 8000 }).catch(() => false);
-      console.log(`   [${auditoria_id}] Audio listo: ${audioListo}`);
-
-      if (!audioListo) {
-        console.log(`   [${auditoria_id}] Audio aún no generado. Esperando ${ESPERA_ENTRE_REINTENTOS / 60000} min...`);
-        await browser.close();
-        if (intento < MAX_INTENTOS) await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
-        continue;
-      }
-
-      // El log anterior confirmó que el menú 3 (índice 2) tiene "Download"
-      // Probar los botones more_vert en orden inverso (el último suele ser el del Audio Overview)
-      const moreBtns = await page.locator('button[aria-label="more_vert"], button[aria-label="Más"]').all();
-      console.log(`   [${auditoria_id}] Botones more_vert: ${moreBtns.length}`);
-
-      for (let i = moreBtns.length - 1; i >= 0; i--) {
-        await moreBtns[i].click().catch(() => {});
-        await page.waitForTimeout(1500);
-
-        const menuItems = await page.locator('[role="menuitem"]').allTextContents();
-        console.log(`   [${auditoria_id}] Menú ${i+1}:`, JSON.stringify(menuItems));
-
-        const itemDescarga = page.locator('[role="menuitem"]').filter({
-          hasText: /download|descargar|save_alt/i
-        }).first();
-
-        if (await itemDescarga.isVisible({ timeout: 2000 }).catch(() => false)) {
-          console.log(`   [${auditoria_id}] Encontrado item descarga en menú ${i+1}`);
-
-          // Inyectar interceptor de Blob URLs ANTES del clic
-          await page.evaluate(() => {
-            window.__blobUrls = [];
-            const origCreateObjectURL = URL.createObjectURL.bind(URL);
-            URL.createObjectURL = function(obj) {
-              const url = origCreateObjectURL(obj);
-              window.__blobUrls.push({ url, type: obj.type || 'unknown', size: obj.size || 0 });
-              return url;
-            };
-          });
-
-          // Hacer clic en Download
-          await itemDescarga.click().catch(() => {});
-          await page.waitForTimeout(3000);
-
-          // Recuperar Blob URLs capturadas
-          const blobInfo = await page.evaluate(() => window.__blobUrls || []);
-          console.log(`   [${auditoria_id}] Blob URLs capturadas: ${JSON.stringify(blobInfo)}`);
-
-          if (blobInfo.length > 0) {
-            // Descargar el blob desde dentro del contexto del browser
-            const blobUrl = blobInfo[blobInfo.length - 1].url;
-            console.log(`   [${auditoria_id}] Descargando blob: ${blobUrl}`);
-            const base64 = await page.evaluate(async (url) => {
-              const resp = await fetch(url);
-              const buf  = await resp.arrayBuffer();
-              const bytes = new Uint8Array(buf);
-              let binary = '';
-              for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-              return btoa(binary);
-            }, blobUrl);
-            const buffer = Buffer.from(base64, 'base64');
-            fs.writeFileSync(rutaSalida, buffer);
-            audioDescargado = true;
-            console.log(`   [${auditoria_id}] ✅ Audio descargado vía Blob URL (${buffer.length} bytes)`);
-          } else {
-            // Fallback: evento download estándar
-            try {
-              await page.keyboard.press('Escape');
-              await page.waitForTimeout(500);
-              await moreBtns[i].click().catch(() => {});
-              await page.waitForTimeout(1000);
-              const itemD2 = page.locator('[role="menuitem"]').filter({ hasText: /download|descargar/i }).first();
-              const [dl] = await Promise.all([
-                page.waitForEvent('download', { timeout: 20_000 }),
-                itemD2.click(),
-              ]);
-              await dl.saveAs(rutaSalida);
-              audioDescargado = true;
-              console.log(`   [${auditoria_id}] ✅ Audio descargado vía evento download`);
-            } catch(e2) {
-              console.log(`   [${auditoria_id}] Fallback también falló: ${e2.message.slice(0, 80)}`);
-            }
-          }
-          break;
-        }
-        await page.keyboard.press('Escape');
-        await page.waitForTimeout(500);
-      }
-
-      await browser.close();
-
-      if (audioDescargado) {
-        // Limpiar sesión temporal solo si éxito
-        fs.unlinkSync(rutaSesion);
-        return;
-      }
-
-      console.log(`   [${auditoria_id}] No se pudo descargar en intento ${intento}. Esperando ${ESPERA_ENTRE_REINTENTOS / 60000} min...`);
-      if (intento < MAX_INTENTOS) await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
-
-    } catch(err) {
-      await browser.close().catch(() => {});
-      if (err.message.includes('Sesión de NotebookLM expirada')) {
-        await alertarSesionExpirada();
-        fs.unlinkSync(rutaSesion);
-        throw err;
-      }
-      console.error(`   [${auditoria_id}] Error en intento ${intento}:`, err.message);
-      if (intento < MAX_INTENTOS) await new Promise(r => setTimeout(r, ESPERA_ENTRE_REINTENTOS));
-    }
-  }
-
-  fs.unlinkSync(rutaSesion);
-  throw new Error(`No se pudo descargar el audio tras ${MAX_INTENTOS} intentos`);
+  return notebookId;
 }
 
 // ── Paleta institucional para PPTX ──────────────────────────────────────────
@@ -499,7 +215,7 @@ function footer(slide) {
   });
 }
 
-// ── Lámina 1: Portada + Resumen ──────────────────────────────────────────────
+// ── Láminas PPTX ─────────────────────────────────────────────────────────────
 
 function laminaPortada(pres, d) {
   const slide = pres.addSlide();
@@ -521,7 +237,6 @@ function laminaPortada(pres, d) {
   });
   slide.addShape('rect', { x: ML, y: MT + 1.72, w: CW, h: 0.008, fill: { color: C.cremaBorde }, line: { color: C.cremaBorde, width: 0 } });
 
-  // Gauge
   slide.addImage({ data: iconGauge(d.puntaje), x: 7.8, y: MT - 0.05, w: 1.7, h: 1.7 });
   const colorRiesgo = d.nivelRiesgo === 'BAJO' ? C.rojo : d.nivelRiesgo === 'MODERADO' ? C.dorado : C.texto;
   slide.addShape('rect', { x: 7.85, y: MT + 1.65, w: 1.6, h: 0.28, fill: { color: colorRiesgo }, line: { color: colorRiesgo, width: 0 } });
@@ -557,7 +272,6 @@ function laminaPortada(pres, d) {
     }
   });
 
-  // Celda de totales
   const totalCol = d.categorias.length % 4, totalRow = Math.floor(d.categorias.length / 4);
   const tx = ML + totalCol * (catW + catGap), ty = catY + totalRow * (catH + catGap);
   slide.addShape('rect', { x: tx, y: ty, w: catW, h: catH, fill: { color: C.rojo }, line: { color: C.rojo, width: 0 } });
@@ -567,8 +281,6 @@ function laminaPortada(pres, d) {
 
   footer(slide);
 }
-
-// ── Lámina por categoría ─────────────────────────────────────────────────────
 
 function laminaCategoria(pres, cat) {
   const slide = pres.addSlide();
@@ -616,8 +328,6 @@ function laminaCategoria(pres, cat) {
   footer(slide);
 }
 
-// ── Lámina de alerta ─────────────────────────────────────────────────────────
-
 function laminaAlerta(pres, alerta, numero, total) {
   const slide = pres.addSlide();
   slide.background = { color: C.blanco };
@@ -660,7 +370,7 @@ function laminaAlerta(pres, alerta, numero, total) {
 
 // ── Extraer estructura del reporte con Claude ─────────────────────────────────
 
-const PROMPT_EXTRACCION = `Eres un asistente que convierte reportes de auditoría liberal en estructuras JSON para generar presentaciones.
+const PROMPT_EXTRACCION = `Eres un asistente que convierte reportes de auditoría liberal en estructuras JSON para generar presentaciones y mapas mentales.
 Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks.
 
 Estructura requerida:
@@ -702,7 +412,7 @@ Reglas:
 - Las 7 categorías siempre son: I=Dignidad y Autonomía Individual, II=Estado de Derecho e Instituciones, III=Propiedad Privada y Libre Empresa, IV=Competencia y Rechazo al Rentismo, V=Límites al Estado y Subsidiariedad, VI=Igualdad de Oportunidades y Política Social, VII=Integridad Semántica y Soberanía
 - Incluye TODAS las alertas del reporte`;
 
-async function extraerEstructuraPresentacion(reporteTexto) {
+async function extraerEstructura(reporteTexto) {
   const respuesta = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 4000,
@@ -716,8 +426,8 @@ async function extraerEstructuraPresentacion(reporteTexto) {
 // ── Generar PPTX ─────────────────────────────────────────────────────────────
 
 async function generarPresentacion(reporteTexto, titulo, rutaSalida, auditoria_id) {
-  console.log(`   [${auditoria_id}] Extrayendo estructura de presentación con Claude...`);
-  const estructura = await extraerEstructuraPresentacion(reporteTexto);
+  console.log(`   [${auditoria_id}] Extrayendo estructura con Claude...`);
+  const estructura = await extraerEstructura(reporteTexto);
   console.log(`   [${auditoria_id}] Estructura extraída: ${estructura.categorias.length} categorías · ${estructura.alertas.length} alertas`);
 
   const pres = new pptxgen();
@@ -729,43 +439,153 @@ async function generarPresentacion(reporteTexto, titulo, rutaSalida, auditoria_i
   laminaPortada(pres, estructura);
   for (const cat of estructura.categorias) laminaCategoria(pres, cat);
   if (estructura.alertas?.length > 0) {
-    estructura.alertas.forEach((alerta, i) => laminaAlerta(pres, alerta, i + 1, estructura.alertas.length));
+    estructura.alertas.forEach((alerta, i) =>
+      laminaAlerta(pres, alerta, i + 1, estructura.alertas.length)
+    );
   }
 
   await pres.writeFile({ fileName: rutaSalida });
   console.log(`   [${auditoria_id}] PPTX generado: ${rutaSalida}`);
-  return rutaSalida;
+  return estructura; // devolvemos la estructura para reutilizarla en el mapa mental
+}
+
+// ── Generar Mapa Mental (SVG → PNG via sharp) ────────────────────────────────
+// Estructura radial: nodo central → 7 ramas (categorías) → subnodos por criterio
+
+async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
+  console.log(`   [${auditoria_id}] Generando mapa mental SVG...`);
+
+  const ANCHO = 2400, ALTO = 2400;
+  const CX = ANCHO / 2, CY = ALTO / 2;
+  const R_CENTRO = 120;
+  const R_CAT    = 340; // radio nodo categoría
+  const R_CRIT   = 580; // radio subnodos criterio
+
+  // Colores por resultado
+  const colorResultado = {
+    SI:       { fill: '#E8F5E9', stroke: '#2E7D32', texto: '#1B5E20' },
+    SI_MATIZ: { fill: '#FFF8E1', stroke: '#B8860B', texto: '#7B5800' },
+    NO:       { fill: '#FFEBEE', stroke: '#C41230', texto: '#8B0000' },
+    NA:       { fill: '#F5F5F5', stroke: '#8A8478', texto: '#4A4A4A' },
+  };
+
+  const nCats = estructura.categorias.length;
+
+  // Acumular elementos SVG
+  const lineas = [], nodos = [], textos = [];
+
+  estructura.categorias.forEach((cat, i) => {
+    const angulo = (2 * Math.PI * i / nCats) - Math.PI / 2;
+    const catX   = CX + R_CAT * Math.cos(angulo);
+    const catY   = CY + R_CAT * Math.sin(angulo);
+
+    // Línea centro → categoría
+    lineas.push(`<line x1="${CX}" y1="${CY}" x2="${catX}" y2="${catY}"
+      stroke="#C41230" stroke-width="3" stroke-opacity="0.4"/>`);
+
+    // Nodo categoría
+    const catColor = cat.siPlenos > 0 ? '#C41230' : cat.siMatiz > 0 ? '#B8860B' : '#4A4A4A';
+    nodos.push(`<circle cx="${catX}" cy="${catY}" r="52"
+      fill="white" stroke="${catColor}" stroke-width="3"/>`);
+    textos.push(`<text x="${catX}" y="${catY - 8}" text-anchor="middle"
+      font-size="18" font-weight="bold" fill="${catColor}" font-family="Arial,sans-serif">${cat.num}</text>`);
+    // Nombre corto de categoría (máx 12 chars)
+    const nombreCorto = cat.nombre.split(' ').slice(0, 2).join(' ');
+    textos.push(`<text x="${catX}" y="${catY + 14}" text-anchor="middle"
+      font-size="13" fill="#4A4A4A" font-family="Arial,sans-serif">${nombreCorto}</text>`);
+    // Badge conteo
+    const badge = cat.siPlenos > 0 ? `${cat.siPlenos}✓` : cat.siMatiz > 0 ? `${cat.siMatiz}~` : '—';
+    textos.push(`<text x="${catX}" y="${catY + 32}" text-anchor="middle"
+      font-size="13" fill="${catColor}" font-family="Arial,sans-serif" font-weight="bold">${badge}</text>`);
+
+    // Subnodos criterios
+    const nCrits = cat.criterios.length;
+    cat.criterios.forEach((crit, j) => {
+      // Distribuir criterios en abanico alrededor del ángulo de la categoría
+      const spread   = Math.min(Math.PI * 0.55, (nCrits - 1) * 0.22);
+      const anguloC  = nCrits > 1
+        ? angulo - spread / 2 + (spread / (nCrits - 1)) * j
+        : angulo;
+      const critX = CX + R_CRIT * Math.cos(anguloC);
+      const critY = CY + R_CRIT * Math.sin(anguloC);
+      const col   = colorResultado[crit.resultado] || colorResultado.NA;
+
+      // Línea categoría → criterio
+      lineas.push(`<line x1="${catX}" y1="${catY}" x2="${critX}" y2="${critY}"
+        stroke="#D4CFC4" stroke-width="1.5"/>`);
+
+      // Nodo criterio (rectángulo redondeado)
+      const rw = 130, rh = 56;
+      nodos.push(`<rect x="${critX - rw/2}" y="${critY - rh/2}" width="${rw}" height="${rh}"
+        rx="4" fill="${col.fill}" stroke="${col.stroke}" stroke-width="2"/>`);
+      textos.push(`<text x="${critX}" y="${critY - 8}" text-anchor="middle"
+        font-size="14" font-weight="bold" fill="${col.texto}" font-family="Arial,sans-serif">${crit.id}</text>`);
+      // Resumen recortado a ~16 chars
+      const resCorto = crit.resumen.length > 16
+        ? crit.resumen.slice(0, 15) + '…'
+        : crit.resumen;
+      textos.push(`<text x="${critX}" y="${critY + 10}" text-anchor="middle"
+        font-size="11" fill="${col.texto}" font-family="Arial,sans-serif">${resCorto}</text>`);
+    });
+  });
+
+  // Nodo central
+  nodos.push(`<circle cx="${CX}" cy="${CY}" r="${R_CENTRO}"
+    fill="#C41230" stroke="#9B0D24" stroke-width="4"/>`);
+  textos.push(`<text x="${CX}" y="${CY - 28}" text-anchor="middle"
+    font-size="22" font-weight="bold" fill="white" font-family="Georgia,serif">AUDITORÍA</text>`);
+  textos.push(`<text x="${CX}" y="${CY}" text-anchor="middle"
+    font-size="22" font-weight="bold" fill="white" font-family="Georgia,serif">LIBERAL</text>`);
+  textos.push(`<text x="${CX}" y="${CY + 30}" text-anchor="middle"
+    font-size="36" font-weight="bold" fill="white" font-family="Arial,sans-serif">${estructura.puntaje}%</text>`);
+  textos.push(`<text x="${CX}" y="${CY + 58}" text-anchor="middle"
+    font-size="16" fill="#FFCDD2" font-family="Arial,sans-serif" letter-spacing="1">ÍNDICE LIBERAL</text>`);
+
+  // Título y leyenda
+  const tituloCorto = estructura.titulo.length > 60
+    ? estructura.titulo.slice(0, 58) + '…'
+    : estructura.titulo;
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${ANCHO}" height="${ALTO}" viewBox="0 0 ${ANCHO} ${ALTO}">
+  <rect width="${ANCHO}" height="${ALTO}" fill="white"/>
+  <!-- Título -->
+  <text x="${CX}" y="52" text-anchor="middle"
+    font-size="28" font-weight="bold" fill="#1A1A1A" font-family="Georgia,serif">${tituloCorto}</text>
+  <text x="${CX}" y="82" text-anchor="middle"
+    font-size="18" fill="#8A8478" font-family="Arial,sans-serif">Mapa Mental · Auditoría Cívica Liberal · liberalmente.app</text>
+  <!-- Líneas -->
+  ${lineas.join('\n  ')}
+  <!-- Nodos -->
+  ${nodos.join('\n  ')}
+  <!-- Textos -->
+  ${textos.join('\n  ')}
+  <!-- Leyenda -->
+  <rect x="40" y="${ALTO - 90}" width="16" height="16" rx="2" fill="#E8F5E9" stroke="#2E7D32" stroke-width="2"/>
+  <text x="64" y="${ALTO - 77}" font-size="18" fill="#4A4A4A" font-family="Arial,sans-serif">SÍ pleno</text>
+  <rect x="160" y="${ALTO - 90}" width="16" height="16" rx="2" fill="#FFF8E1" stroke="#B8860B" stroke-width="2"/>
+  <text x="184" y="${ALTO - 77}" font-size="18" fill="#4A4A4A" font-family="Arial,sans-serif">SÍ con matiz</text>
+  <rect x="320" y="${ALTO - 90}" width="16" height="16" rx="2" fill="#FFEBEE" stroke="#C41230" stroke-width="2"/>
+  <text x="344" y="${ALTO - 77}" font-size="18" fill="#4A4A4A" font-family="Arial,sans-serif">NO</text>
+  <rect x="400" y="${ALTO - 90}" width="16" height="16" rx="2" fill="#F5F5F5" stroke="#8A8478" stroke-width="2"/>
+  <text x="424" y="${ALTO - 77}" font-size="18" fill="#4A4A4A" font-family="Arial,sans-serif">N/A</text>
+</svg>`;
+
+  // SVG → PNG via sharp
+  const svgBuffer = Buffer.from(svg);
+  await sharp(svgBuffer)
+    .png({ quality: 95 })
+    .toFile(rutaSalida);
+
+  console.log(`   [${auditoria_id}] Mapa mental generado: ${rutaSalida}`);
 }
 
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.1', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.2', timestamp: new Date().toISOString() });
 });
 
-app.get('/verificar-sesion', async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
-  const rutaSesion = '/tmp/sesion-test.json';
-  try {
-    const sesionNorm = normalizarSesionGoogle(process.env.SESION_GOOGLE);
-    fs.writeFileSync(rutaSesion, sesionNorm, 'utf8');
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ storageState: rutaSesion });
-    const page    = await context.newPage();
-    await page.goto('https://notebooklm.google.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(5000);
-    const url  = page.url();
-    const viva = !url.includes('accounts.google.com');
-    await browser.close();
-    fs.unlinkSync(rutaSesion);
-    res.json({ viva, url, timestamp: new Date().toISOString() });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
+// Endpoint principal: recibe una auditoría y la procesa
 app.post('/procesar', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -780,29 +600,20 @@ app.post('/procesar', async (req, res) => {
   });
 });
 
-app.post('/retomar', async (req, res) => {
+// Endpoint para que el dashboard complete una auditoría con el audio ya subido
+// POST /completar-audio { auditoria_id, audio_drive_link }
+app.post('/completar-audio', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
   }
-  try {
-    const result = await db.query(`
-      SELECT a.id, a.pdf_drive_id, c.email AS ciudadano_email, a.titulo_documento
-      FROM auditorias a
-      JOIN ciudadanos c ON c.id = a.ciudadano_id
-      WHERE a.estado = 'awaiting_session'
-      ORDER BY a.creada_en ASC
-    `);
-    const pendientes = result.rows;
-    if (pendientes.length === 0) return res.json({ mensaje: 'No hay auditorías en espera', retomadas: 0 });
-    res.json({ mensaje: `Retomando ${pendientes.length} auditoría(s)`, retomadas: pendientes.length });
-    for (const a of pendientes) {
-      await retomarDesdePaquetes(a.id, a.ciudadano_email)
-        .catch(err => console.error(`❌ Error retomando [${a.id}]:`, err.message));
-      if (pendientes.indexOf(a) < pendientes.length - 1) await new Promise(r => setTimeout(r, 3000));
-    }
-  } catch (error) {
-    if (!res.headersSent) res.status(500).json({ error: error.message });
+  const { auditoria_id, audio_drive_link } = req.body;
+  if (!auditoria_id || !audio_drive_link) {
+    return res.status(400).json({ error: 'Faltan auditoria_id y audio_drive_link' });
   }
+  res.json({ mensaje: 'Audio recibido, completando auditoría', auditoria_id });
+  completarConAudio(auditoria_id, audio_drive_link).catch(err => {
+    console.error(`❌ [${auditoria_id}] Error al completar con audio:`, err.message);
+  });
 });
 
 // ── Función principal ────────────────────────────────────────────────────────
@@ -815,13 +626,13 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
   const rutaTXT        = path.join(dir, 'original.txt');
   const rutaReporte    = path.join(dir, 'reporte.txt');
   const rutaReportePDF = path.join(dir, 'reporte.pdf');
-  const rutaPodcast    = path.join(dir, 'podcast.wav');
   const rutaSlides     = path.join(dir, 'presentacion.pptx');
+  const rutaMapa       = path.join(dir, 'mapa.png');
 
   fs.mkdirSync(dir, { recursive: true });
 
   try {
-    // PASO 1 — Descargar PDF
+    // PASO 1 — Descargar PDF original
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando PDF...`);
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
@@ -866,99 +677,126 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     // PASO 6 — PDF del reporte
     console.log(`📄 [${auditoria_id}] PASO 6: Generando PDF del reporte...`);
     await convertirTXTaPDF(rutaReporte, rutaReportePDF, metadatos.titulo);
-    console.log(`✅ [${auditoria_id}] PDF generado`);
+    console.log(`✅ [${auditoria_id}] PDF del reporte generado`);
 
-    // PASO 7 — NotebookLM (Audio Overview)
-    console.log(`🎙️  [${auditoria_id}] PASO 7: Generando audio con NotebookLM API...`);
+    // PASO 7 — NotebookLM: disparar audio (no espera descarga)
+    console.log(`🎙️  [${auditoria_id}] PASO 7: Disparando Audio Overview en NotebookLM...`);
     await actualizarEstado(auditoria_id, 'empaquetando');
-    await ejecutarNotebookLMApi(reporte, metadatos.titulo, rutaPodcast, auditoria_id);
-    console.log(`✅ [${auditoria_id}] Audio generado`);
+    const notebookId = await dispararNotebookLM(reporte, metadatos.titulo, auditoria_id);
+    await db.query(
+      `UPDATE auditorias SET notebook_id = $1 WHERE id = $2`,
+      [notebookId, auditoria_id]
+    );
+    console.log(`✅ [${auditoria_id}] Audio disparado. NotebookID: ${notebookId}`);
 
     // PASO 8 — Presentación PPTX
     console.log(`📊 [${auditoria_id}] PASO 8: Generando presentación PPTX...`);
-    await generarPresentacion(reporte, metadatos.titulo, rutaSlides, auditoria_id);
+    const estructura = await generarPresentacion(reporte, metadatos.titulo, rutaSlides, auditoria_id);
     console.log(`✅ [${auditoria_id}] Presentación generada`);
 
-    // PASO 9 — Subir a Drive y enviar email
-    await finalizarAuditoria(drive, auditoria_id, ciudadano_email, metadatos.titulo,
-      rutaReportePDF, rutaPodcast, rutaSlides);
+    // PASO 9 — Mapa mental PNG
+    console.log(`🗺️  [${auditoria_id}] PASO 9: Generando mapa mental...`);
+    await generarMapaMental(estructura, rutaMapa, auditoria_id);
+    console.log(`✅ [${auditoria_id}] Mapa mental generado`);
+
+    // PASO 10 — Subir archivos a Drive y marcar parcialmente_completada
+    console.log(`☁️  [${auditoria_id}] PASO 10: Subiendo archivos a Drive...`);
+    const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
+
+    // Subir PDF original
+    const linkOriginal = await subirArchivo(drive, rutaPDF, 'documento-original.pdf', 'application/pdf', carpetaId);
+    // Subir reporte PDF
+    const linkReporte  = await subirArchivo(drive, rutaReportePDF, 'reporte.pdf', 'application/pdf', carpetaId);
+    // Subir PPTX
+    const linkSlides   = await subirArchivo(drive, rutaSlides, 'presentacion.pptx',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
+    // Subir mapa mental
+    const linkMapa     = await subirArchivo(drive, rutaMapa, 'mapa-mental.png', 'image/png', carpetaId);
+
+    await db.query(
+      `UPDATE auditorias
+       SET estado = 'parcialmente_completada',
+           link_original = $1,
+           link_reporte  = $2,
+           link_presentacion = $3,
+           link_mapa = $4,
+           drive_carpeta_id = $5
+       WHERE id = $6`,
+      [linkOriginal, linkReporte, linkSlides, linkMapa, carpetaId, auditoria_id]
+    );
+
+    // Email 1 al ciudadano: confirmación de recepción y aviso de que el audio está en proceso
+    await enviarEmailRecepcion(ciudadano_email, metadatos.titulo, auditoria_id);
+
+    console.log(`\n⏳ [${auditoria_id}] Auditoría parcialmente completada. Esperando audio del editor.`);
 
   } catch (error) {
     console.error(`❌ [${auditoria_id}] Error:`, error.message);
     await actualizarEstado(auditoria_id, 'error').catch(() => {});
-    await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`, [error.message, auditoria_id]).catch(() => {});
+    await db.query(
+      `UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`,
+      [error.message, auditoria_id]
+    ).catch(() => {});
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(`🧹 [${auditoria_id}] Archivos temporales eliminados`);
   }
 }
 
-// ── Retomar desde PASO 7 ─────────────────────────────────────────────────────
+// ── Completar auditoría cuando el editor sube el audio ───────────────────────
 
-async function retomarDesdePaquetes(auditoria_id, ciudadano_email) {
-  const dir            = path.join(DIRECTORIO_TEMP, `retomar-${auditoria_id}`);
-  const rutaReporte    = path.join(dir, 'reporte.txt');
-  const rutaReportePDF = path.join(dir, 'reporte.pdf');
-  const rutaPodcast    = path.join(dir, 'podcast.wav');
-  const rutaSlides     = path.join(dir, 'presentacion.pptx');
-
-  fs.mkdirSync(dir, { recursive: true });
+async function completarConAudio(auditoria_id, audio_drive_link) {
+  console.log(`\n🎙️  [${auditoria_id}] Completando auditoría con audio...`);
 
   try {
+    // Recuperar datos de la auditoría
     const result = await db.query(
-      `SELECT reporte_texto, titulo_documento FROM auditorias WHERE id = $1`, [auditoria_id]
+      `SELECT a.titulo_documento, a.notebook_id, c.email AS ciudadano_email,
+              a.link_original, a.link_reporte, a.link_presentacion, a.link_mapa
+       FROM auditorias a
+       JOIN ciudadanos c ON c.id = a.ciudadano_id
+       WHERE a.id = $1`,
+      [auditoria_id]
     );
-    if (!result.rows[0]?.reporte_texto) throw new Error('No se encontró el reporte en BD');
-    const { reporte_texto, titulo_documento } = result.rows[0];
+    if (!result.rows[0]) throw new Error('Auditoría no encontrada');
+    const { titulo_documento, notebook_id, ciudadano_email,
+            link_original, link_reporte, link_presentacion, link_mapa } = result.rows[0];
 
-    fs.writeFileSync(rutaReporte, reporte_texto, 'utf8');
-    await convertirTXTaPDF(rutaReporte, rutaReportePDF, titulo_documento || 'Documento');
+    // Actualizar BD con el link del podcast y marcar como completada
+    await db.query(
+      `UPDATE auditorias
+       SET estado = 'completada',
+           link_podcast = $1,
+           completada_en = NOW()
+       WHERE id = $2`,
+      [audio_drive_link, auditoria_id]
+    );
 
-    await actualizarEstado(auditoria_id, 'empaquetando');
-    await ejecutarNotebookLMApi(reporte_texto, titulo_documento, rutaPodcast, auditoria_id);
-    await generarPresentacion(reporte_texto, titulo_documento, rutaSlides, auditoria_id);
+    // Eliminar el notebook de NotebookLM (ya no se necesita)
+    if (notebook_id) {
+      await nlmEliminarNotebook(notebook_id).catch(() => {});
+      console.log(`   [${auditoria_id}] Notebook eliminado`);
+    }
 
-    const driveAuth = autenticarDrive();
-    const drive = google.drive({ version: 'v3', auth: driveAuth });
-    await finalizarAuditoria(drive, auditoria_id, ciudadano_email, titulo_documento || 'Documento',
-      rutaReportePDF, rutaPodcast, rutaSlides);
+    // Email final al ciudadano con los 5 links
+    const links = {
+      original:     link_original,
+      reporte:      link_reporte,
+      podcast:      audio_drive_link,
+      presentacion: link_presentacion,
+      mapa:         link_mapa,
+    };
+    await enviarEmailFinal(ciudadano_email, titulo_documento, auditoria_id, links);
+
+    console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
 
   } catch (error) {
-    console.error(`❌ [${auditoria_id}] Error al retomar:`, error.message);
-    await actualizarEstado(auditoria_id, 'error').catch(() => {});
-    await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`, [error.message, auditoria_id]).catch(() => {});
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    console.error(`❌ [${auditoria_id}] Error al completar con audio:`, error.message);
+    throw error;
   }
 }
 
-// ── Finalizar auditoría ───────────────────────────────────────────────────────
-
-async function finalizarAuditoria(drive, auditoria_id, ciudadano_email, titulo,
-  rutaReportePDF, rutaPodcast, rutaSlides) {
-
-  console.log(`☁️  [${auditoria_id}] Subiendo archivos a Drive...`);
-  const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
-  const links = {};
-  links.reporte = await subirArchivo(drive, rutaReportePDF, 'reporte.pdf', 'application/pdf', carpetaId);
-  links.podcast = await subirArchivo(drive, rutaPodcast, 'podcast.wav', 'audio/wav', carpetaId);
-  links.slides  = await subirArchivo(drive, rutaSlides, 'presentacion.pptx',
-    'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
-  console.log(`✅ [${auditoria_id}] Archivos subidos`);
-
-  await db.query(
-    `UPDATE auditorias
-     SET estado = 'completada', link_reporte = $1, link_podcast = $2,
-         link_presentacion = $3, completada_en = NOW()
-     WHERE id = $4`,
-    [links.reporte, links.podcast, links.slides, auditoria_id]
-  );
-
-  await enviarEmail(ciudadano_email, auditoria_id, links, titulo);
-  console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
-}
-
-// ── Funciones auxiliares (sin cambios) ───────────────────────────────────────
+// ── Funciones auxiliares ──────────────────────────────────────────────────────
 
 function autenticarDrive() {
   const auth = new google.auth.OAuth2(
@@ -982,7 +820,9 @@ async function descargarPDF(drive, fileId, destino) {
 
 async function obtenerConfigDoctrinal() {
   const result = await db.query(
-    `SELECT version, prompt_sistema, prompt_analisis FROM configuracion_doctrinal WHERE activo = true ORDER BY version DESC LIMIT 1`
+    `SELECT version, prompt_sistema, prompt_analisis
+     FROM configuracion_doctrinal WHERE activo = true
+     ORDER BY version DESC LIMIT 1`
   );
   if (result.rows.length === 0) throw new Error('No hay configuración doctrinal activa');
   return result.rows[0];
@@ -1014,7 +854,8 @@ Fragmento:\n${muestra}`,
     return {
       titulo:    datos.titulo    || 'Documento sin título',
       pais:      datos.pais      || 'General',
-      categoria: ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria) ? datos.categoria : 'pais',
+      categoria: ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria)
+        ? datos.categoria : 'pais',
     };
   } catch {
     return { titulo: 'Documento sin título', pais: 'General', categoria: 'pais' };
@@ -1043,12 +884,16 @@ async function convertirTXTaPDF(rutaTXT, rutaPDF, titulo) {
     doc.fontSize(17).fillColor('#1a1a1a').font('Helvetica-Bold')
       .text(titulo, { align: 'center' }).moveDown(0.5);
     doc.fontSize(9).fillColor('#888888').font('Helvetica')
-      .text(`Generado el ${new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' })}`, { align: 'center' }).moveDown(1.5);
-    doc.moveTo(72, doc.y).lineTo(doc.page.width - 72, doc.y).strokeColor('#cccccc').lineWidth(0.5).stroke().moveDown(1.5);
-    doc.fontSize(11).fillColor('#1a1a1a').font('Helvetica').text(texto, { lineGap: 5, paragraphGap: 10 });
+      .text(`Generado el ${new Date().toLocaleDateString('es-VE',
+        { year: 'numeric', month: 'long', day: 'numeric' })}`, { align: 'center' }).moveDown(1.5);
+    doc.moveTo(72, doc.y).lineTo(doc.page.width - 72, doc.y)
+      .strokeColor('#cccccc').lineWidth(0.5).stroke().moveDown(1.5);
+    doc.fontSize(11).fillColor('#1a1a1a').font('Helvetica')
+      .text(texto, { lineGap: 5, paragraphGap: 10 });
     doc.on('pageAdded', () => {
       doc.fontSize(8).fillColor('#aaaaaa')
-        .text('Auditoría Cívica Liberal · liberalmente.app', 72, doc.page.height - 40, { align: 'center', width: doc.page.width - 144 });
+        .text('Auditoría Cívica Liberal · liberalmente.app', 72, doc.page.height - 40,
+          { align: 'center', width: doc.page.width - 144 });
     });
     doc.end();
     stream.on('finish', resolve);
@@ -1070,13 +915,19 @@ async function obtenerCarpetaAuditoria(drive, auditoria_id) {
 }
 
 async function subirArchivo(drive, ruta, nombre, mime, carpetaId) {
-  if (!fs.existsSync(ruta)) { console.log(`   ⚠️  Omitiendo ${nombre} (no encontrado)`); return null; }
+  if (!fs.existsSync(ruta)) {
+    console.log(`   ⚠️  Omitiendo ${nombre} (no encontrado)`);
+    return null;
+  }
   const res = await drive.files.create({
     requestBody: { name: nombre, parents: [carpetaId] },
     media: { mimeType: mime, body: fs.createReadStream(ruta) },
     fields: 'id, webViewLink',
   });
-  await drive.permissions.create({ fileId: res.data.id, requestBody: { role: 'reader', type: 'anyone' } });
+  await drive.permissions.create({
+    fileId: res.data.id,
+    requestBody: { role: 'reader', type: 'anyone' },
+  });
   console.log(`   ✅ ${nombre} subido`);
   return res.data.webViewLink;
 }
@@ -1085,58 +936,67 @@ async function actualizarEstado(auditoria_id, estado) {
   await db.query(`UPDATE auditorias SET estado = $1 WHERE id = $2`, [estado, auditoria_id]);
 }
 
-async function enviarEmail(email, auditoria_id, links, titulo) {
+// Email 1: confirmación de recepción (se envía al terminar el procesamiento automático)
+async function enviarEmailRecepcion(email, titulo, auditoria_id) {
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+    },
     body: JSON.stringify({
       from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
       to: email,
-      subject: '✅ Tu auditoría está lista',
+      subject: '✅ Recibimos tu auditoría — te avisamos cuando esté lista',
       html: `
-        <p>Tu auditoría de <strong>${titulo}</strong> ha sido procesada. Aquí están tus materiales:</p>
-        <ul>
-          ${links.reporte ? `<li><a href="${links.reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
-          ${links.podcast ? `<li><a href="${links.podcast}">🎙️ Podcast (Audio Overview)</a></li>` : ''}
-          ${links.slides  ? `<li><a href="${links.slides}">📊 Presentación (PPTX)</a></li>` : ''}
-        </ul>
-        <p>Accede a todos tus análisis en <a href="https://liberalmente.app/biblioteca">liberalmente.app/biblioteca</a></p>
+        <p>Ciudadano,</p>
+        <p>Recibimos tu documento <strong>${titulo}</strong> y ya comenzamos a auditarlo.</p>
+        <p>En los próximos minutos estaremos generando tu paquete completo: reporte, presentación, mapa mental y podcast. Te avisamos por correo cuando todo esté listo.</p>
+        <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>
       `,
     }),
   });
-  if (!res.ok) throw new Error(`Error enviando email: ${await res.text()}`);
-  console.log(`   ✅ Email enviado a ${email}`);
+  if (!res.ok) console.error(`   ⚠️  Error enviando email de recepción: ${await res.text()}`);
+  else console.log(`   ✅ Email de recepción enviado a ${email}`);
 }
 
-async function alertarSesionExpirada() {
-  try {
-    const result = await db.query(
-      `SELECT email FROM configuracion_alertas WHERE tipo = 'sesion_notebooklm' AND activo = true`
-    );
-    const destinatarios = result.rows.map(r => r.email);
-    if (destinatarios.length === 0) return;
-    await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
-      body: JSON.stringify({
-        from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
-        to: destinatarios,
-        subject: '⚠️ Sesión de NotebookLM expirada',
-        html: `<p>La sesión de NotebookLM ha expirado. Renovar SESION_GOOGLE en Railway.</p><p><small>${new Date().toISOString()}</small></p>`,
-      }),
-    });
-  } catch (err) {
-    console.error('   ❌ Error enviando alerta:', err.message);
-  }
+// Email 2: email final con los 5 links (se envía cuando el editor completa el audio)
+async function enviarEmailFinal(email, titulo, auditoria_id, links) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+    },
+    body: JSON.stringify({
+      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+      to: email,
+      subject: '🎉 Tu auditoría está lista',
+      html: `
+        <p>Ciudadano,</p>
+        <p>Tu auditoría de <strong>${titulo}</strong> está lista. Aquí están tus materiales:</p>
+        <ul>
+          ${links.original     ? `<li><a href="${links.original}">📄 Documento original (PDF)</a></li>` : ''}
+          ${links.reporte      ? `<li><a href="${links.reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
+          ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Podcast — Audio Overview</a></li>` : ''}
+          ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Presentación (PPTX)</a></li>` : ''}
+          ${links.mapa         ? `<li><a href="${links.mapa}">🗺️ Mapa Mental (PNG)</a></li>` : ''}
+        </ul>
+        <p>Accede a todos tus análisis en <a href="https://liberalmente.app/biblioteca">liberalmente.app/biblioteca</a></p>
+        <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>
+      `,
+    }),
+  });
+  if (!res.ok) throw new Error(`Error enviando email final: ${await res.text()}`);
+  console.log(`   ✅ Email final enviado a ${email}`);
 }
 
 // ── Arrancar servidor ────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.1 corriendo en puerto ${PORT}`);
-  console.log(`   Hemisferio derecho: NotebookLM API + Playwright híbrido`);
-  console.log(`   Listo para recibir auditorías\n`);
+  console.log(`\n⚙️  ACL Worker v3.2 corriendo en puerto ${PORT}`);
+  console.log(`   Hemisferio derecho: NotebookLM API + flujo híbrido`);
+  console.log(`   Pasos automáticos: 1-10 (PDF→análisis→PPTX→mapa→Drive→parcialmente_completada)`);
+  console.log(`   Paso manual: editor sube audio → POST /completar-audio → email final\n`);
 });
-
-// (función agregada en v3.1 — necesaria para flujo híbrido)
