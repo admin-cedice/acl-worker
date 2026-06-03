@@ -102,7 +102,9 @@ async function nlmGenerarAudio(notebookId) {
   const data = await nlmRequest(
     'POST',
     `${NLM_PARENT}/notebooks/${notebookId}/audioOverviews`,
-    null
+    {
+      episodeFocus: 'Genera el podcast completamente en español. Analiza el documento desde una perspectiva liberal clásica, destacando los puntos más relevantes para ciudadanos venezolanos interesados en la libertad y el estado de derecho.',
+    }
   );
   console.log('   [NLM] audioOverviews POST response:', JSON.stringify(data));
   const audioId = data.audioOverview?.audioOverviewId
