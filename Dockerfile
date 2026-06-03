@@ -1,8 +1,11 @@
-# Imagen Microsoft con Playwright y dependencias incluidas
-FROM mcr.microsoft.com/playwright:v1.44.0-jammy
+FROM node:20-slim
+
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 COPY . .
+
 EXPOSE 3001
 CMD ["node", "worker.js"]
