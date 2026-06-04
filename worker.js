@@ -135,14 +135,7 @@ async function dispararNotebookLM(reporteTexto, titulo, auditoria_id) {
 
   console.log(`   [${auditoria_id}] Agregando reporte como fuente...`);
   await nlmAgregarFuente(notebookId, titulo, reporteTexto);
-  console.log(`   [${auditoria_id}] Fuente agregada`);
-
-  await new Promise(r => setTimeout(r, 10_000));
-
-  console.log(`   [${auditoria_id}] Disparando generación de Audio Overview...`);
-  const audioId = await nlmGenerarAudio(notebookId);
-  if (!audioId) throw new Error('La API no devolvió audioOverviewId');
-  console.log(`   [${auditoria_id}] Audio en generación: ${audioId}`);
+  console.log(`   [${auditoria_id}] Fuente agregada. El editor debe generar el audio manualmente.`);
 
   return notebookId;
 }
