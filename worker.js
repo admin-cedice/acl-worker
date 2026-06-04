@@ -538,6 +538,40 @@ app.post('/procesar', async (req, res) => {
   });
 });
 
+// Regenera el Audio Overview de una auditoría ya procesada
+// Útil cuando el audio anterior estaba en el idioma incorrecto o falló
+app.post('/regenerar-audio', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { auditoria_id } = req.body;
+  if (!auditoria_id) {
+    return res.status(400).json({ error: 'Falta auditoria_id' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT reporte_texto, titulo_documento FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (!result.rows[0]?.reporte_texto) {
+      return res.status(404).json({ error: 'No se encontró el reporte en BD' });
+    }
+    const { reporte_texto, titulo_documento } = result.rows[0];
+    console.log(`   [${auditoria_id}] Regenerando Audio Overview...`);
+    const notebookId = await dispararNotebookLM(reporte_texto, titulo_documento, auditoria_id);
+    await db.query(
+      `UPDATE auditorias SET notebook_id = $1, estado = 'parcialmente_completada' WHERE id = $2`,
+      [notebookId, auditoria_id]
+    );
+    const notebookUrl = `https://notebooklm.cloud.google.com/global/notebook/${notebookId}?project=${NLM_PROJECT}`;
+    console.log(`   [${auditoria_id}] Notebook regenerado: ${notebookId}`);
+    res.json({ ok: true, notebookId, notebookUrl });
+  } catch (error) {
+    console.error(`❌ [${auditoria_id}] Error regenerando audio:`, error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Recibe el archivo .wav binario, convierte a .mp3 y completa la auditoría
 app.post('/completar-audio', express.raw({ type: '*/*', limit: '200mb' }), async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
