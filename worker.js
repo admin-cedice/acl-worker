@@ -5,7 +5,7 @@
 // v3.3: conversión wav→mp3 · nombre descriptivo de audio · episodeFocus en español
 
 'use strict';
-
+const { generarPodcastPrueba } = require('./testPodcast');
 const express    = require('express');
 const { google } = require('googleapis');
 const { GoogleAuth } = require('google-auth-library');
@@ -513,6 +513,26 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', version: '3.3', timestamp: new Date().toISOString() });
+});
+
+// PRUEBA TEMPORAL — eliminar después de validar
+app.get('/test-podcast', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const dirTemp = path.join(DIRECTORIO_TEMP, 'test-podcast-' + Date.now());
+  try {
+    const rutaAudio = await generarPodcastPrueba(dirTemp);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', 'inline; filename="podcast-prueba.mp3"');
+    fs.createReadStream(rutaAudio).pipe(res).on('close', () => {
+      fs.rmSync(dirTemp, { recursive: true, force: true });
+    });
+  } catch (error) {
+    console.error('❌ Error en /test-podcast:', error.message);
+    fs.rmSync(dirTemp, { recursive: true, force: true });
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/procesar', async (req, res) => {
