@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker con Cloudconvert
+// generarReportePDF.js — ACL Worker
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con Puppeteer
 // Umbusk LLC · Auditoría Cívica Liberal
 
@@ -816,7 +816,6 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
           output_format: 'pdf',
           engine: 'chrome',
           zoom: 1,
-          width: 794,
           print_background: true,
           margin_top: 0,
           margin_right: 0,
@@ -824,6 +823,8 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
           margin_left: 0,
           page_width: 210,
           page_height: 297,
+          screen_width: 794,
+          screen_height: 1123,
           wait_until: 'networkidle0',
           wait_time: 500,
         },
