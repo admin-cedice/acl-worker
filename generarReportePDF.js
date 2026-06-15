@@ -51,7 +51,7 @@ function colorAlerta(gravedad) {
 // ── CSS del reporte ──────────────────────────────────────────────────────────
 
 const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400;1,600&family=Source+Sans+3:wght@300;400;500;600&display=swap');
+
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -70,8 +70,8 @@ const CSS = `
     --gold-soft:     #F8F3E6;
     --green:         #1A6B3C;
     --green-soft:    #EBF5EE;
-    --serif:         'Playfair Display', Georgia, serif;
-    --sans:          'Source Sans 3', system-ui, sans-serif;
+    --serif:         Georgia, 'Times New Roman', serif;
+    --sans:          Arial, Helvetica, sans-serif;
   }
 
   body {
@@ -826,7 +826,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
           page_width: 210,   // A4 en mm
           page_height: 297,
           wait_until: 'networkidle0',
-          wait_time: 2000,   // 2s para que carguen las Google Fonts
+          wait_time: 1000,   // 1s — sin Google Fonts, el renderizado es inmediato
         },
         'export-pdf': {
           operation: 'export/url',
