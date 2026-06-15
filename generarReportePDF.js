@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker
+// generarReportePDF.js — ACL Worker con Cloudconvert
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con Puppeteer
 // Umbusk LLC · Auditoría Cívica Liberal
 
