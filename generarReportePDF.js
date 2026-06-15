@@ -87,12 +87,11 @@ const CSS = `
   /* ── PORTADA ── */
   .portada {
     width: 794px;
-    height: 1123px;
+    min-height: 1123px;
     background: var(--bg);
     display: flex;
     flex-direction: column;
     page-break-after: always;
-    overflow: hidden;
   }
 
   .portada-cinta { height: 5px; background: var(--accent); }
@@ -216,13 +215,12 @@ const CSS = `
   /* ── PÁGINAS ── */
   .pagina {
     width: 794px;
-    height: 1123px;
+    min-height: 1123px;
     background: white;
     padding: 48px 52px;
     display: flex;
     flex-direction: column;
     page-break-after: always;
-    overflow: hidden;
   }
 
   .pagina-header {
@@ -274,6 +272,7 @@ const CSS = `
   .criterio {
     padding: 16px 0;
     border-bottom: 1px solid var(--border-subtle);
+    page-break-inside: avoid;
   }
   .criterio:last-child { border-bottom: none; }
 
@@ -383,11 +382,15 @@ const CSS = `
 
   /* ── PIE ── */
   .pie-pagina {
-    margin-top: auto; padding-top: 18px;
+    margin-top: auto;
+    padding-top: 16px;
     border-top: 1px solid var(--border-subtle);
-    display: flex; justify-content: space-between;
+    display: flex;
+    justify-content: space-between;
     align-items: center;
-    font-size: 10px; color: var(--text-muted);
+    font-size: 10px;
+    color: var(--text-muted);
+    flex-shrink: 0;
   }
   .pie-logo { font-family: var(--serif); font-size: 12px; font-weight: 700; color: var(--text-muted); }
 `;
@@ -515,14 +518,13 @@ function parsearReporte(reporteTexto) {
     // ── Detectar resultado del criterio (dentro de criterio activo)
     if (criterioActual) {
       // Formato B: "**RESULTADO: SÍ (con reserva)**" o "**RESULTADO: NO**"
-      const matchResultadoB = linea.match(/RESULTADO[:\s]+\*{0,2}(SÍ|SI|NO|N\/A)[^*]*(con reserva|con matiz|parcialmente)?/i);
+      const matchResultadoB = linea.match(/RESULTADO[:\s*:]+([^\n*]+)/i);
       if (matchResultadoB) {
-        const base    = matchResultadoB[1].toUpperCase();
-        const esMatiz = !!(matchResultadoB[2]);
-        if (base === 'NO')     criterioActual.resultado = 'NO';
-        else if (base === 'N/A') criterioActual.resultado = 'NA';
-        else if (esMatiz)      criterioActual.resultado = 'SI_MATIZ';
-        else                   criterioActual.resultado = 'SI';
+        const texto = matchResultadoB[1].toUpperCase().trim();
+        if (/^NO\b|MIXTO.*NO|ALERTA MAYOR/.test(texto))   criterioActual.resultado = 'NO';
+        else if (/^N\/A|^NA\b/.test(texto))               criterioActual.resultado = 'NA';
+        else if (/CON RESERVA|CON MATIZ|PARCIAL|MIXTO/.test(texto)) criterioActual.resultado = 'SI_MATIZ';
+        else if (/^SÍ|^SI/.test(texto))                   criterioActual.resultado = 'SI';
         continue;
       }
 
@@ -574,10 +576,19 @@ function parsearReporte(reporteTexto) {
   if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); }
   datos.resumenEjecutivo = bufferResumen.join(' ').trim();
 
-  // Si no hubo sección de resumen, construir uno del indicador
+  // Si no hubo sección de resumen, construir uno del indicador y alertas
   if (!datos.resumenEjecutivo && datos.puntaje) {
-    const totalCrits = datos.categorias.reduce((a, c) => a + c.criterios.length, 0) || 28;
-    datos.resumenEjecutivo = `El documento analizó ${totalCrits} criterios del Test de Libertad organizados en 7 categorías, obteniendo un ${datos.puntaje}% de alineación con los principios del liberalismo clásico. Nivel de riesgo liberal: ${datos.nivelRiesgo}.`;
+    const totalCrits  = datos.categorias.reduce((a, c) => a + c.criterios.length, 0) || 28;
+    const totalSI     = datos.siPlenos + datos.siMatiz;
+    const totalNO     = datos.noCount;
+    const totalNA     = datos.naCount;
+    const aplicables  = totalCrits - totalNA;
+    const pctReal     = aplicables > 0 ? Math.round((totalSI / aplicables) * 100) : datos.puntaje;
+    const nivel       = datos.nivelRiesgo;
+    const alertaDesc  = datos.alertas.length > 0
+      ? ` La alerta principal es: ${datos.alertas[0].titulo}.`
+      : '';
+    datos.resumenEjecutivo = `El documento obtuvo un ${datos.puntaje}% de alineación con los criterios del liberalismo clásico (${totalSI} SÍ de ${aplicables} criterios aplicables${totalNO > 0 ? `, ${totalNO} NO` : ''}${totalNA > 0 ? `, ${totalNA} N/A` : ''}). Nivel de riesgo liberal: ${nivel}.${alertaDesc}`;
   }
 
   return datos;
