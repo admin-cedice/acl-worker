@@ -215,12 +215,13 @@ const CSS = `
   /* ── PÁGINAS ── */
   .pagina {
     width: 794px;
-    min-height: 1123px;
     background: white;
-    padding: 48px 52px;
+    padding: 48px 52px 32px;
     display: flex;
     flex-direction: column;
+    page-break-before: always;
     page-break-after: always;
+    page-break-inside: avoid;
   }
 
   .pagina-header {
@@ -382,8 +383,8 @@ const CSS = `
 
   /* ── PIE ── */
   .pie-pagina {
-    margin-top: auto;
-    padding-top: 16px;
+    margin-top: 32px;
+    padding-top: 14px;
     border-top: 1px solid var(--border-subtle);
     display: flex;
     justify-content: space-between;
@@ -391,6 +392,8 @@ const CSS = `
     font-size: 10px;
     color: var(--text-muted);
     flex-shrink: 0;
+    page-break-inside: avoid;
+    page-break-before: avoid;
   }
   .pie-logo { font-family: var(--serif); font-size: 12px; font-weight: 700; color: var(--text-muted); }
 `;
@@ -533,8 +536,10 @@ function parsearReporte(reporteTexto) {
       else if (/✅\s*SÍ|✓\s*SÍ|'\s*\*\*SÍ\*\*/i.test(linea) && !linea.includes('*')) criterioActual.resultado = 'SI';
       else if (/✗\s*NO|❌\s*NO/i.test(linea))                               criterioActual.resultado = 'NO';
 
-      // Acumular análisis
-      if (linea.trim() && !linea.startsWith('#') && !linea.startsWith('---') && !linea.startsWith('**RESULTADO')) {
+      // Acumular análisis (saltar tablas markdown y líneas de cálculo)
+      if (linea.trim() && !linea.startsWith('#') && !linea.startsWith('---')
+          && !linea.startsWith('**RESULTADO') && !linea.startsWith('|')
+          && !/^\*\*Cálculo|Criterios aplicables|Resultados SÍ|Porcentaje de alineación/i.test(linea)) {
         const limpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
         if (limpia) bufferAnalisis.push(limpia);
       }
@@ -548,9 +553,10 @@ function parsearReporte(reporteTexto) {
         if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); bufferAlerta = []; }
         alertaActual = { titulo: matchAlerta[1].replace(/\*\*/g,'').trim(), gravedad: 'MODERADA', descripcion: '', criterios: [] };
         // Detectar gravedad en el título
-        if (/CRÍT|ALTA/i.test(alertaActual.titulo))       alertaActual.gravedad = 'ALTA';
-        else if (/MODERADA?[- ]ALTA/i.test(alertaActual.titulo)) alertaActual.gravedad = 'MODERADA-ALTA';
-        else if (/MODERADA?/i.test(alertaActual.titulo))  alertaActual.gravedad = 'MODERADA';
+        if (/CRÍT|CRÍTICA|CRÍTICO/i.test(alertaActual.titulo)) alertaActual.gravedad = 'ALTA';
+        else if (/ALTA/i.test(alertaActual.titulo))               alertaActual.gravedad = 'ALTA';
+        else if (/MODERADA?[- ]ALTA/i.test(alertaActual.titulo))  alertaActual.gravedad = 'MODERADA-ALTA';
+        else if (/MODERADA?/i.test(alertaActual.titulo))          alertaActual.gravedad = 'MODERADA';
         continue;
       }
       if (alertaActual) {
@@ -576,19 +582,36 @@ function parsearReporte(reporteTexto) {
   if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); }
   datos.resumenEjecutivo = bufferResumen.join(' ').trim();
 
+  // Contar SÍ plenos y SÍ con matiz desde los criterios reales parseados
+  const todosLosCriterios = datos.categorias.flatMap(c => c.criterios);
+  const siPlenosReal = todosLosCriterios.filter(c => c.resultado === 'SI').length;
+  const siMatizReal  = todosLosCriterios.filter(c => c.resultado === 'SI_MATIZ').length;
+  const noReal       = todosLosCriterios.filter(c => c.resultado === 'NO').length;
+  const naReal       = todosLosCriterios.filter(c => c.resultado === 'NA').length;
+
+  // Sobreescribir con conteos reales si los tenemos
+  if (siPlenosReal + siMatizReal + noReal > 0) {
+    datos.siPlenos = siPlenosReal;
+    datos.siMatiz  = siMatizReal;
+    datos.noCount  = noReal;
+    datos.naCount  = naReal;
+  }
+
   // Si no hubo sección de resumen, construir uno del indicador y alertas
   if (!datos.resumenEjecutivo && datos.puntaje) {
-    const totalCrits  = datos.categorias.reduce((a, c) => a + c.criterios.length, 0) || 28;
-    const totalSI     = datos.siPlenos + datos.siMatiz;
-    const totalNO     = datos.noCount;
-    const totalNA     = datos.naCount;
-    const aplicables  = totalCrits - totalNA;
-    const pctReal     = aplicables > 0 ? Math.round((totalSI / aplicables) * 100) : datos.puntaje;
-    const nivel       = datos.nivelRiesgo;
-    const alertaDesc  = datos.alertas.length > 0
-      ? ` La alerta principal es: ${datos.alertas[0].titulo}.`
-      : '';
-    datos.resumenEjecutivo = `El documento obtuvo un ${datos.puntaje}% de alineación con los criterios del liberalismo clásico (${totalSI} SÍ de ${aplicables} criterios aplicables${totalNO > 0 ? `, ${totalNO} NO` : ''}${totalNA > 0 ? `, ${totalNA} N/A` : ''}). Nivel de riesgo liberal: ${nivel}.${alertaDesc}`;
+    const totalSI    = datos.siPlenos + datos.siMatiz;
+    const aplicables = (datos.siPlenos + datos.siMatiz + datos.noCount);
+    const nivel      = datos.nivelRiesgo;
+    const alertas    = datos.alertas;
+    let resumen = `El documento obtuvo un ${datos.puntaje}% de alineación con los criterios del liberalismo clásico. `;
+    resumen += `De ${aplicables} criterios aplicables: ${totalSI} SÍ (${datos.siPlenos} plenos, ${datos.siMatiz} con reserva)`;
+    if (datos.noCount > 0) resumen += `, ${datos.noCount} NO`;
+    if (datos.naCount > 0) resumen += `, ${datos.naCount} N/A`;
+    resumen += `. Nivel de riesgo liberal: ${nivel}.`;
+    if (alertas.length > 0) {
+      resumen += ` Alerta principal: ${alertas[0].titulo}.`;
+    }
+    datos.resumenEjecutivo = resumen;
   }
 
   return datos;
