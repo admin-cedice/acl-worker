@@ -6,7 +6,7 @@
 
 'use strict';
 const { generarPodcastPrueba } = require('./testPodcast');
-const { generarReportePDF }    = require('./generarReportePDF');
+const { generarReportePDF, registrarRutaHTMLTemporal } = require('./generarReportePDF');
 const express    = require('express');
 const { google } = require('googleapis');
 const { GoogleAuth } = require('google-auth-library');
@@ -28,7 +28,8 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-
+// Ruta temporal para servir HTMLs a CloudConvert
+registrarRutaHTMLTemporal(app);
 // ── Clientes globales ────────────────────────────────────────────────────────
 
 const anthropic     = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });

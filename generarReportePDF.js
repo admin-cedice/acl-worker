@@ -786,7 +786,23 @@ function agruparCategoriasPorPagina(categorias) {
   return paginas;
 }
 
-// ── Conversión HTML → PDF vía CloudConvert API (import/upload) ───────────────
+// ── Conversión HTML → PDF vía CloudConvert API (import/url) ─────────────────
+// El worker sirve el HTML temporalmente en una URL pública que CloudConvert
+// abre con Chrome real — así el renderizado es idéntico al navegador.
+
+// Mapa global de HTMLs temporales: auditoria_id → contenido HTML
+const _htmlsTemporales = new Map();
+
+// Esta función debe llamarse desde worker.js para registrar la ruta temporal.
+// Se llama así: registrarRutaHTMLTemporal(app)
+function registrarRutaHTMLTemporal(app) {
+  app.get('/reporte-temp/:id', (req, res) => {
+    const html = _htmlsTemporales.get(req.params.id);
+    if (!html) return res.status(404).send('No encontrado');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  });
+}
 
 async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
   const CLOUDCONVERT_API_KEY = process.env.CLOUDCONVERT_API_KEY;
@@ -794,119 +810,111 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
     throw new Error('Falta la variable de entorno CLOUDCONVERT_API_KEY');
   }
 
+  const WORKER_URL = process.env.WORKER_URL || 'https://acl-worker-production.up.railway.app';
   const htmlContent = fs.readFileSync(rutaHTML, 'utf8');
 
-  // Paso 1: Crear job — import/upload (el HTML se sube en paso separado)
-  console.log(`   [${auditoria_id}] Creando job en CloudConvert...`);
-  const jobRes = await fetch('https://api.cloudconvert.com/v2/jobs', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${CLOUDCONVERT_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      tasks: {
-        'upload-html': {
-          operation: 'import/upload',
-        },
-        'convert-to-pdf': {
-          operation: 'convert',
-          input: 'upload-html',
-          input_format: 'html',
-          output_format: 'pdf',
-          engine: 'chrome',
-          zoom: 1,
-          print_background: true,
-          margin_top: 0,
-          margin_right: 0,
-          margin_bottom: 0,
-          margin_left: 0,
-          page_width: 210,
-          page_height: 297,
-          screen_width: 794,
-          screen_height: 1123,
-          wait_until: 'networkidle0',
-          wait_time: 500,
-        },
-        'export-pdf': {
-          operation: 'export/url',
-          input: 'convert-to-pdf',
-        },
+  // Registrar el HTML temporalmente en memoria para que CloudConvert lo descargue
+  _htmlsTemporales.set(auditoria_id, htmlContent);
+  const urlTemporal = `${WORKER_URL}/reporte-temp/${auditoria_id}`;
+  console.log(`   [${auditoria_id}] HTML disponible en: ${urlTemporal}`);
+
+  try {
+    // Paso 1: Crear job — import/url apunta a la URL temporal del worker
+    console.log(`   [${auditoria_id}] Creando job en CloudConvert...`);
+    const jobRes = await fetch('https://api.cloudconvert.com/v2/jobs', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${CLOUDCONVERT_API_KEY}`,
+        'Content-Type': 'application/json',
       },
-    }),
-  });
-
-  if (!jobRes.ok) {
-    const err = await jobRes.text();
-    throw new Error(`CloudConvert error creando job: ${err}`);
-  }
-
-  const job = await jobRes.json();
-  const jobId = job.data.id;
-  console.log(`   [${auditoria_id}] Job creado: ${jobId}`);
-
-  // Paso 2: Subir el HTML al endpoint de upload que CloudConvert provee
-  const uploadTask = job.data.tasks.find(t => t.name === 'upload-html');
-  if (!uploadTask?.result?.form) {
-    throw new Error('CloudConvert no devolvió el formulario de upload');
-  }
-
-  const { url: uploadUrl, parameters: uploadParams } = uploadTask.result.form;
-  const formData = new FormData();
-  for (const [key, value] of Object.entries(uploadParams)) {
-    formData.append(key, value);
-  }
-  formData.append('file', new Blob([htmlContent], { type: 'text/html' }), 'reporte.html');
-
-  console.log(`   [${auditoria_id}] Subiendo HTML a CloudConvert...`);
-  const uploadRes = await fetch(uploadUrl, { method: 'POST', body: formData });
-  if (!uploadRes.ok) {
-    const err = await uploadRes.text();
-    throw new Error(`CloudConvert error subiendo HTML: ${err}`);
-  }
-  console.log(`   [${auditoria_id}] HTML subido, esperando conversión...`);
-
-  // Paso 3: Polling hasta que el job termine (max 2 minutos)
-  const inicio = Date.now();
-  const MAX_ESPERA = 120_000;
-  const INTERVALO  = 3_000;
-
-  let exportTask = null;
-  while (Date.now() - inicio < MAX_ESPERA) {
-    await new Promise(r => setTimeout(r, INTERVALO));
-
-    const statusRes = await fetch(`https://api.cloudconvert.com/v2/jobs/${jobId}`, {
-      headers: { 'Authorization': `Bearer ${CLOUDCONVERT_API_KEY}` },
+      body: JSON.stringify({
+        tasks: {
+          'import-html': {
+            operation: 'import/url',
+            url: urlTemporal,
+            filename: 'reporte.html',
+          },
+          'convert-to-pdf': {
+            operation: 'convert',
+            input: 'import-html',
+            input_format: 'html',
+            output_format: 'pdf',
+            engine: 'chrome',
+            print_background: true,
+            margin_top: 0,
+            margin_right: 0,
+            margin_bottom: 0,
+            margin_left: 0,
+            page_width: 210,
+            page_height: 297,
+            screen_width: 1240,
+            wait_until: 'networkidle0',
+            wait_time: 1000,
+          },
+          'export-pdf': {
+            operation: 'export/url',
+            input: 'convert-to-pdf',
+          },
+        },
+      }),
     });
-    const statusData = await statusRes.json();
-    const estado = statusData.data.status;
 
-    console.log(`   [${auditoria_id}] Estado: ${estado}`);
-
-    if (estado === 'finished') {
-      exportTask = statusData.data.tasks.find(t => t.name === 'export-pdf');
-      break;
+    if (!jobRes.ok) {
+      const err = await jobRes.text();
+      throw new Error(`CloudConvert error creando job: ${err}`);
     }
 
-    if (estado === 'error') {
-      const tareaFallida = statusData.data.tasks.find(t => t.status === 'error');
-      throw new Error(`CloudConvert error en conversión: ${tareaFallida?.message || 'Error desconocido'}`);
+    const job = await jobRes.json();
+    const jobId = job.data.id;
+    console.log(`   [${auditoria_id}] Job creado: ${jobId}`);
+
+    // Paso 2: Polling hasta que el job termine (max 3 minutos)
+    console.log(`   [${auditoria_id}] Esperando conversión...`);
+    const inicio = Date.now();
+    const MAX_ESPERA = 180_000;
+    const INTERVALO  = 3_000;
+
+    let exportTask = null;
+    while (Date.now() - inicio < MAX_ESPERA) {
+      await new Promise(r => setTimeout(r, INTERVALO));
+
+      const statusRes = await fetch(`https://api.cloudconvert.com/v2/jobs/${jobId}`, {
+        headers: { 'Authorization': `Bearer ${CLOUDCONVERT_API_KEY}` },
+      });
+      const statusData = await statusRes.json();
+      const estado = statusData.data.status;
+      console.log(`   [${auditoria_id}] Estado: ${estado}`);
+
+      if (estado === 'finished') {
+        exportTask = statusData.data.tasks.find(t => t.name === 'export-pdf');
+        break;
+      }
+
+      if (estado === 'error') {
+        const tareaFallida = statusData.data.tasks.find(t => t.status === 'error');
+        throw new Error(`CloudConvert error en conversión: ${tareaFallida?.message || 'Error desconocido'}`);
+      }
     }
+
+    if (!exportTask?.result?.files?.[0]?.url) {
+      throw new Error('CloudConvert: timeout o no se encontró el PDF exportado');
+    }
+
+    // Paso 3: Descargar el PDF resultante
+    console.log(`   [${auditoria_id}] Descargando PDF...`);
+    const pdfUrl = exportTask.result.files[0].url;
+    const pdfRes = await fetch(pdfUrl);
+    if (!pdfRes.ok) throw new Error(`Error descargando PDF de CloudConvert: ${pdfRes.status}`);
+
+    const buffer = Buffer.from(await pdfRes.arrayBuffer());
+    fs.writeFileSync(rutaPDF, buffer);
+    console.log(`   [${auditoria_id}] ✅ PDF descargado: ${rutaPDF} (${Math.round(buffer.length / 1024)} KB)`);
+
+  } finally {
+    // Limpiar el HTML temporal de memoria siempre
+    _htmlsTemporales.delete(auditoria_id);
+    console.log(`   [${auditoria_id}] HTML temporal eliminado de memoria`);
   }
-
-  if (!exportTask?.result?.files?.[0]?.url) {
-    throw new Error('CloudConvert: timeout o no se encontró el PDF exportado');
-  }
-
-  // Paso 4: Descargar el PDF resultante
-  console.log(`   [${auditoria_id}] Descargando PDF...`);
-  const pdfUrl = exportTask.result.files[0].url;
-  const pdfRes = await fetch(pdfUrl);
-  if (!pdfRes.ok) throw new Error(`Error descargando PDF de CloudConvert: ${pdfRes.status}`);
-
-  const buffer = Buffer.from(await pdfRes.arrayBuffer());
-  fs.writeFileSync(rutaPDF, buffer);
-  console.log(`   [${auditoria_id}] ✅ PDF descargado: ${rutaPDF} (${Math.round(buffer.length / 1024)} KB)`);
 }
 // ── Función principal exportada ──────────────────────────────────────────────
 
@@ -931,10 +939,10 @@ async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_
     await convertirHTMLaPDF(rutaHTML, rutaSalida, auditoria_id);
   } finally {
     // Limpiar HTML temporal siempre, aunque la conversión falle
-    // if (fs.existsSync(rutaHTML)) fs.unlinkSync(rutaHTML);
+    if (fs.existsSync(rutaHTML)) fs.unlinkSync(rutaHTML);
   }
 
   return datos;
 }
 
-module.exports = { generarReportePDF, parsearReporte, generarHTML };
+module.exports = { generarReportePDF, parsearReporte, generarHTML, registrarRutaHTMLTemporal };
