@@ -931,7 +931,7 @@ async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_
     await convertirHTMLaPDF(rutaHTML, rutaSalida, auditoria_id);
   } finally {
     // Limpiar HTML temporal siempre, aunque la conversión falle
-    if (fs.existsSync(rutaHTML)) fs.unlinkSync(rutaHTML);
+    // if (fs.existsSync(rutaHTML)) fs.unlinkSync(rutaHTML);
   }
 
   return datos;

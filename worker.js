@@ -566,8 +566,14 @@ app.post('/test-reporte', async (req, res) => {
     const carpetaId = drive_carpeta_id || await obtenerCarpetaAuditoria(drive, auditoria_id);
     const linkNuevo = await subirArchivo(drive, rutaPDF, 'reporte-nuevo-diseno.pdf', 'application/pdf', carpetaId);
 
+
     console.log(`   [TEST] ✅ PDF subido: ${linkNuevo}`);
-    res.json({ ok: true, link: linkNuevo, titulo: titulo_documento });
+
+    const rutaHTML = rutaPDF.replace('.pdf', '.html');
+	const linkHTML = fs.existsSync(rutaHTML)
+	  ? await subirArchivo(drive, rutaHTML, 'reporte-debug.html', 'text/html', carpetaId)
+	  : null;
+    res.json({ ok: true, link: linkNuevo, linkHTML, titulo: titulo_documento });
 
   } catch (error) {
     console.error(`   [TEST] ❌ Error:`, error.message);
