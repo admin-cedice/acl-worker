@@ -51,7 +51,7 @@ function colorAlerta(gravedad) {
 // ── CSS del reporte ──────────────────────────────────────────────────────────
 
 const CSS = `
-
+  @page { size: A4; margin: 0; }
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -841,13 +841,12 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
             output_format: 'pdf',
             engine: 'chrome',
             print_background: true,
+            css_page_size: true,
             margin_top: 0,
             margin_right: 0,
             margin_bottom: 0,
             margin_left: 0,
-            page_width: 210,
-            page_height: 297,
-            screen_width: 1240,
+            screen_width: 794,
             wait_until: 'networkidle0',
             wait_time: 1000,
           },
