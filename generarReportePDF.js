@@ -786,7 +786,7 @@ function agruparCategoriasPorPagina(categorias) {
   return paginas;
 }
 
-// ── Conversión HTML → PDF vía CloudConvert API ───────────────────────────────
+// ── Conversión HTML → PDF vía CloudConvert API (import/upload) ───────────────
 
 async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
   const CLOUDCONVERT_API_KEY = process.env.CLOUDCONVERT_API_KEY;
@@ -796,7 +796,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 
   const htmlContent = fs.readFileSync(rutaHTML, 'utf8');
 
-  // Paso 1: Crear el job con las tareas encadenadas
+  // Paso 1: Crear job — import/upload (el HTML se sube en paso separado)
   console.log(`   [${auditoria_id}] Creando job en CloudConvert...`);
   const jobRes = await fetch('https://api.cloudconvert.com/v2/jobs', {
     method: 'POST',
@@ -807,9 +807,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
     body: JSON.stringify({
       tasks: {
         'upload-html': {
-          operation: 'import/raw',
-          file: Buffer.from(htmlContent).toString('base64'),
-          filename: 'reporte.html',
+          operation: 'import/upload',
         },
         'convert-to-pdf': {
           operation: 'convert',
@@ -823,10 +821,10 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
           margin_right: 0,
           margin_bottom: 0,
           margin_left: 0,
-          page_width: 210,   // A4 en mm
+          page_width: 210,
           page_height: 297,
           wait_until: 'networkidle0',
-          wait_time: 1000,   // 1s — sin Google Fonts, el renderizado es inmediato
+          wait_time: 500,
         },
         'export-pdf': {
           operation: 'export/url',
@@ -845,11 +843,31 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
   const jobId = job.data.id;
   console.log(`   [${auditoria_id}] Job creado: ${jobId}`);
 
-  // Paso 2: Polling hasta que el job termine (max 2 minutos)
-  console.log(`   [${auditoria_id}] Esperando conversión...`);
+  // Paso 2: Subir el HTML al endpoint de upload que CloudConvert provee
+  const uploadTask = job.data.tasks.find(t => t.name === 'upload-html');
+  if (!uploadTask?.result?.form) {
+    throw new Error('CloudConvert no devolvió el formulario de upload');
+  }
+
+  const { url: uploadUrl, parameters: uploadParams } = uploadTask.result.form;
+  const formData = new FormData();
+  for (const [key, value] of Object.entries(uploadParams)) {
+    formData.append(key, value);
+  }
+  formData.append('file', new Blob([htmlContent], { type: 'text/html' }), 'reporte.html');
+
+  console.log(`   [${auditoria_id}] Subiendo HTML a CloudConvert...`);
+  const uploadRes = await fetch(uploadUrl, { method: 'POST', body: formData });
+  if (!uploadRes.ok) {
+    const err = await uploadRes.text();
+    throw new Error(`CloudConvert error subiendo HTML: ${err}`);
+  }
+  console.log(`   [${auditoria_id}] HTML subido, esperando conversión...`);
+
+  // Paso 3: Polling hasta que el job termine (max 2 minutos)
   const inicio = Date.now();
-  const MAX_ESPERA = 120_000; // 2 minutos
-  const INTERVALO  = 3_000;  // cada 3 segundos
+  const MAX_ESPERA = 120_000;
+  const INTERVALO  = 3_000;
 
   let exportTask = null;
   while (Date.now() - inicio < MAX_ESPERA) {
@@ -878,7 +896,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
     throw new Error('CloudConvert: timeout o no se encontró el PDF exportado');
   }
 
-  // Paso 3: Descargar el PDF resultante
+  // Paso 4: Descargar el PDF resultante
   console.log(`   [${auditoria_id}] Descargando PDF...`);
   const pdfUrl = exportTask.result.files[0].url;
   const pdfRes = await fetch(pdfUrl);
@@ -888,7 +906,6 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
   fs.writeFileSync(rutaPDF, buffer);
   console.log(`   [${auditoria_id}] ✅ PDF descargado: ${rutaPDF} (${Math.round(buffer.length / 1024)} KB)`);
 }
-
 // ── Función principal exportada ──────────────────────────────────────────────
 
 async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
