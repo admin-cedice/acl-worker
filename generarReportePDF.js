@@ -751,7 +751,7 @@ function generarHTML(datos, metadatos) {
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=794">
 <title>Reporte de Auditoría — ${esc(titulo)}</title>
 <style>${CSS}</style>
 </head>
@@ -816,6 +816,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
           output_format: 'pdf',
           engine: 'chrome',
           zoom: 1,
+          width: 794,
           print_background: true,
           margin_top: 0,
           margin_right: 0,
