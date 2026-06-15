@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker v2
+// generarReportePDF.js — ACL Worker v2.1
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
@@ -6,6 +6,13 @@
 //   1. Resumen ejecutivo generado por Claude (no mecánico)
 //   2. Log de diagnóstico de contadores en parsearReporte()
 //   3. Nueva arquitectura CSS: sin .pagina rígido, flujo natural Chrome + @page
+//
+// CAMBIOS v2.1 (15 jun 2026):
+//   4. Fix parser: notas metodológicas (ej. "C-06 se computa como NO...") ya no
+//      se parsean como criterios falsos — elimina el "criterio 29" fantasma
+//   5. Fix CSS: break-before: page (propiedad moderna) en lugar de
+//      page-break-before: always — elimina páginas en blanco entre categorías
+//   6. orphans/widows: 3 en body para que Chrome no deje líneas sueltas
 
 'use strict';
 
@@ -100,6 +107,8 @@ const CSS = `
     line-height: 1.6;
     -webkit-print-color-adjust: exact;
     print-color-adjust: exact;
+    orphans: 3;
+    widows: 3;
   }
 
   /* ═══════════════════════════════════════════════════════════
@@ -107,10 +116,10 @@ const CSS = `
   ═══════════════════════════════════════════════════════════ */
   .portada {
     page: portada;
-    page-break-after: always;
+    break-after: page;
     background: var(--bg);
     width: 100%;
-    min-height: 297mm;
+    min-height: 250mm;
     display: flex;
     flex-direction: column;
   }
@@ -279,9 +288,12 @@ const CSS = `
   }
 
   /* ── CATEGORÍAS ── */
-  /* Cada categoría empieza en página nueva para tener su propio "aire" */
+  /* Cada categoría empieza en página nueva.
+     break-before: page es la propiedad moderna — evita páginas en blanco
+     que page-break-before: always puede generar cuando Chrome ya está
+     al inicio de una página. */
   .categoria-bloque {
-    page-break-before: always;
+    break-before: page;
   }
 
   .categoria-titulo {
@@ -353,7 +365,7 @@ const CSS = `
 
   /* ── ALERTAS ── */
   .alertas-bloque {
-    page-break-before: always;
+    break-before: page;
   }
 
   .alertas-titulo {
@@ -415,7 +427,7 @@ const CSS = `
 
   /* ── FICHA FINAL ── */
   .ficha-bloque {
-    page-break-before: always;
+    break-before: page;
   }
 
   .ficha-tabla { width: 100%; border-collapse: collapse; margin-top: 8px; }
@@ -547,6 +559,17 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     // ── Detectar criterio C-XX
     const matchCrit = linea.match(/^\*{0,2}(C-\d{2})\*{0,2}[.\s:]*(.*)/);
     if (matchCrit && categoriaActual) {
+      // Ignorar notas metodológicas que mencionan códigos de criterio pero no son criterios
+      // Ejemplo: "C-06 se computa como NO (incompatibilidad con marco constitucional vigente)"
+      const esNotaMetodologica = /se computa|se compute|computa como|por tanto|N\/A aplicado|los criterios con|se pondera/i.test(linea);
+      if (esNotaMetodologica) {
+        // Tratarla como texto de análisis del criterio actual, no como nuevo criterio
+        if (criterioActual) {
+          const limpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
+          if (limpia) bufferAnalisis.push(limpia);
+        }
+        continue;
+      }
       if (criterioActual) {
         criterioActual.analisis = bufferAnalisis.join(' ').trim();
         bufferAnalisis = [];
