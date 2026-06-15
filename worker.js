@@ -516,6 +516,67 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', version: '3.3', timestamp: new Date().toISOString() });
 });
 
+// ENDPOINT TEMPORAL — agregar a worker.js después de /health
+// Regenera el PDF del reporte de una auditoría existente usando el nuevo diseño
+// Eliminar después de validar
+
+app.post('/test-reporte', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { auditoria_id } = req.body;
+  if (!auditoria_id) {
+    return res.status(400).json({ error: 'Falta auditoria_id' });
+  }
+
+  const dir = path.join(DIRECTORIO_TEMP, `test-reporte-${auditoria_id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    // Leer reporte_texto y metadatos de la BD
+    const result = await db.query(
+      `SELECT reporte_texto, titulo_documento, pais, drive_carpeta_id
+       FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (!result.rows[0]?.reporte_texto) {
+      return res.status(404).json({ error: 'No se encontró reporte_texto para esta auditoría' });
+    }
+
+    const { reporte_texto, titulo_documento, pais, drive_carpeta_id } = result.rows[0];
+    const rutaPDF = path.join(dir, 'reporte-nuevo.pdf');
+
+    console.log(`   [TEST] Generando reporte para: ${titulo_documento}`);
+
+    await generarReportePDF(
+      reporte_texto,
+      {
+        titulo:         titulo_documento,
+        pais:           pais || '',
+        marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026',
+        generadoEl:     new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
+      },
+      rutaPDF,
+      auditoria_id
+    );
+
+    // Subir a Drive en la carpeta existente de la auditoría
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const carpetaId = drive_carpeta_id || await obtenerCarpetaAuditoria(drive, auditoria_id);
+    const linkNuevo = await subirArchivo(drive, rutaPDF, 'reporte-nuevo-diseno.pdf', 'application/pdf', carpetaId);
+
+    console.log(`   [TEST] ✅ PDF subido: ${linkNuevo}`);
+    res.json({ ok: true, link: linkNuevo, titulo: titulo_documento });
+
+  } catch (error) {
+    console.error(`   [TEST] ❌ Error:`, error.message);
+    res.status(500).json({ error: error.message });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // PRUEBA TEMPORAL — eliminar después de validar
 app.get('/test-podcast', async (req, res) => {
   if (req.query.secret !== WORKER_SECRET) {
