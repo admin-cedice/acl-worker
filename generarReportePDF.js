@@ -87,11 +87,12 @@ const CSS = `
   /* ── PORTADA ── */
   .portada {
     width: 794px;
-    min-height: 1123px;
+    height: 1123px;
     background: var(--bg);
     display: flex;
     flex-direction: column;
     page-break-after: always;
+    overflow: hidden;
   }
 
   .portada-cinta { height: 5px; background: var(--accent); }
@@ -215,12 +216,13 @@ const CSS = `
   /* ── PÁGINAS ── */
   .pagina {
     width: 794px;
-    min-height: 1123px;
+    height: 1123px;
     background: white;
     padding: 48px 52px;
     display: flex;
     flex-direction: column;
     page-break-after: always;
+    overflow: hidden;
   }
 
   .pagina-header {
@@ -391,102 +393,117 @@ const CSS = `
 `;
 
 // ── Parsear el reporte de texto plano ────────────────────────────────────────
-// Extrae los datos estructurados del reporte Markdown que genera Claude
+// Soporta dos formatos de salida del prompt de Claude:
+// Formato A (clásico): ✅ SÍ / ' **SÍ** / NIVEL DE RIESGO: BAJO
+// Formato B (actual):  **RESULTADO: SÍ (con reserva)** / 81.5% / MODERADO
 
 function parsearReporte(reporteTexto) {
-  const lineas = reporteTexto.split('\n');
   const datos = {
-    puntaje:         null,
-    nivelRiesgo:     'BAJO',
-    siPlenos:        0,
-    siMatiz:         0,
-    noCount:         0,
+    puntaje:          null,
+    nivelRiesgo:      'MODERADO',
+    siPlenos:         0,
+    siMatiz:          0,
+    noCount:          0,
+    naCount:          0,
     resumenEjecutivo: '',
-    categorias:      [],
-    alertas:         [],
+    categorias:       [],
+    alertas:          [],
   };
 
-  // Buscar puntaje y nivel de riesgo
+  const lineas = reporteTexto.split('\n');
+
+  // ── 1. Extraer puntaje ──────────────────────────────────────────────────────
+  // Formato A: "Porcentaje SÍ/aplicables: **100%"
+  // Formato B: "22/27 = 81.5%" o "Porcentaje de alineación: 22/27 = 81.5%"
   for (const linea of lineas) {
-    const matchPct = linea.match(/(\d{2,3})%/);
-    if (matchPct && !datos.puntaje) datos.puntaje = parseInt(matchPct[1]);
-
-    if (linea.toUpperCase().includes('NIVEL DE RIESGO') || linea.toUpperCase().includes('RIESGO LIBERAL')) {
-      if (linea.toUpperCase().includes('BAJO'))     datos.nivelRiesgo = 'BAJO';
-      if (linea.toUpperCase().includes('MODERADO')) datos.nivelRiesgo = 'MODERADO';
-      if (linea.toUpperCase().includes('ALTO') && !linea.toUpperCase().includes('MUY')) datos.nivelRiesgo = 'ALTO';
-      if (linea.toUpperCase().includes('MUY ALTO')) datos.nivelRiesgo = 'MUY ALTO';
-    }
-
-    const matchSI = linea.match(/\*\*SÍ plenos[:\*]*\s*(\d+)/i) || linea.match(/SÍ.*?plenas.*?:\s*\**(\d+)/i);
-    if (matchSI) datos.siPlenos = parseInt(matchSI[1]);
-
-    const matchMatiz = linea.match(/SÍ.*?matiz[:\*]*\s*(\d+)/i) || linea.match(/matiz.*?:\s*\**(\d+)/i);
-    if (matchMatiz) datos.siMatiz = parseInt(matchMatiz[1]);
-  }
-
-  // Si no encontró conteos, intentar contarlos directamente
-  if (datos.siPlenos === 0 && datos.siMatiz === 0) {
-    const matchTotal = reporteTexto.match(/\*\*SÍ plenos:\*\*\s*(\d+).*?\*\*SÍ con matiz[^:]*:\*\*\s*(\d+)/is);
-    if (matchTotal) {
-      datos.siPlenos = parseInt(matchTotal[1]);
-      datos.siMatiz  = parseInt(matchTotal[2]);
+    const matchPct = linea.match(/([\d.]+)%/);
+    if (matchPct && !datos.puntaje) {
+      const v = parseFloat(matchPct[1]);
+      if (v > 10 && v <= 100) { datos.puntaje = Math.round(v); }
     }
   }
 
-  // Parsear categorías y criterios
+  // ── 2. Extraer totales SÍ / NO / N/A ───────────────────────────────────────
+  // Formato B: tabla "| **TOTALES** | **28** | **22** | **5** | **1** |"
+  const matchTotales = reporteTexto.match(/TOTALES[^|]*\|[^|]*\|[^|]*\|\s*\**(\d+)\**\s*\|[^|]*\|\s*\**(\d+)\**\s*\|[^|]*\|\s*\**(\d+)\**\s*\|/i);
+  if (matchTotales) {
+    datos.siPlenos = parseInt(matchTotales[1]);
+    datos.noCount  = parseInt(matchTotales[2]);
+    datos.naCount  = parseInt(matchTotales[3]);
+  }
+
+  // Formato A: "SÍ plenos: 20" / "SÍ con matiz: 8"
+  const matchSIplenos = reporteTexto.match(/SÍ plenos[^:]*:\**\s*(\d+)/i);
+  if (matchSIplenos) datos.siPlenos = parseInt(matchSIplenos[1]);
+  const matchSImatiz = reporteTexto.match(/SÍ con matiz[^:]*:\**\s*(\d+)/i);
+  if (matchSImatiz) datos.siMatiz = parseInt(matchSImatiz[1]);
+  const matchNO = reporteTexto.match(/\*\*NO:\*\*\s*(\d+)/i);
+  if (matchNO) datos.noCount = parseInt(matchNO[1]);
+
+  // ── 3. Extraer nivel de riesgo ─────────────────────────────────────────────
+  // Formato A: "NIVEL DE RIESGO LIBERAL: **BAJO**"
+  // Formato B: "NIVEL DE RIESGO LIBERAL: **MODERADO**"
+  const matchRiesgo = reporteTexto.match(/NIVEL DE RIESGO LIBERAL[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO)/i);
+  if (matchRiesgo) datos.nivelRiesgo = matchRiesgo[1].toUpperCase();
+
+  // ── 4. Parsear categorías y criterios ──────────────────────────────────────
   const CATEGORIAS_NOMBRES = {
-    'I':    'Dignidad y Autonomía Individual',
-    'II':   'Estado de Derecho e Instituciones',
-    'III':  'Propiedad Privada y Libre Empresa',
-    'IV':   'Competencia y Rechazo al Rentismo',
-    'V':    'Límites al Estado y Subsidiariedad',
-    'VI':   'Igualdad de Oportunidades y Política Social',
-    'VII':  'Integridad Semántica y Soberanía',
+    'I':   'Dignidad y Autonomía Individual',
+    'II':  'Estado de Derecho e Instituciones',
+    'III': 'Propiedad Privada y Libre Empresa',
+    'IV':  'Competencia y Rechazo al Rentismo',
+    'V':   'Límites al Estado y Subsidiariedad',
+    'VI':  'Igualdad de Oportunidades y Política Social',
+    'VII': 'Integridad Semántica y Soberanía',
   };
 
   let categoriaActual = null;
   let criterioActual  = null;
-  let enResumenEjecutivo = false;
-  let enAlertas = false;
-  let alertaActual = null;
-  let bufferResumen = [];
-  let bufferAnalisis = [];
-  let bufferAlerta = [];
+  let bufferAnalisis  = [];
+  let enAlertas       = false;
+  let alertaActual    = null;
+  let bufferAlerta    = [];
+  let bufferResumen   = [];
+  let enResumen       = false;
 
   for (let i = 0; i < lineas.length; i++) {
     const linea = lineas[i];
 
-    // Detectar resumen ejecutivo / conclusión
-    if (/conclusi[oó]n|resumen ejecutivo/i.test(linea)) {
-      enResumenEjecutivo = true;
-      enAlertas = false;
-      continue;
-    }
-
-    // Detectar sección de alertas
-    if (/^#+\s*\d+\.\s*ALERTAS?|^##\s*ALERTAS/i.test(linea) || /alertas principales/i.test(linea)) {
-      enAlertas = true;
-      enResumenEjecutivo = false;
+    // ── Detectar sección alertas
+    if (/^#{1,4}\s*\d+\.\s*ALERTAS?|^##\s*ALERTAS|ALERTAS? PRINCIPALES/i.test(linea)) {
+      enAlertas = true; enResumen = false;
       if (criterioActual) { criterioActual.analisis = bufferAnalisis.join(' ').trim(); bufferAnalisis = []; criterioActual = null; }
       if (alertaActual)   { alertaActual.descripcion = bufferAlerta.join(' ').trim(); bufferAlerta = []; datos.alertas.push(alertaActual); alertaActual = null; }
       continue;
     }
 
-    // Detectar categoría (## CATEGORÍA I o ### CATEGORÍA I — Nombre)
-    const matchCat = linea.match(/^#{1,3}\s*CATEGOR[IÍ]A\s+(I{1,3}V?|VI{0,3}|IV)\s*[—-]?\s*(.*)/i);
-    if (matchCat) {
+    // ── Detectar resumen/conclusión
+    if (/conclusi[oó]n|resumen ejecutivo|valoraci[oó]n final/i.test(linea) && linea.startsWith('#')) {
+      enResumen = true; enAlertas = false;
       if (criterioActual) { criterioActual.analisis = bufferAnalisis.join(' ').trim(); bufferAnalisis = []; criterioActual = null; }
-      const numRom  = matchCat[1].toUpperCase();
-      const nombre  = matchCat[2].trim() || CATEGORIAS_NOMBRES[numRom] || `Categoría ${numRom}`;
-      categoriaActual = { num: numRom, nombre, criterios: [] };
-      datos.categorias.push(categoriaActual);
-      enResumenEjecutivo = false;
       continue;
     }
 
-    // Detectar criterio (C-01, **C-01**, etc.)
-    const matchCrit = linea.match(/^\*{0,2}(C-\d{2})\*{0,2}[.\s:]*(.+)/);
+    // ── Detectar categoría
+    // Formato A: "## CATEGORÍA I — Nombre" o "### CATEGORÍA I — Nombre"
+    // Formato B: "### CATEGORÍA I — DIGNIDAD Y AUTONOMÍA INDIVIDUAL"
+    const matchCat = linea.match(/^#{1,4}\s*CATEGOR[IÍ]A\s+(I{1,3}V?|VI{0,3}|IV)\s*[—–-]+\s*(.*)/i);
+    if (matchCat) {
+      if (criterioActual) { criterioActual.analisis = bufferAnalisis.join(' ').trim(); bufferAnalisis = []; criterioActual = null; }
+      const numRom = matchCat[1].toUpperCase();
+      const nombre = matchCat[2].trim() || CATEGORIAS_NOMBRES[numRom] || `Categoría ${numRom}`;
+      // Capitalizar el nombre si está en mayúsculas
+      const nombreFmt = nombre === nombre.toUpperCase()
+        ? (CATEGORIAS_NOMBRES[numRom] || nombre.charAt(0) + nombre.slice(1).toLowerCase())
+        : nombre;
+      categoriaActual = { num: numRom, nombre: nombreFmt, criterios: [] };
+      datos.categorias.push(categoriaActual);
+      enResumen = false; enAlertas = false;
+      continue;
+    }
+
+    // ── Detectar criterio C-XX
+    const matchCrit = linea.match(/^\*{0,2}(C-\d{2})\*{0,2}[.\s:]*(.*)/);
     if (matchCrit && categoriaActual) {
       if (criterioActual) { criterioActual.analisis = bufferAnalisis.join(' ').trim(); bufferAnalisis = []; }
       const pregunta = matchCrit[2].replace(/\*\*/g, '').trim();
@@ -495,77 +512,73 @@ function parsearReporte(reporteTexto) {
       continue;
     }
 
-    // Detectar resultado dentro de un criterio
+    // ── Detectar resultado del criterio (dentro de criterio activo)
     if (criterioActual) {
-      if (/✅\s*SÍ\s*\*|✓\s*SÍ\s*\*|☑\s*SÍ\s*\*|SÍ\s*—\s*con\s*matiz|SÍ\s*\*/i.test(linea)) {
-        criterioActual.resultado = 'SI_MATIZ';
-      } else if (/✅\s*SÍ|✓\s*SÍ|'\s*\*\*SÍ\*\*|^SÍ$/i.test(linea) && !linea.includes('*')) {
-        criterioActual.resultado = 'SI';
-      } else if (/✗\s*NO|❌\s*NO|^NO$/i.test(linea)) {
-        criterioActual.resultado = 'NO';
-      } else if (linea.trim() && !linea.startsWith('#') && !linea.startsWith('---')) {
-        const lineaLimpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
-        if (lineaLimpia) bufferAnalisis.push(lineaLimpia);
+      // Formato B: "**RESULTADO: SÍ (con reserva)**" o "**RESULTADO: NO**"
+      const matchResultadoB = linea.match(/RESULTADO[:\s]+\*{0,2}(SÍ|SI|NO|N\/A)[^*]*(con reserva|con matiz|parcialmente)?/i);
+      if (matchResultadoB) {
+        const base    = matchResultadoB[1].toUpperCase();
+        const esMatiz = !!(matchResultadoB[2]);
+        if (base === 'NO')     criterioActual.resultado = 'NO';
+        else if (base === 'N/A') criterioActual.resultado = 'NA';
+        else if (esMatiz)      criterioActual.resultado = 'SI_MATIZ';
+        else                   criterioActual.resultado = 'SI';
+        continue;
+      }
+
+      // Formato A: ✅ SÍ / ✅ SÍ* / ❌ NO
+      if (/✅\s*SÍ\s*\*|✓\s*SÍ\s*\*|SÍ\s*con\s*matiz/i.test(linea))      criterioActual.resultado = 'SI_MATIZ';
+      else if (/✅\s*SÍ|✓\s*SÍ|'\s*\*\*SÍ\*\*/i.test(linea) && !linea.includes('*')) criterioActual.resultado = 'SI';
+      else if (/✗\s*NO|❌\s*NO/i.test(linea))                               criterioActual.resultado = 'NO';
+
+      // Acumular análisis
+      if (linea.trim() && !linea.startsWith('#') && !linea.startsWith('---') && !linea.startsWith('**RESULTADO')) {
+        const limpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
+        if (limpia) bufferAnalisis.push(limpia);
       }
       continue;
     }
 
-    // Detectar alerta
+    // ── Alertas
     if (enAlertas) {
-      const matchAlerta = linea.match(/^#{1,4}\s*(?:ALERTA\s*\d+|Alerta\s*\d+)[—\s-]*(.*)/i);
+      const matchAlerta = linea.match(/^#{1,4}\s*ALERTA\s*\d+[^:]*[:\s]*(.*)/i);
       if (matchAlerta) {
         if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); bufferAlerta = []; }
-        alertaActual = {
-          titulo:      matchAlerta[1].trim(),
-          gravedad:    'MODERADA',
-          descripcion: '',
-          criterios:   [],
-        };
+        alertaActual = { titulo: matchAlerta[1].replace(/\*\*/g,'').trim(), gravedad: 'MODERADA', descripcion: '', criterios: [] };
+        // Detectar gravedad en el título
+        if (/CRÍT|ALTA/i.test(alertaActual.titulo))       alertaActual.gravedad = 'ALTA';
+        else if (/MODERADA?[- ]ALTA/i.test(alertaActual.titulo)) alertaActual.gravedad = 'MODERADA-ALTA';
+        else if (/MODERADA?/i.test(alertaActual.titulo))  alertaActual.gravedad = 'MODERADA';
         continue;
       }
       if (alertaActual) {
-        const matchGrav = linea.match(/\*\*Gravedad[:\*]*\s*(ALTA|MODERADA[- ]ALTA|MODERADA|BAJA)/i);
+        const matchGrav = linea.match(/Gravedad[:\s]+\**(ALTA|MODERADA[- ]ALTA|MODERADA|BAJA)\**/i);
         if (matchGrav) { alertaActual.gravedad = matchGrav[1].toUpperCase(); continue; }
-
-        const matchCrits = linea.match(/\(([C-\d,\s]+)\)/);
-        if (matchCrits) {
-          alertaActual.criterios = matchCrits[1].split(',').map(c => c.trim()).filter(Boolean);
-          continue;
-        }
-        const lineaLimpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
-        if (lineaLimpia && !linea.startsWith('#')) bufferAlerta.push(lineaLimpia);
+        const matchCrits = linea.match(/C-\d{2}/g);
+        if (matchCrits) alertaActual.criterios.push(...matchCrits.filter(c => !alertaActual.criterios.includes(c)));
+        const limpia = linea.replace(/\*\*/g,'').replace(/^[>\s*#-]+/,'').trim();
+        if (limpia && !linea.startsWith('#')) bufferAlerta.push(limpia);
       }
       continue;
     }
 
-    // Resumen ejecutivo
-    if (enResumenEjecutivo) {
-      const lineaLimpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
-      if (lineaLimpia && !linea.startsWith('#')) bufferResumen.push(lineaLimpia);
+    // ── Resumen ejecutivo
+    if (enResumen) {
+      const limpia = linea.replace(/\*\*/g,'').replace(/^[\s>*-]+/,'').trim();
+      if (limpia && !linea.startsWith('#')) bufferResumen.push(limpia);
     }
   }
 
   // Volcar buffers finales
-  if (criterioActual && bufferAnalisis.length > 0) {
-    criterioActual.analisis = bufferAnalisis.join(' ').trim();
-  }
-  if (alertaActual) {
-    alertaActual.descripcion = bufferAlerta.join(' ').trim();
-    datos.alertas.push(alertaActual);
-  }
+  if (criterioActual && bufferAnalisis.length > 0) criterioActual.analisis = bufferAnalisis.join(' ').trim();
+  if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); }
   datos.resumenEjecutivo = bufferResumen.join(' ').trim();
 
-  // Inferir resultado desde el análisis si no se detectó explícitamente
-  datos.categorias.forEach(cat => {
-    cat.criterios.forEach(crit => {
-      if (!crit.resultado || crit.resultado === 'SI') {
-        const texto = (crit.pregunta + ' ' + crit.analisis).toLowerCase();
-        if (texto.includes('con matiz') || texto.includes('con alerta') || texto.includes('parcialmente') || texto.includes('sí*')) {
-          crit.resultado = 'SI_MATIZ';
-        }
-      }
-    });
-  });
+  // Si no hubo sección de resumen, construir uno del indicador
+  if (!datos.resumenEjecutivo && datos.puntaje) {
+    const totalCrits = datos.categorias.reduce((a, c) => a + c.criterios.length, 0) || 28;
+    datos.resumenEjecutivo = `El documento analizó ${totalCrits} criterios del Test de Libertad organizados en 7 categorías, obteniendo un ${datos.puntaje}% de alineación con los principios del liberalismo clásico. Nivel de riesgo liberal: ${datos.nivelRiesgo}.`;
+  }
 
   return datos;
 }
