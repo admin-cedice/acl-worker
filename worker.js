@@ -6,6 +6,7 @@
 
 'use strict';
 const { generarPodcastPrueba } = require('./testPodcast');
+const { generarReportePDF }    = require('./generarReportePDF');
 const express    = require('express');
 const { google } = require('googleapis');
 const { GoogleAuth } = require('google-auth-library');
@@ -647,8 +648,20 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     );
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} chars)`);
 
-    console.log(`📄 [${auditoria_id}] PASO 6: Generando PDF del reporte...`);
-    await convertirTXTaPDF(rutaReporte, rutaReportePDF, metadatos.titulo);
+    console.log(`📄 [${auditoria_id}] PASO 6: Generando PDF del reporte (diseño institucional)...`);
+    await generarReportePDF(
+      reporte,
+      {
+        titulo:         metadatos.titulo,
+        pais:           metadatos.pais     || '',
+        fecha:          metadatos.fecha    || '',
+        paginas:        metadatos.paginas  || '',
+        marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026',
+        generadoEl:     new Date().toLocaleDateString('es-VE', { year:'numeric', month:'long', day:'numeric' }),
+      },
+      rutaReportePDF,
+      auditoria_id
+    );
     console.log(`✅ [${auditoria_id}] PDF del reporte generado`);
 
     console.log(`🎙️  [${auditoria_id}] PASO 7: Disparando Audio Overview en NotebookLM...`);
