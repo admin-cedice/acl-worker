@@ -652,6 +652,119 @@ app.post('/regenerar-audio', async (req, res) => {
   }
 });
 
+// ── Módulo: Manual Cívico Liberal (documento vivo, versionado) ──────────────
+// Agregado 15 jun 2026. Requiere la migración 002_manual_liberalismo.sql.
+// El manual se sube desde el dashboard admin, queda inactivo hasta que se
+// activa explícitamente, y solo una versión puede estar activa a la vez
+// (el índice único de la migración lo garantiza a nivel de base de datos).
+
+// GET /manual/versiones — lista versiones con metadatos (sin el texto completo)
+app.get('/manual/versiones', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const { rows } = await db.query(`
+      SELECT id, version, notas_version, activo, creado_en,
+             length(contenido_texto) AS longitud_caracteres
+      FROM manual_liberalismo
+      ORDER BY creado_en DESC
+    `);
+    res.json({ ok: true, versiones: rows });
+  } catch (err) {
+    console.error('[manual/versiones] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /manual/subir-version — sube texto pegado o un PDF en base64 (se extrae
+// el texto con pdf-parse, ya usado en extraerTextoPDF). Queda inactiva hasta
+// que se active con POST /manual/activar.
+// Body: { version, notas_version, contenido_texto } o { version, notas_version, pdf_base64 }
+app.post('/manual/subir-version', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  const { version, notas_version, contenido_texto, pdf_base64 } = req.body;
+
+  if (!version) {
+    return res.status(400).json({ error: 'Falta el campo "version" (ej. "2026.3")' });
+  }
+  if (!contenido_texto && !pdf_base64) {
+    return res.status(400).json({ error: 'Debes enviar "contenido_texto" o "pdf_base64"' });
+  }
+
+  try {
+    let texto = contenido_texto;
+
+    if (!texto && pdf_base64) {
+      console.log(`   [manual/subir-version] Extrayendo texto del PDF para versión ${version}...`);
+      const buffer   = Buffer.from(pdf_base64, 'base64');
+      const datosPDF = await pdfParse(buffer);
+      texto = datosPDF.text;
+      console.log(`   [manual/subir-version] Texto extraído: ${texto.length} caracteres`);
+    }
+
+    if (!texto || texto.trim().length < 100) {
+      return res.status(400).json({
+        error: 'El texto extraído es demasiado corto (menos de 100 caracteres) — revisa el PDF o el texto pegado',
+      });
+    }
+
+    const { rows } = await db.query(`
+      INSERT INTO manual_liberalismo (version, contenido_texto, notas_version, activo)
+      VALUES ($1, $2, $3, false)
+      RETURNING id, version, creado_en
+    `, [version, texto, notas_version || null]);
+
+    console.log(`   [manual/subir-version] ✅ Versión ${version} guardada (id: ${rows[0].id}, ${texto.length} caracteres)`);
+    res.json({ ok: true, manual: rows[0], longitud_caracteres: texto.length });
+
+  } catch (err) {
+    console.error('[manual/subir-version] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /manual/activar — activa una versión y desactiva las demás en una
+// transacción (evita que dos versiones queden activas si algo falla a mitad).
+// Body: { id }
+app.post('/manual/activar', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'Falta el campo "id"' });
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE manual_liberalismo SET activo = false WHERE activo = true`);
+    const { rows } = await client.query(`
+      UPDATE manual_liberalismo SET activo = true WHERE id = $1
+      RETURNING id, version
+    `, [id]);
+
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Versión no encontrada' });
+    }
+
+    await client.query('COMMIT');
+    console.log(`   [manual/activar] ✅ Versión ${rows[0].version} activada (id: ${rows[0].id})`);
+    res.json({ ok: true, activado: rows[0] });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[manual/activar] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // Recibe el archivo .wav binario, convierte a .mp3 y completa la auditoría
 app.post('/completar-audio', express.raw({ type: '*/*', limit: '200mb' }), async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
@@ -694,6 +807,12 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     console.log(`📖 [${auditoria_id}] PASO 3: Leyendo configuración doctrinal...`);
     const config = await obtenerConfigDoctrinal();
     console.log(`✅ [${auditoria_id}] Prompt versión ${config.version}`);
+    const manualActivo = await obtenerManualActivo();
+    if (manualActivo) {
+      console.log(`✅ [${auditoria_id}] Manual Cívico Liberal versión ${manualActivo.version} (${manualActivo.contenido_texto.length} caracteres)`);
+    } else {
+      console.log(`⚠️  [${auditoria_id}] Sin versión activa del Manual Cívico Liberal — se analiza solo con configuracion_doctrinal`);
+    }
 
     console.log(`🏷️  [${auditoria_id}] PASO 4: Extrayendo metadatos...`);
     await actualizarEstado(auditoria_id, 'procesando');
@@ -708,11 +827,11 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     await new Promise(r => setTimeout(r, 90_000));
 
     console.log(`🧠 [${auditoria_id}] PASO 5: Analizando con Claude...`);
-    const reporte = await analizarConClaude(textoPDF, config);
+    const reporte = await analizarConClaude(textoPDF, config, manualActivo);
     fs.writeFileSync(rutaReporte, reporte, 'utf8');
     await db.query(
-      `UPDATE auditorias SET reporte_texto = $1, prompt_version = $2 WHERE id = $3`,
-      [reporte, config.version, auditoria_id]
+      `UPDATE auditorias SET reporte_texto = $1, prompt_version = $2, manual_version_id = $3 WHERE id = $4`,
+      [reporte, config.version, manualActivo?.id || null, auditoria_id]
     );
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} chars)`);
 
@@ -875,6 +994,20 @@ async function obtenerConfigDoctrinal() {
   return result.rows[0];
 }
 
+// Obtiene la versión activa del Manual Cívico Liberal, si existe.
+// Devuelve null (no lanza error) si aún no se ha subido/activado ninguna —
+// así el pipeline de análisis sigue funcionando con solo configuracion_doctrinal
+// mientras el manual versionado se termina de poblar.
+async function obtenerManualActivo() {
+  const { rows } = await db.query(`
+    SELECT id, version, contenido_texto
+    FROM manual_liberalismo
+    WHERE activo = true
+    LIMIT 1
+  `);
+  return rows[0] || null;
+}
+
 async function extraerTextoPDF(rutaPDF) {
   const buffer = fs.readFileSync(rutaPDF);
   const data   = await pdfParse(buffer);
@@ -908,11 +1041,17 @@ Fragmento:\n${muestra}`,
   }
 }
 
-async function analizarConClaude(textoPDF, config) {
+async function analizarConClaude(textoPDF, config, manualActivo = null) {
+  // Si hay una versión activa del manual, se agrega al final del system prompt
+  // ya configurado en configuracion_doctrinal — no lo reemplaza, lo complementa.
+  const systemFinal = manualActivo
+    ? `${config.prompt_sistema}\n\n---\n\nMANUAL CÍVICO LIBERAL (versión ${manualActivo.version}) — fuente doctrinal completa para este análisis:\n\n${manualActivo.contenido_texto}`
+    : config.prompt_sistema;
+
   const respuesta = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 8000,
-    system: config.prompt_sistema,
+    system: systemFinal,
     messages: [{ role: 'user', content: `${config.prompt_analisis}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}` }],
   });
   return respuesta.content[0].text;
