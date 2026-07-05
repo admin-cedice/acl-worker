@@ -7,6 +7,14 @@
 // mental quedan PAUSADOS (no eliminados) mientras se define el nuevo camino
 // de audio y se revisa el diseño de PPTX/mapa. Las funciones y endpoints
 // siguen intactos para reactivarse sin reconstruir nada.
+//
+// FIX (5 jul 2026): lectura segura de las respuestas de Claude. Sonnet 5
+// activa "pensamiento adaptativo" por defecto: cuando decide pensar, agrega
+// un bloque { type: 'thinking' } ANTES del bloque de texto en response.content.
+// El código asumía que el texto siempre está en content[0], lo cual rompía
+// analizarConClaude() (y silenciosamente degradaba extraerMetadatos()) cuando
+// el modelo pensaba antes de responder. Se agrega extraerTextoRespuesta() y
+// se usa en los 3 puntos donde antes se leía content[0].text directamente.
 
 'use strict';
 const { generarPodcastPrueba } = require('./testPodcast');
@@ -40,6 +48,19 @@ const anthropic     = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const db            = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const DIRECTORIO_TEMP = '/tmp/acl-worker';
+
+// ── Utilidad: extraer el bloque de texto de una respuesta de Claude ─────────
+// Sonnet 5 activa "pensamiento adaptativo" por defecto: cuando decide pensar,
+// antepone un bloque { type: 'thinking' } al bloque { type: 'text' } dentro
+// de response.content. Leer siempre content[0].text ya no es seguro. Esta
+// función busca el bloque de tipo 'text' sin importar en qué posición venga.
+function extraerTextoRespuesta(response) {
+  const bloqueTexto = response.content.find(b => b.type === 'text');
+  if (!bloqueTexto) {
+    throw new Error('La respuesta de Claude no incluyó ningún bloque de texto (revisar response.content completo)');
+  }
+  return bloqueTexto.text;
+}
 
 // ── Autenticación Google Cloud (cuenta de servicio) ──────────────────────────
 
@@ -426,7 +447,7 @@ async function extraerEstructura(reporteTexto) {
     system: PROMPT_EXTRACCION,
     messages: [{ role: 'user', content: `Extrae la estructura de este reporte:\n\n${reporteTexto}` }],
   });
-  const limpio = respuesta.content[0].text.trim().replace(/```json|```/g, '').trim();
+  const limpio = extraerTextoRespuesta(respuesta).trim().replace(/```json|```/g, '').trim();
   return JSON.parse(limpio);
 }
 
@@ -1031,7 +1052,7 @@ Fragmento:\n${muestra}`,
     }],
   });
   try {
-    const limpio = respuesta.content[0].text.trim().replace(/```json|```/g, '').trim();
+    const limpio = extraerTextoRespuesta(respuesta).trim().replace(/```json|```/g, '').trim();
     const datos  = JSON.parse(limpio);
     return {
       titulo:    datos.titulo    || 'Documento sin título',
@@ -1061,7 +1082,7 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
     system: systemFinal,
     messages: [{ role: 'user', content: `${config.prompt_analisis}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}` }],
   });
-  return respuesta.content[0].text;
+  return extraerTextoRespuesta(respuesta);
 }
 
 async function convertirTXTaPDF(rutaTXT, rutaPDF, titulo) {
