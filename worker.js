@@ -1,8 +1,12 @@
-// worker.js — ACL Worker v3.3
+// worker.js — ACL Worker v3.4
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
-// Hemisferio derecho: NotebookLM Enterprise API (flujo híbrido)
-// v3.3: conversión wav→mp3 · nombre descriptivo de audio · episodeFocus en español
+//
+// v3.4 (3 jul 2026): pipeline simplificado — solo genera el reporte de
+// auditoría (PDF) y lo envía por correo. NotebookLM (audio), PPTX y mapa
+// mental quedan PAUSADOS (no eliminados) mientras se define el nuevo camino
+// de audio y se revisa el diseño de PPTX/mapa. Las funciones y endpoints
+// siguen intactos para reactivarse sin reconstruir nada.
 
 'use strict';
 const { generarPodcastPrueba } = require('./testPodcast');
@@ -417,7 +421,7 @@ Reglas:
 
 async function extraerEstructura(reporteTexto) {
   const respuesta = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 8000,
     system: PROMPT_EXTRACCION,
     messages: [{ role: 'user', content: `Extrae la estructura de este reporte:\n\n${reporteTexto}` }],
@@ -789,8 +793,8 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
   const rutaTXT        = path.join(dir, 'original.txt');
   const rutaReporte    = path.join(dir, 'reporte.txt');
   const rutaReportePDF = path.join(dir, 'reporte.pdf');
-  const rutaSlides     = path.join(dir, 'presentacion.pptx');
-  const rutaMapa       = path.join(dir, 'mapa.png');
+  // const rutaSlides  = path.join(dir, 'presentacion.pptx'); // desactivado — ver nota en PASO 6
+  // const rutaMapa    = path.join(dir, 'mapa.png');          // desactivado — ver nota en PASO 6
   fs.mkdirSync(dir, { recursive: true });
   try {
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando PDF...`);
@@ -851,38 +855,36 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     );
     console.log(`✅ [${auditoria_id}] PDF del reporte generado`);
 
-    console.log(`🎙️  [${auditoria_id}] PASO 7: Disparando Audio Overview en NotebookLM...`);
-    await actualizarEstado(auditoria_id, 'empaquetando');
-    const notebookId = await dispararNotebookLM(reporte, metadatos.titulo, auditoria_id);
-    await db.query(`UPDATE auditorias SET notebook_id = $1 WHERE id = $2`, [notebookId, auditoria_id]);
-    console.log(`✅ [${auditoria_id}] Audio disparado. NotebookID: ${notebookId}`);
+    // ── PASOS TEMPORALMENTE DESACTIVADOS (3 jul 2026) ──────────────────────
+    // NotebookLM (audio), PPTX y mapa mental quedan en pausa mientras se
+    // define el nuevo camino para el audio (Google Vertex AI+TTS o
+    // ElevenLabs) y se revisa el diseño de PPTX/mapa. Las funciones
+    // dispararNotebookLM(), generarPresentacion() y generarMapaMental()
+    // siguen definidas más abajo — reactivar aquí cuando corresponda.
 
-    console.log(`📊 [${auditoria_id}] PASO 8: Generando presentación PPTX...`);
-    const estructura = await generarPresentacion(reporte, metadatos.titulo, rutaSlides, auditoria_id);
-    console.log(`✅ [${auditoria_id}] Presentación generada`);
-
-    console.log(`🗺️  [${auditoria_id}] PASO 9: Generando mapa mental...`);
-    await generarMapaMental(estructura, rutaMapa, auditoria_id);
-    console.log(`✅ [${auditoria_id}] Mapa mental generado`);
-
-    console.log(`☁️  [${auditoria_id}] PASO 10: Subiendo archivos a Drive...`);
+    console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo archivos a Drive...`);
     const carpetaId    = await obtenerCarpetaAuditoria(drive, auditoria_id);
     const linkOriginal = await subirArchivo(drive, rutaPDF, 'documento-original.pdf', 'application/pdf', carpetaId);
     const linkReporte  = await subirArchivo(drive, rutaReportePDF, 'reporte.pdf', 'application/pdf', carpetaId);
-    const linkSlides   = await subirArchivo(drive, rutaSlides, 'presentacion.pptx',
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation', carpetaId);
-    const linkMapa     = await subirArchivo(drive, rutaMapa, 'mapa-mental.png', 'image/png', carpetaId);
 
     await db.query(
       `UPDATE auditorias
-       SET estado = 'parcialmente_completada',
+       SET estado = 'completada',
            link_original = $1, link_reporte = $2,
-           link_presentacion = $3, link_mapa = $4,
-           drive_carpeta_id = $5
-       WHERE id = $6`,
-      [linkOriginal, linkReporte, linkSlides, linkMapa, carpetaId, auditoria_id]
+           drive_carpeta_id = $3, completada_en = NOW()
+       WHERE id = $4`,
+      [linkOriginal, linkReporte, carpetaId, auditoria_id]
     );
-    console.log(`\n⏳ [${auditoria_id}] Auditoría parcialmente completada. Esperando audio del editor.`);
+    console.log(`✅ [${auditoria_id}] Archivos subidos a Drive`);
+
+    console.log(`📧 [${auditoria_id}] PASO 8: Enviando email al ciudadano...`);
+    await enviarEmailFinal(ciudadano_email, metadatos.titulo, auditoria_id, {
+      original: linkOriginal,
+      reporte:  linkReporte,
+      // podcast, presentacion y mapa se omiten — enviarEmailFinal ya los
+      // renderiza condicionalmente, así que no aparecen en el correo.
+    });
+    console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
 
   } catch (error) {
     console.error(`❌ [${auditoria_id}] Error:`, error.message);
@@ -1017,7 +1019,7 @@ async function extraerTextoPDF(rutaPDF) {
 async function extraerMetadatos(textoPDF) {
   const muestra = textoPDF.slice(0, 3000);
   const respuesta = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: 300,
     system: `Eres un clasificador de documentos jurídicos. Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks.`,
     messages: [{
@@ -1049,8 +1051,13 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
     : config.prompt_sistema;
 
   const respuesta = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 8000,
+    model: 'claude-sonnet-5',
+    // max_tokens subido de 8000 a 16000 (3 jul 2026): Sonnet 5 usa un
+    // tokenizador nuevo que produce ~30% más tokens para el mismo texto, y
+    // además "piensa" internamente por defecto — ese pensamiento también
+    // consume parte de este mismo límite. Sin margen, el reporte de 28
+    // criterios corre riesgo de cortarse a mitad de un criterio.
+    max_tokens: 16000,
     system: systemFinal,
     messages: [{ role: 'user', content: `${config.prompt_analisis}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}` }],
   });
@@ -1142,9 +1149,10 @@ async function enviarEmailFinal(email, titulo, auditoria_id, links) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.3 corriendo en puerto ${PORT}`);
-  console.log(`   Hemisferio derecho: NotebookLM API + flujo híbrido`);
-  console.log(`   Audio: wav→mp3 con fluent-ffmpeg · nombre descriptivo`);
-  console.log(`   Pasos automáticos: 1-10 (PDF→análisis→PPTX→mapa→Drive→parcialmente_completada)`);
-  console.log(`   Paso manual: editor sube audio → POST /completar-audio → email final\n`);
+  console.log(`\n⚙️  ACL Worker v3.4 corriendo en puerto ${PORT}`);
+  console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
+  console.log(`   PAUSADO: Audio (NotebookLM), PPTX y mapa mental — pendiente definir`);
+  console.log(`   nuevo camino de audio (Google Vertex AI+TTS / ElevenLabs) y revisar diseño`);
+  console.log(`   Funciones intactas y listas para reactivar: dispararNotebookLM(),`);
+  console.log(`   generarPresentacion(), generarMapaMental(), /completar-audio, /regenerar-audio\n`);
 });

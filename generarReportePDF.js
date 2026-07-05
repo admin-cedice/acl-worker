@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker v2.1
+// generarReportePDF.js — ACL Worker v2.2
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
@@ -9,10 +9,15 @@
 //
 // CAMBIOS v2.1 (15 jun 2026):
 //   4. Fix parser: notas metodológicas (ej. "C-06 se computa como NO...") ya no
-//      se parsean como criterios falsos — elimina el "criterio 29" fantasma
+//      se parsean como criterios falsos — eliminado el "criterio 29 fantasma"
 //   5. Fix CSS: break-before: page (propiedad moderna) en lugar de
 //      page-break-before: always — elimina páginas en blanco entre categorías
 //   6. orphans/widows: 3 en body para que Chrome no deje líneas sueltas
+//
+// CAMBIOS v2.2 (3 jul 2026):
+//   7. Fix: si el texto de Claude no trae un porcentaje explícito, el puntaje
+//      se calcula desde los conteos reales de criterios (SI/SI_MATIZ/NO) en
+//      vez de quedar en null — eliminado el "null%" en la portada del PDF
 
 'use strict';
 
@@ -254,8 +259,6 @@ const CSS = `
      CUERPO DEL REPORTE — flujo natural, Chrome decide los cortes
   ═══════════════════════════════════════════════════════════ */
 
-  /* Cabecera de sección que aparece en cada página (no es un header fijo,
-     es el encabezado del primer bloque de esa página) */
   .seccion-cabecera {
     display: flex;
     justify-content: space-between;
@@ -263,7 +266,6 @@ const CSS = `
     margin-bottom: 28px;
     padding-bottom: 12px;
     border-bottom: 1px solid var(--border);
-    /* No se corta justo antes de esta línea — siempre va con lo que sigue */
     page-break-after: avoid;
   }
 
@@ -288,10 +290,6 @@ const CSS = `
   }
 
   /* ── CATEGORÍAS ── */
-  /* Cada categoría empieza en página nueva.
-     break-before: page es la propiedad moderna — evita páginas en blanco
-     que page-break-before: always puede generar cuando Chrome ya está
-     al inicio de una página. */
   .categoria-bloque {
     break-before: page;
   }
@@ -306,7 +304,6 @@ const CSS = `
     align-items: baseline;
     gap: 10px;
     margin-bottom: 4px;
-    /* El título va siempre con al menos el primer criterio */
     page-break-after: avoid;
   }
 
@@ -320,7 +317,6 @@ const CSS = `
   .criterio {
     padding: 14px 0;
     border-bottom: 1px solid var(--border-subtle);
-    /* No partir un criterio a la mitad entre dos páginas */
     page-break-inside: avoid;
   }
   .criterio:last-child { border-bottom: none; }
@@ -442,8 +438,6 @@ const CSS = `
   .ficha-tabla td:last-child { color: var(--text); }
 
   /* ── PIE DE PÁGINA ── */
-  /* Aparece al final de cada bloque de análisis.
-     Chrome lo imprime en la posición natural del flujo — no flotando. */
   .pie-pagina {
     margin-top: 28px;
     padding-top: 12px;
@@ -480,7 +474,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
 
   const lineas = reporteTexto.split('\n');
 
-  // ── 1. Extraer puntaje ─────────────────────────────────────────────────────
+  // ── 1. Extraer puntaje (si el texto trae uno explícito) ────────────────────
   for (const linea of lineas) {
     const matchPct = linea.match(/([\d.]+)%/);
     if (matchPct && !datos.puntaje) {
@@ -563,7 +557,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       // Ejemplo: "C-06 se computa como NO (incompatibilidad con marco constitucional vigente)"
       const esNotaMetodologica = /se computa|se compute|computa como|por tanto|N\/A aplicado|los criterios con|se pondera/i.test(linea);
       if (esNotaMetodologica) {
-        // Tratarla como texto de análisis del criterio actual, no como nuevo criterio
         if (criterioActual) {
           const limpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
           if (limpia) bufferAnalisis.push(limpia);
@@ -582,7 +575,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
 
     // ── Detectar resultado dentro de criterio activo
     if (criterioActual) {
-      // Formato B: "**RESULTADO: SÍ (con reserva)**"
       const matchResultadoB = linea.match(/RESULTADO[:\s*:]+([^\n*]+)/i);
       if (matchResultadoB) {
         const texto = matchResultadoB[1].toUpperCase().trim();
@@ -593,12 +585,10 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
         continue;
       }
 
-      // Formato A: ✅ SÍ / ✅ SÍ* / ❌ NO
       if      (/✅\s*SÍ\s*\*|✓\s*SÍ\s*\*|SÍ\s*con\s*matiz/i.test(linea))         criterioActual.resultado = 'SI_MATIZ';
       else if (/✅\s*SÍ|✓\s*SÍ|'\s*\*\*SÍ\*\*/i.test(linea) && !linea.includes('*')) criterioActual.resultado = 'SI';
       else if (/✗\s*NO|❌\s*NO/i.test(linea))                                         criterioActual.resultado = 'NO';
 
-      // Acumular texto de análisis
       if (linea.trim() && !linea.startsWith('#') && !linea.startsWith('---')
           && !linea.startsWith('**RESULTADO') && !linea.startsWith('|')
           && !/^\*\*Cálculo|Criterios aplicables|Resultados SÍ|Porcentaje de alineación/i.test(linea)) {
@@ -651,7 +641,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   const naReal       = todos.filter(c => c.resultado === 'NA').length;
 
   // ── LOG DE DIAGNÓSTICO ────────────────────────────────────────────────────
-  // Imprime en Railway para detectar dónde se rompen los contadores
   console.log(`\n   ╔══════════════════════════════════════════════════`);
   console.log(`   ║ DIAGNÓSTICO PARSER [${auditoria_id}]`);
   console.log(`   ╠══════════════════════════════════════════════════`);
@@ -663,7 +652,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   console.log(`   ║ NO         : ${noReal}`);
   console.log(`   ║ N/A        : ${naReal}`);
   console.log(`   ╠──────────────────────────────────────────────────`);
-  console.log(`   ║ Puntaje detectado : ${datos.puntaje}%`);
+  console.log(`   ║ Puntaje detectado en texto : ${datos.puntaje === null ? 'null (se calculará desde conteos)' : datos.puntaje + '%'}`);
   console.log(`   ║ Riesgo detectado  : ${datos.nivelRiesgo}`);
   console.log(`   ║ Alertas           : ${datos.alertas.length}`);
   if (datos.categorias.length > 0) {
@@ -680,12 +669,25 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     datos.naCount  = naReal;
   }
 
+  // ── FIX v2.2: fallback de puntaje calculado desde conteos reales ───────────
+  // Si Claude no incluyó un "%" explícito en el texto (o el regex no lo detectó),
+  // se calcula directamente desde los criterios ya parseados — más confiable
+  // que depender de que el formato de texto libre lo mencione.
+  if (datos.puntaje === null) {
+    const aplicables = datos.siPlenos + datos.siMatiz + datos.noCount; // N/A no cuenta como aplicable
+    if (aplicables > 0) {
+      datos.puntaje = Math.round(((datos.siPlenos + datos.siMatiz) / aplicables) * 100);
+      console.log(`   [parsearReporte] Puntaje calculado desde conteos reales: ${datos.puntaje}%`);
+    } else {
+      datos.puntaje = 0;
+      console.log(`   [parsearReporte] ⚠️  No se pudo calcular puntaje (sin criterios aplicables) — usando 0%`);
+    }
+  }
+
   return datos;
 }
 
 // ── Generar resumen ejecutivo con Claude ─────────────────────────────────────
-// Llamado separado al API de Claude para obtener un resumen ejecutivo rico,
-// en lugar del resumen mecánico construido por el parser.
 
 async function generarResumenEjecutivo(reporteTexto, datos, metadatos) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -717,8 +719,12 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
 
   try {
     const response = await anthropic.messages.create({
-      model:      'claude-sonnet-4-6',
-      max_tokens: 600,
+      model:      'claude-sonnet-5',
+      // max_tokens subido de 600 a 1200 (3 jul 2026): mismo motivo que en
+      // analizarConClaude — tokenizador nuevo (+30%) y pensamiento adaptativo
+      // comparten este presupuesto. El resumen ya venía generando 2000+
+      // caracteres, cerca del límite anterior incluso sin estos cambios.
+      max_tokens: 1200,
       messages:   [{ role: 'user', content: prompt }],
     });
 
@@ -733,7 +739,6 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
 
   } catch (err) {
     console.error(`   [generarResumenEjecutivo] Error llamando a Claude:`, err.message);
-    // Fallback mecánico si Claude falla
     const totalSI    = siPlenos + siMatiz;
     const aplicables = siPlenos + siMatiz + noCount;
     let resumen = `El documento obtuvo un ${puntaje}% de alineación con los criterios del liberalismo clásico. `;
@@ -750,7 +755,7 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
 
 function generarHTML(datos, metadatos) {
   const {
-    puntaje          = 89,
+    puntaje: puntajeRaw,
     nivelRiesgo      = 'BAJO',
     siPlenos         = 0,
     siMatiz          = 0,
@@ -760,6 +765,12 @@ function generarHTML(datos, metadatos) {
     categorias       = [],
     alertas          = [],
   } = datos;
+
+  // Nota: usar ?? en vez de un valor por defecto en la destructuración, porque
+  // el default de destructuring NO cubre el caso `null` (solo `undefined`).
+  // parsearReporte ya debería garantizar que puntaje nunca sea null, pero esto
+  // es una segunda barrera de seguridad para la portada.
+  const puntaje = puntajeRaw ?? 0;
 
   const {
     titulo        = 'Documento auditado',
@@ -773,7 +784,6 @@ function generarHTML(datos, metadatos) {
 
   const totalCriterios = categorias.reduce((acc, cat) => acc + cat.criterios.length, 0) || 28;
 
-  // Convertir saltos de línea dobles en párrafos HTML para el resumen
   const resumenHTML = resumenEjecutivo
     .split(/\n{2,}/)
     .map(p => p.trim())
@@ -781,7 +791,6 @@ function generarHTML(datos, metadatos) {
     .map(p => `<p>${esc(p)}</p>`)
     .join('');
 
-  // ── PORTADA ───────────────────────────────────────────────────────────────
   const htmlPortada = `
 <div class="portada">
   <div class="portada-cinta"></div>
@@ -830,8 +839,6 @@ function generarHTML(datos, metadatos) {
   </div>
 </div>`;
 
-  // ── ANÁLISIS POR CATEGORÍA ────────────────────────────────────────────────
-  // Cada categoría en su propio bloque con page-break-before: always en CSS
   const htmlCategorias = categorias.map((cat, idxCat) => {
     const critHTML = cat.criterios.map(crit => `
   <div class="criterio">
@@ -843,7 +850,6 @@ function generarHTML(datos, metadatos) {
     ${crit.analisis ? `<div class="criterio-analisis">${esc(crit.analisis)}</div>` : ''}
   </div>`).join('');
 
-    // La primera categoría encabeza la sección de análisis
     const cabecera = idxCat === 0 ? `
   <div class="seccion-cabecera">
     <div class="seccion-label">Análisis por criterio</div>
@@ -873,7 +879,6 @@ function generarHTML(datos, metadatos) {
 </div>`;
   }).join('\n');
 
-  // ── ALERTAS PRINCIPALES ────────────────────────────────────────────────────
   let htmlAlertas = '';
   if (alertas.length > 0) {
     const alertasHTML = alertas.map((alerta, i) => {
@@ -911,7 +916,6 @@ function generarHTML(datos, metadatos) {
 </div>`;
   }
 
-  // ── FICHA DEL DOCUMENTO ────────────────────────────────────────────────────
   const htmlFicha = `
 <div class="ficha-bloque">
   <div class="seccion-cabecera">
@@ -988,7 +992,6 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
   console.log(`   [${auditoria_id}] HTML disponible en: ${urlTemporal}`);
 
   try {
-    // ── Paso 1: Crear job
     console.log(`   [${auditoria_id}] Creando job en CloudConvert...`);
     const jobRes = await fetch('https://api.cloudconvert.com/v2/jobs', {
       method: 'POST',
@@ -1010,8 +1013,8 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
             output_format:    'pdf',
             engine:           'chrome',
             print_background: true,
-            css_page_size:    true,   // respeta @page { size: A4 }
-            margin_top:       0,      // los márgenes los define @page en el CSS
+            css_page_size:    true,
+            margin_top:       0,
             margin_right:     0,
             margin_bottom:    0,
             margin_left:      0,
@@ -1036,7 +1039,6 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
     const jobId = job.data.id;
     console.log(`   [${auditoria_id}] Job creado: ${jobId}`);
 
-    // ── Paso 2: Polling
     console.log(`   [${auditoria_id}] Esperando conversión...`);
     const inicio    = Date.now();
     const MAX_ESPERA = 180_000;
@@ -1067,7 +1069,6 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
       throw new Error('CloudConvert: timeout o no se encontró el PDF exportado');
     }
 
-    // ── Paso 3: Descargar PDF
     console.log(`   [${auditoria_id}] Descargando PDF...`);
     const pdfUrl = exportTask.result.files[0].url;
     const pdfRes = await fetch(pdfUrl);
@@ -1086,9 +1087,8 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // ── Función principal exportada ──────────────────────────────────────────────
 
 async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.2`);
 
-  // 1. Parsear el reporte
   console.log(`   [${auditoria_id}] Paso 1: Parseando reporte...`);
   const datos = parsearReporte(reporteTexto, auditoria_id);
 
@@ -1097,18 +1097,15 @@ async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_
     datos.resumenEjecutivo = reporteTexto.slice(0, 1200).replace(/\n+/g, ' ').trim();
   }
 
-  // 2. Generar resumen ejecutivo con Claude
   console.log(`   [${auditoria_id}] Paso 2: Generando resumen ejecutivo con Claude...`);
   datos.resumenEjecutivo = await generarResumenEjecutivo(reporteTexto, datos, metadatos);
 
-  // 3. Generar HTML
   console.log(`   [${auditoria_id}] Paso 3: Generando HTML...`);
   const html     = generarHTML(datos, metadatos);
   const rutaHTML = rutaSalida.replace('.pdf', '.html');
   fs.writeFileSync(rutaHTML, html, 'utf8');
   console.log(`   [${auditoria_id}] HTML generado (${Math.round(html.length / 1024)} KB)`);
 
-  // 4. Convertir a PDF con CloudConvert
   console.log(`   [${auditoria_id}] Paso 4: Convirtiendo a PDF...`);
   try {
     await convertirHTMLaPDF(rutaHTML, rutaSalida, auditoria_id);
