@@ -285,7 +285,6 @@ const CSS = `
   .resumen-texto p:last-child { margin-bottom: 0; }
 
   .categoria-bloque {
-    break-before: page;
   }
 
   .categoria-titulo {
