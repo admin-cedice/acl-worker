@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker v2.6
+// generarReportePDF.js — ACL Worker v2.7
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
@@ -7,65 +7,84 @@
 //   2. Log de diagnóstico de contadores en parsearReporte()
 //   3. Nueva arquitectura CSS: sin .pagina rígido, flujo natural Chrome + @page
 //
-// CAMBIOS v2.1 (15 jun 2026):
-//   4. Fix parser: notas metodológicas ya no se parsean como criterios falsos
-//   5. Fix CSS: break-before: page en lugar de page-break-before: always
-//   6. orphans/widows: 3 en body para que Chrome no deje líneas sueltas
-//
-// CAMBIOS v2.2 (3 jul 2026):
-//   7. Fix: puntaje se calcula desde conteos reales si no hay % explícito
-//
-// CAMBIOS v2.3 (6 jul 2026):
-//   8. Reordenado: Portada → Ficha → Categorías → Alertas
-//   9. Eliminado el pie de página repetido que se cortaba entre páginas
-//  10. Desglose SÍ/NO se omite si no se detectaron criterios
-//
-// CAMBIOS v2.4 (7 jul 2026):
-//  11. Resumen Ejecutivo movido a su propia sección con margen normal
-//  12. Reemplazado el "Indicador General" por puntos clave generados por Claude
-//
-// CAMBIOS v2.5 (7 jul 2026):
-//  13. Detección de criterios en formato de TABLA MARKDOWN (causa raíz real
-//      del contenido faltante — Sonnet 5 escribe los criterios en tabla)
-//  14. Detección de categoría con "#" opcional (la primera venía sin "#")
-//
-// CAMBIOS v2.5.1-v2.5.2 (aplicados manualmente por Moisés, incorporados aquí):
-//  15. .categoria-bloque ya NO fuerza salto de página — las categorías
-//      fluyen continuas entre sí.
-//  16. Eliminado el encabezado "Análisis por criterio (cont.)" que aparecía
-//      repetido en cada categoría a partir de la segunda.
+// CAMBIOS v2.1-v2.5 (jun-jul 2026): ver versiones anteriores del archivo.
+//   Resumen: fix de notas metodológicas, break-before:page por categoría
+//   (luego retirado), puntaje calculado desde conteos reales, detección de
+//   criterios en tabla markdown (formato real de Sonnet 5), Manual y Ficha
+//   reordenados, Indicador General reemplazado por puntos clave.
 //
 // CAMBIOS v2.6 (7 jul 2026):
-//  17. Header de portada: "CEDICE / Friedrich Naumann" → "CEDICE / Fundación
-//      Friedrich Naumann".
-//  18. La etiqueta "Reporte de Auditoría · Test de Libertad" ahora incluye
-//      la fecha de generación (antes solo vivía en el pie de portada, que
-//      se eliminó en este mismo cambio — ver #19).
-//  19. Eliminado el pie de portada completo (el bloque que decía "Auditoría
-//      Cívica Liberal para la Transición Democrática... Generado el...").
-//  20. Fondo crema de borde a borde en TODAS las páginas: el color ahora se
-//      pinta también en `html` (no solo en `body`), porque Chrome respeta
-//      el margen de @page para el fondo de body, pero SÍ extiende el fondo
-//      de html hasta el borde físico de la hoja — así los márgenes dejan
-//      de verse en blanco. Los márgenes de @page NO se tocaron (seguían
-//      siendo necesarios para que el contenido multi-página tenga espacio
-//      consistente en cada página — solo cambió el color debajo de ellos).
-//  21. Reintroducido un ÚNICO salto de página, aplicado solo a la primera
-//      categoría (clase .categoria-bloque-primera), para que "Análisis por
-//      Criterio" empiece limpio justo después de la Ficha. Las categorías
-//      II-VII siguen sin forzar salto (ver #15).
-//  22. Agregada una leyenda ("Cómo leer los resultados": SÍ / SÍ* / NO) al
-//      inicio del Análisis por Criterio, y un cuadro resumen con el
-//      desglose por categoría + total general al final (después de la
-//      última categoría, antes de Alertas). El cuadro se omite si no se
-//      detectaron criterios individuales (mismo criterio ya usado en la
-//      Ficha para no mostrar ceros que no reflejan la realidad).
+//   17-19. Header con "Fundación", fecha en la etiqueta de portada, pie de
+//      portada eliminado.
+//   20. Fondo crema de borde a borde (color en html, no solo en body).
+//   21. Solo la primera categoría fuerza salto de página.
+//   22. Leyenda SÍ/SÍ*/NO + cuadro resumen por categoría al final.
+//
+// CAMBIOS v2.7 (7 jul 2026):
+//  23. FIX DE RAÍZ: Claude a veces concatena, sin salto de línea, un
+//      párrafo de cierre ("Resultados NO: 23 NIVEL DE RIESGO: CRÍTICO...")
+//      dentro de la justificación del ÚLTIMO criterio de la tabla — se
+//      detecta y se separa (extraerNotaFinalDeTexto), en vez de mostrarlo
+//      pegado a esa pregunta.
+//  24. FIX de inconsistencia de nivel de riesgo: el texto de cierre usa
+//      "NIVEL DE RIESGO" (sin la palabra "LIBERAL") y un nivel nuevo,
+//      "CRÍTICO", que la expresión anterior no reconocía — por eso los
+//      puntos clave (generados aparte) mostraban un nivel distinto al del
+//      cierre real. Ahora se acepta "CRÍTICO" y la palabra "LIBERAL" es
+//      opcional; además, el nivel del párrafo de cierre (el más
+//      autoritativo, calculado al final del análisis) SOBREESCRIBE
+//      cualquier detección anterior.
+//  25. Cuadro resumen por categoría duplicado en la portada (versión
+//      compacta), junto a los puntos clave — ADVERTENCIA: la portada debe
+//      caber en una sola página (usa el margen cero especial); si un
+//      documento tiene título/bullets muy largos podría desbordarse a una
+//      segunda página y reproducir el bug de márgenes ya corregido. Probar
+//      con varios documentos reales antes de confiar en que siempre cabe.
+//  26. Espaciado de los puntos clave reducido, para dejar espacio al
+//      cuadro en la portada.
+//  27. Numeración de páginas vía @page (contador nativo de Chrome) —
+//      confianza moderada, verificar visualmente que se vea bien. La
+//      portada no muestra número (no se declaró su propio margin-box).
+//  28. Nota "(consultar el Manual de Liberalismo)" con link a
+//      liberalmente.app/manual-de-liberalismo.pdf, insertada automática
+//      donde el texto mencione "efecto comadreja". Requiere que el PDF
+//      esté subido a public/ en el repo del frontend (pendiente).
+//  29. Leyenda de niveles de riesgo: CONSTRUIDA PERO APAGADA
+//      (LEYENDA_RIESGO_LISTA = false). Solo "CRÍTICO (0–39%)" está
+//      confirmado con datos reales; los demás rangos son placeholders.
+//      Cambiar a true únicamente cuando se confirmen los rangos oficiales
+//      (buscar en configuracion_doctrinal.prompt_analisis).
 
 'use strict';
 
 const fs      = require('fs');
 const path    = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
+
+// ── Constantes pendientes de confirmación doctrinal ──────────────────────────
+
+// v2.7: link al Manual de Liberalismo, usado en la nota de "efecto
+// comadreja". Asume que el PDF ya está subido a public/ en el repo del
+// frontend (admin-cedice/auditoria-civica-liberal) — si no está ahí
+// todavía, este link dará 404 hasta que se suba.
+const URL_MANUAL = 'https://liberalmente.app/manual-de-liberalismo.pdf';
+
+// v2.7 — PENDIENTE: solo "CRÍTICO" tiene rango confirmado (apareció en un
+// reporte real). Los demás son placeholders ("XX–XX%"). NO cambiar
+// LEYENDA_RIESGO_LISTA a true hasta completar estos rangos con los datos
+// reales de configuracion_doctrinal.prompt_analisis.
+// v2.8 (confirmado contra configuracion_doctrinal.prompt_analisis): el
+// Test define 4 niveles, no 5 — "MUY ALTO" nunca existió en la doctrina
+// real, era un supuesto heredado en el código desde antes de esta sesión.
+const RANGOS_RIESGO = [
+  { nivel: 'BAJO',     rango: '85–100%', desc: 'Alineación sólida con los principios del liberalismo clásico.' },
+  { nivel: 'MODERADO', rango: '65–84%',  desc: 'Alineación mayoritaria, con debilidades puntuales que no son estructurales.' },
+  { nivel: 'ALTO',     rango: '40–64%',  desc: 'Debilidades significativas frente al marco doctrinal liberal.' },
+  { nivel: 'CRÍTICO',  rango: '0–39%',   desc: 'Configuración normativa que contradice de forma extensa y estructural los principios del liberalismo clásico.' },
+];
+
+// v2.8: rangos confirmados — la leyenda ya se puede mostrar.
+const LEYENDA_RIESGO_LISTA = true;
 
 // ── Helpers de HTML ──────────────────────────────────────────────────────────
 
@@ -76,6 +95,18 @@ function esc(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+// v2.7: como esc(), pero además inserta la nota doctrinal cuando el texto
+// menciona "efecto comadreja". Usar en vez de esc() para texto narrativo
+// (justificaciones, resumen ejecutivo, párrafo de cierre) — no hace falta
+// usarlo en títulos, nombres de categoría, etc. donde esa frase no aparece.
+function conNotaComadreja(textoPlano) {
+  const escapado = esc(textoPlano);
+  return escapado.replace(
+    /efecto comadreja/gi,
+    (match) => `${match} <a href="${URL_MANUAL}" class="nota-doctrinal">(consultar el Manual de Liberalismo)</a>`
+  );
 }
 
 function badgeResultado(resultado) {
@@ -105,19 +136,44 @@ function normalizarResultadoTabla(texto) {
   return 'SI';
 }
 
+// v2.7: detecta un párrafo de cierre tipo "Resultados NO: 23 NIVEL DE
+// RIESGO: CRÍTICO (0-39%) El documento presenta..." que a veces Claude
+// concatena, sin salto de línea, dentro de la justificación del último
+// criterio. Si lo encuentra, separa el texto limpio (la justificación
+// real) del nivel de riesgo y el párrafo de cierre.
+function extraerNotaFinalDeTexto(texto) {
+  const m = texto.match(/(Resultados\s+(?:SÍ|SI|NO|N\/A)[^.]{0,60}?:\s*\d+\s*NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)\**\s*(?:\([^)]*\))?\s*)([\s\S]*)$/i);
+  if (!m) return null;
+  const idx = texto.indexOf(m[0]);
+  return {
+    textoLimpio:  texto.slice(0, idx).trim(),
+    nivelRiesgo:  m[2].toUpperCase(),
+    parrafoFinal: m[3].trim(),
+  };
+}
+
 // ── CSS del reporte ──────────────────────────────────────────────────────────
 
 const CSS = `
   /* ── PÁGINA ── */
+  /* v2.7: numeración de páginas vía margin-box de @page (soporte nativo de
+     Chrome para impresión/PDF). Confianza moderada — verificar visualmente
+     que se vea bien tras desplegar. */
   @page {
     size: A4;
     margin: 18mm 18mm 22mm 18mm;
+    @bottom-right {
+      content: counter(page) " / " counter(pages);
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 9px;
+      color: #8A8478;
+    }
   }
 
-  /* La portada ocupa toda su página. Solo contiene título, subtítulo y
-     puntos clave — contenido corto y acotado que siempre cabe en una
-     página, por lo que este margen cero nunca se desborda a una segunda
-     página. */
+  /* La portada ocupa toda su página, con margen cero y sin numerar (no
+     declara su propio margin-box, así que no hereda el contador). Debe
+     caber en una sola página — ver advertencia de la v2.7 sobre el cuadro
+     resumen agregado aquí. */
   @page portada {
     margin: 0;
   }
@@ -143,11 +199,6 @@ const CSS = `
     --sans:          Arial, Helvetica, sans-serif;
   }
 
-  /* v2.6: el fondo se pinta en html (no solo en body) porque Chrome
-     respeta el margen de @page para el fondo de body, pero SÍ pinta el
-     fondo de html hasta el borde físico de la hoja — así los márgenes ya
-     no se ven en blanco, quedan del mismo crema de la paleta. Los tamaños
-     de margen de @page no cambiaron, solo el color debajo de ellos. */
   html {
     background: var(--bg);
     -webkit-print-color-adjust: exact;
@@ -201,7 +252,7 @@ const CSS = `
 
   .portada-body {
     flex: 1;
-    padding: 44px 52px 0;
+    padding: 40px 52px 0;
     display: flex;
     flex-direction: column;
   }
@@ -209,34 +260,36 @@ const CSS = `
   .portada-etiqueta {
     font-size: 10px; font-weight: 600;
     letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--accent); margin-bottom: 20px;
+    color: var(--accent); margin-bottom: 16px;
   }
 
   .portada-titulo {
     font-family: var(--serif);
-    font-size: 32px; font-weight: 700;
+    font-size: 28px; font-weight: 700;
     line-height: 1.2; letter-spacing: -0.02em;
-    color: var(--text); max-width: 560px; margin-bottom: 12px;
+    color: var(--text); max-width: 560px; margin-bottom: 10px;
   }
 
   .portada-subtitulo {
-    font-size: 14px; color: var(--text-mid);
-    font-style: italic; font-family: var(--serif); margin-bottom: 36px;
+    font-size: 13px; color: var(--text-mid);
+    font-style: italic; font-family: var(--serif); margin-bottom: 20px;
   }
 
+  /* v2.7: espaciado reducido para dejar sitio al cuadro resumen agregado
+     en la portada (ver .resumen-portada-bloque). */
   .puntos-clave {
     list-style: none;
-    margin: 0 0 28px 0;
+    margin: 0 0 16px 0;
     padding: 0;
   }
 
   .puntos-clave li {
     position: relative;
-    padding-left: 20px;
-    margin-bottom: 10px;
-    font-size: 13px;
+    padding-left: 16px;
+    margin-bottom: 4px;
+    font-size: 12px;
     color: var(--text-mid);
-    line-height: 1.55;
+    line-height: 1.35;
     font-weight: 400;
   }
 
@@ -244,11 +297,38 @@ const CSS = `
     content: '';
     position: absolute;
     left: 0;
-    top: 7px;
-    width: 6px;
-    height: 6px;
+    top: 6px;
+    width: 5px;
+    height: 5px;
     border-radius: 50%;
     background: var(--accent);
+  }
+
+  /* v2.7: cuadro resumen compacto en la portada, junto a los puntos clave.
+     ADVERTENCIA: la portada usa margen cero y debe caber en una sola
+     página — probar con varios documentos reales antes de confiar en que
+     siempre cabe (títulos muy largos podrían desbordar a una 2da página). */
+  .resumen-portada-bloque {
+    margin-top: 6px;
+  }
+
+  .resumen-categorias-tabla--compacta th,
+  .resumen-categorias-tabla--compacta td {
+    padding: 4px 6px;
+    font-size: 9.5px;
+  }
+
+  .nota-final-texto {
+    margin-top: 12px;
+    font-size: 11px;
+    color: var(--text-mid);
+    line-height: 1.55;
+    font-weight: 300;
+  }
+
+  .nota-doctrinal {
+    color: var(--accent);
+    text-decoration: underline;
   }
 
   /* ═══════════════════════════════════════════════════════════
@@ -312,9 +392,6 @@ const CSS = `
   }
   .ficha-tabla td:last-child { color: var(--text); }
 
-  /* v2.6: solo la primera categoría fuerza salto de página — así el
-     Análisis por Criterio empieza limpio justo después de la Ficha, pero
-     las categorías II-VII siguen fluyendo continuas entre sí. */
   .categoria-bloque-primera {
     break-before: page;
   }
@@ -377,7 +454,6 @@ const CSS = `
   .criterio-resultado.no       { background: #FEF0F0; color: var(--accent); border: 1px solid #EDAAAA; }
   .criterio-resultado.na       { background: var(--bg); color: var(--text-muted); border: 1px solid var(--border); }
 
-  /* ── LEYENDA (v2.6) ── */
   .leyenda-resultados {
     background: var(--bg-alt);
     border: 1px solid var(--border);
@@ -404,13 +480,37 @@ const CSS = `
   }
   .leyenda-item:last-child { margin-bottom: 0; }
 
+  /* v2.7: leyenda de niveles de riesgo (apagada hasta confirmar rangos —
+     ver LEYENDA_RIESGO_LISTA). Reutiliza el mismo lenguaje visual que
+     .leyenda-resultados pero en su propio bloque. */
+  .leyenda-riesgo {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 14px 16px;
+    margin-top: 16px;
+    page-break-inside: avoid;
+  }
+  .leyenda-riesgo .leyenda-titulo {
+    font-size: 9.5px; font-weight: 700;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--text-muted); margin-bottom: 8px;
+  }
+  .leyenda-riesgo .leyenda-item-riesgo {
+    font-size: 11px;
+    color: var(--text-mid);
+    line-height: 1.5;
+    margin-bottom: 5px;
+  }
+  .leyenda-riesgo .leyenda-item-riesgo:last-child { margin-bottom: 0; }
+  .leyenda-riesgo .leyenda-item-riesgo strong { color: var(--text); }
+
   .criterio-analisis {
     margin-left: 42px;
     font-size: 12px; color: var(--text-mid);
     line-height: 1.65; font-weight: 300;
   }
 
-  /* ── CUADRO RESUMEN POR CATEGORÍA (v2.6) ── */
   .tabla-resumen-bloque {
     margin-top: 28px;
     page-break-inside: avoid;
@@ -537,6 +637,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     naCount:     0,
     resumenEjecutivo: '',
     puntosClave: [],
+    notaFinal:   null,
     categorias:  [],
     alertas:     [],
   };
@@ -551,7 +652,10 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     }
   }
 
-  const matchRiesgo = reporteTexto.match(/NIVEL DE RIESGO LIBERAL[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO)/i);
+  // v2.7: se acepta "CRÍTICO" además de los 4 niveles anteriores, y la
+  // palabra "LIBERAL" ahora es opcional (el texto de cierre real dice
+  // solo "NIVEL DE RIESGO", sin "LIBERAL").
+  const matchRiesgo = reporteTexto.match(/NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)/i);
   if (matchRiesgo) datos.nivelRiesgo = matchRiesgo[1].toUpperCase();
 
   const CATEGORIAS_NOMBRES = {
@@ -702,6 +806,25 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   if (criterioActual && bufferAnalisis.length > 0) criterioActual.analisis = bufferAnalisis.join(' ').trim();
   if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); }
 
+  // ── v2.7: separar el párrafo de cierre pegado al último criterio ──────────
+  // Recorre todos los criterios parseados (de cualquier categoría, por si
+  // el bloque de cierre no siempre queda en la última) y, si encuentra el
+  // patrón "Resultados X: N NIVEL DE RIESGO: ...", lo separa de la
+  // justificación real. El nivel de riesgo de ese cierre es más
+  // autoritativo (se calcula al final del análisis completo) y sobreescribe
+  // cualquier detección anterior — soluciona la inconsistencia entre el
+  // nivel mostrado en los puntos clave y el del cierre real.
+  for (const cat of datos.categorias) {
+    for (const crit of cat.criterios) {
+      const extra = extraerNotaFinalDeTexto(crit.analisis || '');
+      if (extra) {
+        crit.analisis     = extra.textoLimpio;
+        datos.nivelRiesgo  = extra.nivelRiesgo;
+        datos.notaFinal    = extra.parrafoFinal;
+      }
+    }
+  }
+
   const todos = datos.categorias.flatMap(c => c.criterios);
   const siPlenosReal = todos.filter(c => c.resultado === 'SI').length;
   const siMatizReal  = todos.filter(c => c.resultado === 'SI_MATIZ').length;
@@ -721,6 +844,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   console.log(`   ╠──────────────────────────────────────────────────`);
   console.log(`   ║ Puntaje detectado en texto : ${datos.puntaje === null ? 'null (se calculará desde conteos)' : datos.puntaje + '%'}`);
   console.log(`   ║ Riesgo detectado  : ${datos.nivelRiesgo}`);
+  console.log(`   ║ Nota final        : ${datos.notaFinal ? 'sí (' + datos.notaFinal.length + ' chars)' : 'no encontrada'}`);
   console.log(`   ║ Alertas           : ${datos.alertas.length}`);
   if (datos.categorias.length > 0) {
     console.log(`   ╠── Distribución de resultados por criterio:`);
@@ -837,6 +961,7 @@ function generarHTML(datos, metadatos) {
     naCount          = 0,
     resumenEjecutivo = '',
     puntosClave      = [],
+    notaFinal        = null,
     categorias       = [],
     alertas          = [],
   } = datos;
@@ -861,8 +986,6 @@ function generarHTML(datos, metadatos) {
     ? ` · ${siPlenos} SÍ plenos · ${siMatiz} SÍ con matiz · ${noCount} NO${naCount > 0 ? ` · ${naCount} N/A` : ''}`
     : '';
 
-  // v2.6: desglose por categoría para el cuadro resumen al final del
-  // Análisis por Criterio.
   const tallyPorCategoria = categorias.map(cat => ({
     num:     cat.num,
     nombre:  cat.nombre,
@@ -881,11 +1004,56 @@ function generarHTML(datos, metadatos) {
     .split(/\n{2,}/)
     .map(p => p.trim())
     .filter(Boolean)
-    .map(p => `<p>${esc(p)}</p>`)
+    .map(p => `<p>${conNotaComadreja(p)}</p>`)
     .join('');
 
-  // v2.6: header con "Fundación" + etiqueta con fecha de generación (antes
-  // vivía solo en el pie de portada, que se eliminó — ver más abajo).
+  // v2.7: leyenda de niveles de riesgo — apagada por defecto (ver
+  // LEYENDA_RIESGO_LISTA al inicio del archivo).
+  const htmlLeyendaRiesgo = LEYENDA_RIESGO_LISTA ? `
+<div class="leyenda-riesgo">
+  <div class="leyenda-titulo">Niveles de riesgo liberal</div>
+  ${RANGOS_RIESGO.map(r => `
+  <div class="leyenda-item-riesgo"><strong>${esc(r.nivel)} (${esc(r.rango)})</strong> — ${esc(r.desc)}</div>`).join('')}
+</div>` : '';
+
+  // v2.7: filas de la tabla de resumen, reutilizadas en portada y al final.
+  const filasTabla = tallyPorCategoria.map(t => `
+      <tr>
+        <td>CAT. ${esc(t.num)} — ${esc(t.nombre)}</td>
+        <td>${t.si}</td>
+        <td>${t.siMatiz}</td>
+        <td>${t.no}</td>
+        <td>${t.na}</td>
+        <td>${t.total}</td>
+      </tr>`).join('');
+
+  const filaTotalTabla = `
+      <tr>
+        <td>Total general</td>
+        <td>${siPlenos}</td>
+        <td>${siMatiz}</td>
+        <td>${noCount}</td>
+        <td>${naCount}</td>
+        <td>${totalCriterios}</td>
+      </tr>`;
+
+  // v2.7: cuadro resumen compacto para la portada (título/país omitidos en
+  // los nombres de categoría para ahorrar espacio). ADVERTENCIA: la
+  // portada usa margen cero y debe caber en una sola página — probar con
+  // varios documentos reales antes de confiar en que siempre cabe.
+  const htmlResumenCompacto = criteriosDetectados ? `
+<div class="resumen-portada-bloque">
+  <table class="resumen-categorias-tabla resumen-categorias-tabla--compacta">
+    <thead>
+      <tr><th>Categoría</th><th>SÍ</th><th>SÍ*</th><th>NO</th><th>N/A</th><th>Total</th></tr>
+    </thead>
+    <tbody>${filasTabla}</tbody>
+    <tfoot>${filaTotalTabla}</tfoot>
+  </table>
+  ${htmlLeyendaRiesgo}
+  ${notaFinal ? `<div class="nota-final-texto">${conNotaComadreja(notaFinal)}</div>` : ''}
+</div>` : '';
+
   const htmlPortada = `
 <div class="portada">
   <div class="portada-cinta"></div>
@@ -901,6 +1069,7 @@ function generarHTML(datos, metadatos) {
     <h1 class="portada-titulo">${esc(titulo)}</h1>
     <div class="portada-subtitulo">${esc(subtitulo || [pais, fecha].filter(Boolean).join(' · '))}</div>
     ${puntosClaveHTML}
+    ${htmlResumenCompacto}
   </div>
 </div>`;
 
@@ -924,11 +1093,9 @@ function generarHTML(datos, metadatos) {
       <span class="criterio-pregunta">${esc(crit.pregunta)}</span>
       ${badgeResultado(crit.resultado)}
     </div>
-    ${crit.analisis ? `<div class="criterio-analisis">${esc(crit.analisis)}</div>` : ''}
+    ${crit.analisis ? `<div class="criterio-analisis">${conNotaComadreja(crit.analisis)}</div>` : ''}
   </div>`).join('');
 
-    // v2.6: leyenda de resultados agregada al final de la cabecera de la
-    // primera categoría (justo antes de empezar las preguntas).
     const cabecera = idxCat === 0 ? `
   <div class="seccion-cabecera">
     <div class="seccion-label">Análisis por criterio</div>
@@ -953,8 +1120,6 @@ function generarHTML(datos, metadatos) {
     </div>
   </div>` : '';
 
-    // v2.6: solo la primera categoría fuerza salto de página, con la clase
-    // .categoria-bloque-primera. Las demás siguen fluyendo continuas.
     return `
 <div class="categoria-bloque${idxCat === 0 ? ' categoria-bloque-primera' : ''}">
   ${cabecera}
@@ -966,9 +1131,9 @@ function generarHTML(datos, metadatos) {
 </div>`;
   }).join('\n');
 
-  // v2.6: cuadro resumen por categoría, al final del Análisis por Criterio.
-  // Se omite si no se detectaron criterios individuales (mismo criterio ya
-  // usado en la Ficha para no mostrar ceros que no reflejan la realidad).
+  // v2.7: cuadro resumen completo al final del Análisis por Criterio,
+  // ahora con la leyenda de riesgo (si está activa) y el párrafo de cierre
+  // ya separado del último criterio (ver extraerNotaFinalDeTexto).
   const htmlResumenCategorias = criteriosDetectados ? `
 <div class="tabla-resumen-bloque">
   <div class="seccion-cabecera">
@@ -979,28 +1144,11 @@ function generarHTML(datos, metadatos) {
     <thead>
       <tr><th>Categoría</th><th>SÍ</th><th>SÍ con matiz</th><th>NO</th><th>N/A</th><th>Total</th></tr>
     </thead>
-    <tbody>
-      ${tallyPorCategoria.map(t => `
-      <tr>
-        <td>CAT. ${esc(t.num)} — ${esc(t.nombre)}</td>
-        <td>${t.si}</td>
-        <td>${t.siMatiz}</td>
-        <td>${t.no}</td>
-        <td>${t.na}</td>
-        <td>${t.total}</td>
-      </tr>`).join('')}
-    </tbody>
-    <tfoot>
-      <tr>
-        <td>Total general</td>
-        <td>${siPlenos}</td>
-        <td>${siMatiz}</td>
-        <td>${noCount}</td>
-        <td>${naCount}</td>
-        <td>${totalCriterios}</td>
-      </tr>
-    </tfoot>
+    <tbody>${filasTabla}</tbody>
+    <tfoot>${filaTotalTabla}</tfoot>
   </table>
+  ${htmlLeyendaRiesgo}
+  ${notaFinal ? `<div class="nota-final-texto">${conNotaComadreja(notaFinal)}</div>` : ''}
 </div>` : '';
 
   let htmlAlertas = '';
@@ -1018,7 +1166,7 @@ function generarHTML(datos, metadatos) {
       <span class="alerta-gravedad" style="background:${col.badge}">${esc(alerta.gravedad)}</span>
     </div>
     <div class="alerta-cuerpo">
-      ${esc(alerta.descripcion)}
+      ${conNotaComadreja(alerta.descripcion)}
       ${criteriosHTML ? `<div class="alerta-criterios">${criteriosHTML}</div>` : ''}
     </div>
   </div>`;
@@ -1061,8 +1209,6 @@ function generarHTML(datos, metadatos) {
   </table>
 </div>`;
 
-  // v2.6: orden del documento — Portada → Resumen → Ficha → Categorías →
-  // Cuadro resumen por categoría → Alertas.
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -1203,7 +1349,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // ── Función principal exportada ──────────────────────────────────────────────
 
 async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.6`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.7`);
 
   console.log(`   [${auditoria_id}] Paso 1: Parseando reporte...`);
   const datos = parsearReporte(reporteTexto, auditoria_id);
