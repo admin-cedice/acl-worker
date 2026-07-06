@@ -1071,16 +1071,30 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
     ? `${config.prompt_sistema}\n\n---\n\nMANUAL CÍVICO LIBERAL (versión ${manualActivo.version}) — fuente doctrinal completa para este análisis:\n\n${manualActivo.contenido_texto}`
     : config.prompt_sistema;
 
+// FORMATO_RESPUESTA (7 jul 2026): Sonnet 5 empezó a responder los 28
+  // criterios como tabla markdown compacta en vez de prosa razonada. Esta
+  // instrucción no toca las 28 preguntas en sí (eso vive en
+  // config.prompt_analisis, en la base de datos) — solo le dice a Claude
+  // cómo presentar la respuesta.
+  const FORMATO_RESPUESTA = `
+FORMATO DE RESPUESTA OBLIGATORIO PARA CADA CRITERIO:
+No uses tablas markdown ni listas de una sola línea. Para cada uno de los 28 criterios, escribe:
+
+**C-XX: [enunciado completo de la pregunta del criterio]**
+RESULTADO: [SÍ | SÍ (con reserva) | NO | N/A]
+
+[Un párrafo de 3 a 5 oraciones en prosa corrida y bien razonada, explicando por qué se llegó a ese resultado, citando artículos o elementos concretos del documento cuando aplique.]
+
+Agrupa los criterios bajo el encabezado de su categoría (### CATEGORÍA [número romano] — [nombre]).`;
+
   const respuesta = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    // max_tokens subido de 8000 a 16000 (3 jul 2026): Sonnet 5 usa un
-    // tokenizador nuevo que produce ~30% más tokens para el mismo texto, y
-    // además "piensa" internamente por defecto — ese pensamiento también
-    // consume parte de este mismo límite. Sin margen, el reporte de 28
-    // criterios corre riesgo de cortarse a mitad de un criterio.
-    max_tokens: 16000,
+    max_tokens: 24000,
     system: systemFinal,
-    messages: [{ role: 'user', content: `${config.prompt_analisis}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}` }],
+    messages: [{
+      role: 'user',
+      content: `${config.prompt_analisis}\n${FORMATO_RESPUESTA}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}`
+    }],
   });
   return extraerTextoRespuesta(respuesta);
 }
