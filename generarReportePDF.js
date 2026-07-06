@@ -1,49 +1,41 @@
-// generarReportePDF.js — ACL Worker v2.9
+// generarReportePDF.js — ACL Worker v3.0
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
-// CAMBIOS v2 (15 jun 2026):
-//   1. Resumen ejecutivo generado por Claude (no mecánico)
-//   2. Log de diagnóstico de contadores en parsearReporte()
-//   3. Nueva arquitectura CSS: sin .pagina rígido, flujo natural Chrome + @page
+// CAMBIOS v2-v2.6 (jun-jul 2026): ver versiones anteriores del archivo.
+//   Resumen ejecutivo por Claude, detección de criterios en tabla markdown,
+//   Manual/Ficha reordenados, Indicador General reemplazado por puntos
+//   clave, fondo crema de borde a borde, salto de página solo antes de la
+//   primera categoría, leyenda SÍ/SÍ*/NO, cuadro resumen por categoría.
 //
-// CAMBIOS v2.1-v2.6 (jun-jul 2026): ver versiones anteriores del archivo.
-//   Resumen: fix de notas metodológicas, detección de criterios en tabla
-//   markdown (formato real de Sonnet 5), Manual/Ficha reordenados,
-//   Indicador General reemplazado por puntos clave, fondo crema de borde a
-//   borde, salto de página solo antes de la primera categoría, leyenda
-//   SÍ/SÍ*/NO, cuadro resumen por categoría.
+// CAMBIOS v2.7-v2.9 (7 jul 2026):
+//   Fix del párrafo de cierre pegado al último criterio + inconsistencia
+//   de nivel de riesgo (CRÍTICO reconocido). Cuadro resumen duplicado en
+//   portada, espaciado de bullets reducido, numeración de páginas, nota de
+//   "efecto comadreja", leyenda de niveles de riesgo (rangos confirmados:
+//   Bajo 85-100% / Moderado 65-84% / Alto 40-64% / Crítico 0-39% — "MUY
+//   ALTO" nunca existió en la doctrina real). Cuadro/leyenda duplicados al
+//   final del Análisis por Criterio eliminados (quedaban redundantes con
+//   la portada). Ficha movida a después de la última categoría.
 //
-// CAMBIOS v2.7 (7 jul 2026):
-//  23-24. Fix del párrafo de cierre pegado al último criterio + fix de
-//      inconsistencia de nivel de riesgo (se acepta "CRÍTICO", "LIBERAL"
-//      opcional, y el nivel del cierre real sobreescribe cualquier otro).
-//  25. Cuadro resumen duplicado en portada.
-//  26. Espaciado de puntos clave reducido.
-//  27. Numeración de páginas vía @page.
-//  28. Nota "(consultar el Manual de Liberalismo)" con link.
-//  29. Leyenda de niveles de riesgo construida pero apagada (pendiente de
-//      confirmar rangos).
-//
-// CAMBIOS v2.8 (7 jul 2026) — confirmado contra configuracion_doctrinal.prompt_analisis:
-//  30. El Test define 4 niveles de riesgo, no 5 — "MUY ALTO" nunca existió
-//      en la doctrina real. Rangos reales: Bajo 85-100% / Moderado 65-84%
-//      / Alto 40-64% / Crítico 0-39%. Leyenda de riesgo activada
-//      (LEYENDA_RIESGO_LISTA = true).
-//
-// CAMBIOS v2.9 (7 jul 2026):
-//  31. FIX: extraerNotaFinalDeTexto() no reconocía el párrafo de cierre
-//      cuando Claude insertaba el paso intermedio "Porcentaje de
-//      conformidad: N/N = N%" entre "Resultados X: N" y "NIVEL DE RIESGO"
-//      (la fórmula real del prompt: "porcentaje SÍ/aplicables"). Se amplió
-//      el hueco tolerado entre ambos para aceptar ese texto intermedio.
-//  32. Eliminado el cuadro resumen por categoría + leyenda de riesgo que
-//      se repetían al final del Análisis por Criterio — quedaban
-//      redundantes con la misma información ya presente en la portada.
-//  33. La Ficha del Documento Auditado se movió de la 3ra página (entre
-//      Resumen y Categorías) a justo después de la última categoría —
-//      ahora es lo último que aparece tras la respuesta al último
-//      criterio del Test.
+// CAMBIOS v3.0 (7 jul 2026):
+//  34. FIX DE RAÍZ (puntos clave vacíos + resumen ejecutivo reducido a una
+//      línea): generarResumenEjecutivo() pedía la respuesta en JSON con el
+//      resumen de 3 párrafos embebido en un campo de texto. Un texto largo
+//      con saltos de línea dentro de un string JSON es frágil — basta que
+//      Claude use un salto de línea real en vez de "\n" escapado para que
+//      JSON.parse() falle, y eso es exactamente lo que estaba pasando: al
+//      fallar, la función caía al texto mecánico de respaldo (una sola
+//      oración) y devolvía puntosClave vacío. Se dejó de usar JSON — ahora
+//      se pide un formato de texto plano con marcadores ("PUNTOS_CLAVE:" /
+//      "RESUMEN:") que no tiene sintaxis que romper con un salto de línea.
+//  35. El link al Manual de Liberalismo ya NO depende de que Claude escriba
+//      literalmente "efecto comadreja" en su análisis (frase que varía de
+//      una corrida a otra). Ahora aparece SIEMPRE en dos lugares que se
+//      renderizan en todo reporte: la fila "Marco doctrinal" de la Ficha,
+//      y la leyenda de niveles de riesgo en la portada. La nota dinámica
+//      cuando sí aparece "efecto comadreja" en el texto se conserva como
+//      complemento, no como única vía.
 
 'use strict';
 
@@ -53,13 +45,8 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 // ── Constantes doctrinales ──────────────────────────────────────────────────
 
-// Link al Manual de Liberalismo, usado en la nota de "efecto comadreja".
-// Asume que el PDF ya está subido a public/ en el repo del frontend.
 const URL_MANUAL = 'https://liberalmente.app/manual-de-liberalismo.pdf';
 
-// v2.8: rangos confirmados contra configuracion_doctrinal.prompt_analisis.
-// El Test define 4 niveles, no 5 — "MUY ALTO" nunca existió en la doctrina
-// real, era un supuesto heredado en el código desde antes de esta sesión.
 const RANGOS_RIESGO = [
   { nivel: 'BAJO',     rango: '85–100%', desc: 'Alineación sólida con los principios del liberalismo clásico.' },
   { nivel: 'MODERADO', rango: '65–84%',  desc: 'Alineación mayoritaria, con debilidades puntuales que no son estructurales.' },
@@ -67,7 +54,6 @@ const RANGOS_RIESGO = [
   { nivel: 'CRÍTICO',  rango: '0–39%',   desc: 'Configuración normativa que contradice de forma extensa y estructural los principios del liberalismo clásico.' },
 ];
 
-// v2.8: rangos confirmados — la leyenda ya se muestra.
 const LEYENDA_RIESGO_LISTA = true;
 
 // ── Helpers de HTML ──────────────────────────────────────────────────────────
@@ -82,8 +68,8 @@ function esc(str) {
 }
 
 // Como esc(), pero además inserta la nota doctrinal cuando el texto
-// menciona "efecto comadreja". Usar para texto narrativo (justificaciones,
-// resumen ejecutivo, párrafo de cierre) — no hace falta en títulos, etc.
+// menciona "efecto comadreja". Complementa (no reemplaza) el link fijo que
+// ahora vive en la Ficha y en la leyenda de riesgo — ver changelog v3.0 #35.
 function conNotaComadreja(textoPlano) {
   const escapado = esc(textoPlano);
   return escapado.replace(
@@ -119,11 +105,6 @@ function normalizarResultadoTabla(texto) {
   return 'SI';
 }
 
-// v2.9: se amplió el hueco entre "Resultados X: N" y "NIVEL DE RIESGO" para
-// tolerar el paso intermedio "Porcentaje de conformidad: N/N = N%" que
-// Claude agrega siguiendo la fórmula real del prompt ("porcentaje
-// SÍ/aplicables") — antes solo se aceptaba un espacio en blanco ahí, y por
-// eso el párrafo de cierre seguía quedando pegado al último criterio.
 function extraerNotaFinalDeTexto(texto) {
   const m = texto.match(/(Resultados\s+(?:SÍ|SI|NO|N\/A)\s*:\s*\d+[\s\S]{0,150}?NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)\**\s*(?:\([^)]*\))?\s*)([\s\S]*)$/i);
   if (!m) return null;
@@ -138,7 +119,6 @@ function extraerNotaFinalDeTexto(texto) {
 // ── CSS del reporte ──────────────────────────────────────────────────────────
 
 const CSS = `
-  /* ── PÁGINA ── */
   @page {
     size: A4;
     margin: 18mm 18mm 22mm 18mm;
@@ -193,9 +173,6 @@ const CSS = `
     widows: 3;
   }
 
-  /* ═══════════════════════════════════════════════════════════
-     PORTADA — página propia con margin 0
-  ═══════════════════════════════════════════════════════════ */
   .portada {
     page: portada;
     break-after: page;
@@ -300,10 +277,6 @@ const CSS = `
     color: var(--accent);
     text-decoration: underline;
   }
-
-  /* ═══════════════════════════════════════════════════════════
-     CUERPO DEL REPORTE — flujo natural, Chrome decide los cortes
-  ═══════════════════════════════════════════════════════════ */
 
   .seccion-cabecera {
     display: flex;
@@ -825,6 +798,10 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
 }
 
 // ── Generar resumen ejecutivo + puntos clave con Claude ──────────────────────
+// v3.0: formato de texto plano con marcadores, NO JSON. Un texto largo con
+// saltos de línea dentro de un string JSON es frágil (basta un salto de
+// línea sin escapar para romper JSON.parse) — este formato no tiene
+// sintaxis que se pueda romper así.
 
 async function generarResumenEjecutivo(reporteTexto, datos, metadatos) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -846,19 +823,27 @@ REPORTE COMPLETO (del cual debes extraer las ideas más importantes):
 ${reporteTexto.slice(0, 6000)}
 
 INSTRUCCIONES:
-Responde ÚNICAMENTE con un JSON válido, sin backticks, sin texto antes ni después, con esta forma exacta:
+Responde ÚNICAMENTE con el siguiente formato de texto plano — NO uses JSON, ni backticks, ni markdown. Empieza directamente con "PUNTOS_CLAVE:", sin nada antes:
 
-{
-  "puntos_clave": ["frase 1", "frase 2", "frase 3", "frase 4", "frase 5"],
-  "resumen": "párrafo 1\\n\\npárrafo 2\\n\\npárrafo 3"
-}
+PUNTOS_CLAVE:
+- frase 1
+- frase 2
+- frase 3
 
-"puntos_clave": entre 3 y 5 frases muy breves (máximo 14 palabras cada una), sin numeración ni viñetas dentro del texto, pensadas para alguien que solo va a leer eso antes de decidir si sigue leyendo. Cada una debe aportar un dato o hallazgo distinto.
+RESUMEN:
+párrafo 1
 
-"resumen": 3 párrafos separados por doble salto de línea (\\n\\n dentro del JSON), sin títulos ni viñetas, sin asteriscos ni markdown.
-Párrafo 1 (2-3 oraciones): qué es el documento, su alcance y contexto político-jurídico.
-Párrafo 2 (3-4 oraciones): qué encontró el análisis — fortalezas liberales, debilidades y las alertas más graves con criterios específicos.
-Párrafo 3 (2-3 oraciones): valoración final del riesgo liberal y recomendación al ciudadano.
+párrafo 2
+
+párrafo 3
+
+Reglas:
+- PUNTOS_CLAVE: entre 3 y 5 frases muy breves (máximo 14 palabras cada una), cada una en su propia línea empezando con "- ". Cada una debe aportar un dato o hallazgo distinto — no repitas la misma idea con otras palabras.
+- RESUMEN: exactamente 3 párrafos, separados entre sí por una línea completamente en blanco. Sin títulos, sin viñetas, sin asteriscos ni markdown dentro de los párrafos.
+  Párrafo 1 (2-3 oraciones): qué es el documento, su alcance y contexto político-jurídico.
+  Párrafo 2 (3-4 oraciones): qué encontró el análisis — fortalezas liberales, debilidades y las alertas más graves con criterios específicos.
+  Párrafo 3 (2-3 oraciones): valoración final del riesgo liberal y recomendación al ciudadano.
+- No escribas nada antes de "PUNTOS_CLAVE:" ni nada después del último párrafo del resumen.
 
 Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con el poder. Lenguaje propio del liberalismo clásico (propiedad privada, Estado de derecho, separación de poderes, subsidiariedad).`;
 
@@ -875,19 +860,23 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
       .join('')
       .trim();
 
-    const limpio = textoRespuesta.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(limpio);
+    const matchResumen = textoRespuesta.match(/RESUMEN:\s*([\s\S]*)$/i);
+    const resumen = matchResumen ? matchResumen[1].trim() : textoRespuesta;
 
-    const puntosClave = Array.isArray(parsed.puntos_clave)
-      ? parsed.puntos_clave.filter(Boolean).slice(0, 5)
+    const matchBullets = textoRespuesta.match(/PUNTOS_CLAVE:\s*([\s\S]*?)(?=RESUMEN:|$)/i);
+    const puntosClave = matchBullets
+      ? matchBullets[1]
+          .split('\n')
+          .map(l => l.replace(/^[\s\-•*]+/, '').trim())
+          .filter(Boolean)
+          .slice(0, 5)
       : [];
-    const resumen = typeof parsed.resumen === 'string' ? parsed.resumen : '';
 
     console.log(`   [generarResumenEjecutivo] Resumen generado (${resumen.length} chars) · ${puntosClave.length} puntos clave`);
     return { puntosClave, resumen };
 
   } catch (err) {
-    console.error(`   [generarResumenEjecutivo] Error llamando a Claude o parseando JSON:`, err.message);
+    console.error(`   [generarResumenEjecutivo] Error llamando a Claude:`, err.message);
     const totalSI    = siPlenos + siMatiz;
     const aplicables = siPlenos + siMatiz + noCount;
     let resumen = `El documento obtuvo un ${puntaje}% de alineación con los criterios del liberalismo clásico. `;
@@ -958,11 +947,14 @@ function generarHTML(datos, metadatos) {
     .map(p => `<p>${conNotaComadreja(p)}</p>`)
     .join('');
 
+  // v3.0: el link al Manual ahora es fijo (última línea), no depende de
+  // que aparezca la frase "efecto comadreja".
   const htmlLeyendaRiesgo = LEYENDA_RIESGO_LISTA ? `
 <div class="leyenda-riesgo">
   <div class="leyenda-titulo">Niveles de riesgo liberal</div>
   ${RANGOS_RIESGO.map(r => `
   <div class="leyenda-item-riesgo"><strong>${esc(r.nivel)} (${esc(r.rango)})</strong> — ${esc(r.desc)}</div>`).join('')}
+  <div class="leyenda-item-riesgo">Consulta el <a href="${URL_MANUAL}" class="nota-doctrinal">Manual de Liberalismo completo</a> para el marco doctrinal detrás de este Test.</div>
 </div>` : '';
 
   const filasTabla = tallyPorCategoria.map(t => `
@@ -985,9 +977,6 @@ function generarHTML(datos, metadatos) {
         <td>${totalCriterios}</td>
       </tr>`;
 
-  // v2.9: el cuadro resumen + leyenda + nota final ahora viven SOLO en la
-  // portada — se eliminó el bloque duplicado que aparecía al final del
-  // Análisis por Criterio, porque era redundante con esto.
   const htmlResumenCompacto = criteriosDetectados ? `
 <div class="resumen-portada-bloque">
   <table class="resumen-categorias-tabla resumen-categorias-tabla--compacta">
@@ -1110,6 +1099,8 @@ function generarHTML(datos, metadatos) {
 </div>`;
   }
 
+  // v3.0: link al Manual también en la Ficha (siempre se renderiza, sin
+  // condición) — segundo lugar garantizado además de la leyenda de riesgo.
   const htmlFicha = `
 <div class="ficha-bloque">
   <div class="seccion-cabecera">
@@ -1123,7 +1114,7 @@ function generarHTML(datos, metadatos) {
     ${pais      ? `<tr><td>País</td><td>${esc(pais)}</td></tr>` : ''}
     ${fecha     ? `<tr><td>Fecha del documento</td><td>${esc(fecha)}</td></tr>` : ''}
     ${paginas   ? `<tr><td>Extensión analizada</td><td>${esc(paginas)}</td></tr>` : ''}
-    <tr><td>Marco doctrinal</td><td>${esc(marcaDoctrinal)}</td></tr>
+    <tr><td>Marco doctrinal</td><td><a href="${URL_MANUAL}" class="nota-doctrinal">${esc(marcaDoctrinal)}</a></td></tr>
     <tr><td>Auditor</td><td>Auditor Cívico Liberal — liberalmente.app</td></tr>
     <tr><td>Generado el</td><td>${esc(generadoEl)}</td></tr>
     <tr><td>Criterios aplicados</td><td>${totalCriterios} criterios en 7 categorías del Test de Libertad</td></tr>
@@ -1136,10 +1127,6 @@ function generarHTML(datos, metadatos) {
   </table>
 </div>`;
 
-  // v2.9: orden del documento — Portada → Resumen → Categorías → Ficha →
-  // Alertas. La Ficha se movió de justo después del Resumen a justo
-  // después de la última categoría (a pedido: "debajo de la respuesta a
-  // la última pregunta").
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -1279,7 +1266,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // ── Función principal exportada ──────────────────────────────────────────────
 
 async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.9`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v3.0`);
 
   console.log(`   [${auditoria_id}] Paso 1: Parseando reporte...`);
   const datos = parsearReporte(reporteTexto, auditoria_id);
