@@ -849,18 +849,14 @@ function generarHTML(datos, metadatos) {
     ${crit.analisis ? `<div class="criterio-analisis">${esc(crit.analisis)}</div>` : ''}
   </div>`).join('');
 
-    const cabecera = idxCat === 0 ? `
+const cabecera = idxCat === 0 ? `
   <div class="seccion-cabecera">
     <div class="seccion-label">Análisis por criterio</div>
     <div class="seccion-referencia">Test de Libertad — ${totalCriterios} criterios · 7 categorías</div>
   </div>
   <div class="seccion-titulo-principal">
     Reporte de Auditoría Cívica Liberal: Análisis por Criterio del Test de Libertad
-  </div>` : `
-  <div class="seccion-cabecera">
-    <div class="seccion-label">Análisis por criterio (cont.)</div>
-    <div class="seccion-referencia">liberalmente.app</div>
-  </div>`;
+  </div>` : '';
 
     return `
 <div class="categoria-bloque">
