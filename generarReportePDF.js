@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker v2.2
+// generarReportePDF.js — ACL Worker v2.3
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
@@ -18,6 +18,25 @@
 //   7. Fix: si el texto de Claude no trae un porcentaje explícito, el puntaje
 //      se calcula desde los conteos reales de criterios (SI/SI_MATIZ/NO) en
 //      vez de quedar en null — eliminado el "null%" en la portada del PDF
+//
+// CAMBIOS v2.3 (6 jul 2026):
+//   8. Reordenado el documento: Portada → Ficha del Documento → Categorías
+//      (preguntas y respuestas) → Alertas. Antes la Ficha quedaba al final.
+//   9. Eliminado el <div class="pie-pagina"> repetido dentro de cada bloque
+//      de categoría, de alertas y de la ficha — en Chrome/CloudConvert este
+//      footer podía cortarse y aparecer a mitad de la página siguiente. Se
+//      conserva solo el pie de la portada (.portada-footer), que es distinto
+//      y no presentaba el problema.
+//  10. El desglose "SÍ plenos / SÍ con matiz / NO / N/A" en la portada y en
+//      la ficha ahora se omite si el parser no detectó ningún criterio
+//      individual — se deja solo el % general en vez de mostrar ceros que
+//      no reflejan la realidad del análisis.
+//  11. PROVISIONAL — regex de detección de criterio (matchCrit) ampliada
+//      para tolerar líneas que empiecen con "#", "-", ">" o la palabra
+//      "Criterio" antes del código C-XX. Pendiente de confirmar contra un
+//      reporte_texto real: si el "Total criterios" del log de diagnóstico
+//      sigue en 0 después de este cambio, hace falta ver el texto crudo
+//      para ajustar la expresión con precisión en vez de adivinar.
 
 'use strict';
 
@@ -437,7 +456,10 @@ const CSS = `
   }
   .ficha-tabla td:last-child { color: var(--text); }
 
-  /* ── PIE DE PÁGINA ── */
+  /* ── PIE DE PÁGINA ──
+     Nota v2.3: esta clase ya no se usa dentro de categorías, alertas ni
+     ficha (ver changelog #9) — se dejó definida por si se reintroduce un
+     pie de página más adelante con un mecanismo distinto. */
   .pie-pagina {
     margin-top: 28px;
     padding-top: 12px;
@@ -551,7 +573,11 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     }
 
     // ── Detectar criterio C-XX
-    const matchCrit = linea.match(/^\*{0,2}(C-\d{2})\*{0,2}[.\s:]*(.*)/);
+    // PROVISIONAL (6 jul 2026): ampliado para tolerar líneas que empiecen
+    // con "#", "-", ">" o la palabra "Criterio" antes del código — por si
+    // Sonnet 5 formatea distinto a como lo hacía el modelo anterior.
+    // Pendiente confirmar contra el texto real si el conteo sigue en 0.
+    const matchCrit = linea.match(/^[#>\-\s]*\*{0,2}(?:criterio\s+)?(C-\d{2})\*{0,2}[.\s:]*(.*)/i);
     if (matchCrit && categoriaActual) {
       // Ignorar notas metodológicas que mencionan códigos de criterio pero no son criterios
       // Ejemplo: "C-06 se computa como NO (incompatibilidad con marco constitucional vigente)"
@@ -568,7 +594,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
         bufferAnalisis = [];
       }
       const pregunta = matchCrit[2].replace(/\*\*/g, '').trim();
-      criterioActual = { id: matchCrit[1], pregunta, resultado: 'SI', analisis: '' };
+      criterioActual = { id: matchCrit[1].toUpperCase(), pregunta, resultado: 'SI', analisis: '' };
       categoriaActual.criterios.push(criterioActual);
       continue;
     }
@@ -782,7 +808,25 @@ function generarHTML(datos, metadatos) {
     generadoEl    = new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
   } = metadatos;
 
-  const totalCriterios = categorias.reduce((acc, cat) => acc + cat.criterios.length, 0) || 28;
+  // v2.3: se separa el conteo real (para saber si hay desglose que mostrar)
+  // del total con fallback a 28 (que es el que se muestra siempre en portada).
+  const criteriosParseados  = categorias.reduce((acc, cat) => acc + cat.criterios.length, 0);
+  const totalCriterios      = criteriosParseados || 28;
+  const criteriosDetectados = criteriosParseados > 0;
+
+  // v2.3: si no se detectaron criterios individuales, se omite el desglose
+  // SÍ/NO/matiz (quedarían todos en 0, lo cual es engañoso) y se deja solo
+  // el % general — tal como se pidió: mejor ocultar el detalle que mostrar
+  // un dato que no se pudo calcular con confianza.
+  const desglosePills = criteriosDetectados ? `
+          <span class="indicador-pill pill-verde">${siPlenos} SÍ plenos</span>
+          <span class="indicador-pill pill-dorado">${siMatiz} SÍ con matiz</span>
+          ${noCount > 0 ? `<span class="indicador-pill pill-rojo">${noCount} NO</span>` : ''}
+          ${naCount > 0 ? `<span class="indicador-pill pill-muted">${naCount} N/A</span>` : ''}` : '';
+
+  const desgloseFicha = criteriosDetectados
+    ? ` · ${siPlenos} SÍ plenos · ${siMatiz} SÍ con matiz · ${noCount} NO${naCount > 0 ? ` · ${naCount} N/A` : ''}`
+    : '';
 
   const resumenHTML = resumenEjecutivo
     .split(/\n{2,}/)
@@ -813,10 +857,7 @@ function generarHTML(datos, metadatos) {
         <div class="indicador-desc">${puntaje}% de alineación · ${totalCriterios} criterios evaluados</div>
         <div class="indicador-pills">
           ${pillRiesgo(nivelRiesgo)}
-          <span class="indicador-pill pill-verde">${siPlenos} SÍ plenos</span>
-          <span class="indicador-pill pill-dorado">${siMatiz} SÍ con matiz</span>
-          ${noCount > 0 ? `<span class="indicador-pill pill-rojo">${noCount} NO</span>` : ''}
-          ${naCount > 0 ? `<span class="indicador-pill pill-muted">${naCount} N/A</span>` : ''}
+          ${desglosePills}
         </div>
       </div>
     </div>
@@ -863,6 +904,9 @@ function generarHTML(datos, metadatos) {
     <div class="seccion-referencia">liberalmente.app</div>
   </div>`;
 
+    // v2.3: se eliminó el <div class="pie-pagina"> que cerraba cada bloque
+    // de categoría — en Chrome/CloudConvert podía cortarse y aparecer a
+    // mitad de la página siguiente.
     return `
 <div class="categoria-bloque">
   ${cabecera}
@@ -871,11 +915,6 @@ function generarHTML(datos, metadatos) {
     ${esc(cat.nombre)}
   </div>
   ${critHTML}
-  <div class="pie-pagina">
-    <span class="pie-logo">Liberalmente</span>
-    <span>${esc(cat.nombre)} · Test de Libertad</span>
-    <span>liberalmente.app</span>
-  </div>
 </div>`;
   }).join('\n');
 
@@ -900,6 +939,8 @@ function generarHTML(datos, metadatos) {
   </div>`;
     }).join('');
 
+    // v2.3: se eliminó el <div class="pie-pagina"> final de este bloque —
+    // mismo motivo que en las categorías.
     htmlAlertas = `
 <div class="alertas-bloque">
   <div class="seccion-cabecera">
@@ -908,14 +949,12 @@ function generarHTML(datos, metadatos) {
   </div>
   <div class="alertas-titulo">Alertas Principales</div>
   ${alertasHTML}
-  <div class="pie-pagina">
-    <span class="pie-logo">Liberalmente</span>
-    <span>${alertas.length} alerta${alertas.length !== 1 ? 's' : ''} identificada${alertas.length !== 1 ? 's' : ''}</span>
-    <span>liberalmente.app</span>
-  </div>
 </div>`;
   }
 
+  // v2.3: se eliminó el <div class="pie-pagina"> final de la ficha — mismo
+  // motivo que en categorías y alertas. También se usa desgloseFicha en vez
+  // de mostrar siempre los conteos SÍ/NO/matiz.
   const htmlFicha = `
 <div class="ficha-bloque">
   <div class="seccion-cabecera">
@@ -936,19 +975,15 @@ function generarHTML(datos, metadatos) {
     <tr>
       <td>Resultado</td>
       <td>
-        ${puntaje}% de alineación · Riesgo Liberal: ${esc(nivelRiesgo)} ·
-        ${siPlenos} SÍ plenos · ${siMatiz} SÍ con matiz · ${noCount} NO
-        ${naCount > 0 ? ` · ${naCount} N/A` : ''}
+        ${puntaje}% de alineación · Riesgo Liberal: ${esc(nivelRiesgo)}${desgloseFicha}
       </td>
     </tr>
   </table>
-  <div class="pie-pagina" style="margin-top:40px;">
-    <span class="pie-logo">Liberalmente</span>
-    <span>CEDICE / Fundación Friedrich Naumann · Auditoría Cívica Liberal para la Transición Democrática</span>
-    <span>liberalmente.app</span>
-  </div>
 </div>`;
 
+  // v2.3: orden del documento — Portada → Ficha → Categorías → Alertas.
+  // Antes la Ficha quedaba al final; ahora va justo después de la portada,
+  // como se pidió.
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -959,9 +994,9 @@ function generarHTML(datos, metadatos) {
 </head>
 <body>
 ${htmlPortada}
+${htmlFicha}
 ${htmlCategorias}
 ${htmlAlertas}
-${htmlFicha}
 </body>
 </html>`;
 }
@@ -1087,7 +1122,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // ── Función principal exportada ──────────────────────────────────────────────
 
 async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.2`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.3`);
 
   console.log(`   [${auditoria_id}] Paso 1: Parseando reporte...`);
   const datos = parsearReporte(reporteTexto, auditoria_id);
