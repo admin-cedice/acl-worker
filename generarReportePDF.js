@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker v2.3
+// generarReportePDF.js — ACL Worker v2.5
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
@@ -8,35 +8,47 @@
 //   3. Nueva arquitectura CSS: sin .pagina rígido, flujo natural Chrome + @page
 //
 // CAMBIOS v2.1 (15 jun 2026):
-//   4. Fix parser: notas metodológicas (ej. "C-06 se computa como NO...") ya no
-//      se parsean como criterios falsos — eliminado el "criterio 29 fantasma"
-//   5. Fix CSS: break-before: page (propiedad moderna) en lugar de
-//      page-break-before: always — elimina páginas en blanco entre categorías
+//   4. Fix parser: notas metodológicas ya no se parsean como criterios falsos
+//   5. Fix CSS: break-before: page en lugar de page-break-before: always
 //   6. orphans/widows: 3 en body para que Chrome no deje líneas sueltas
 //
 // CAMBIOS v2.2 (3 jul 2026):
-//   7. Fix: si el texto de Claude no trae un porcentaje explícito, el puntaje
-//      se calcula desde los conteos reales de criterios (SI/SI_MATIZ/NO) en
-//      vez de quedar en null — eliminado el "null%" en la portada del PDF
+//   7. Fix: puntaje se calcula desde conteos reales si no hay % explícito
 //
 // CAMBIOS v2.3 (6 jul 2026):
-//   8. Reordenado el documento: Portada → Ficha del Documento → Categorías
-//      (preguntas y respuestas) → Alertas. Antes la Ficha quedaba al final.
-//   9. Eliminado el <div class="pie-pagina"> repetido dentro de cada bloque
-//      de categoría, de alertas y de la ficha — en Chrome/CloudConvert este
-//      footer podía cortarse y aparecer a mitad de la página siguiente. Se
-//      conserva solo el pie de la portada (.portada-footer), que es distinto
-//      y no presentaba el problema.
-//  10. El desglose "SÍ plenos / SÍ con matiz / NO / N/A" en la portada y en
-//      la ficha ahora se omite si el parser no detectó ningún criterio
-//      individual — se deja solo el % general en vez de mostrar ceros que
-//      no reflejan la realidad del análisis.
-//  11. PROVISIONAL — regex de detección de criterio (matchCrit) ampliada
-//      para tolerar líneas que empiecen con "#", "-", ">" o la palabra
-//      "Criterio" antes del código C-XX. Pendiente de confirmar contra un
-//      reporte_texto real: si el "Total criterios" del log de diagnóstico
-//      sigue en 0 después de este cambio, hace falta ver el texto crudo
-//      para ajustar la expresión con precisión en vez de adivinar.
+//   8. Reordenado: Portada → Ficha → Categorías → Alertas
+//   9. Eliminado el pie de página repetido que se cortaba entre páginas
+//  10. Desglose SÍ/NO se omite si no se detectaron criterios
+//  11. Regex de criterio ampliada (provisional, sin confirmar aún)
+//
+// CAMBIOS v2.4 (7 jul 2026):
+//  12. Resumen Ejecutivo movido a su propia sección con margen normal —
+//      soluciona el bug de márgenes entre la página de portada y la
+//      siguiente cuando el resumen se desbordaba.
+//  13. Reemplazado el "Indicador General" (39% + píldoras) por 3-5 puntos
+//      clave generados por Claude junto con el resumen.
+//  14. Limpieza de CSS/JS ya no usado del indicador eliminado.
+//  15. La regex provisional de v2.3 quedó sin confirmar contra texto real.
+//
+// CAMBIOS v2.5 (7 jul 2026) — CONFIRMADO CON TEXTO REAL:
+//  16. CAUSA RAÍZ ENCONTRADA del contenido faltante: Claude (Sonnet 5) está
+//      escribiendo los 28 criterios como una TABLA MARKDOWN —
+//      "| C-01 | **NO** | justificación... |" — no como bloques de texto
+//      con el código al inicio de la línea, que es lo único que el parser
+//      sabía leer hasta ahora. No era un problema de detalles de formato
+//      (guiones, numerales, etc.) sino un cambio de estructura completo.
+//  17. Agregado un detector específico de filas de tabla (matchCritTabla),
+//      revisado ANTES que el formato de texto anterior. Extrae en una sola
+//      línea: código del criterio, resultado y justificación. El formato
+//      de texto anterior (matchCrit) se conserva intacto como respaldo por
+//      si algún reporte viene en ese estilo.
+//  18. LIMITACIÓN CONOCIDA: la tabla no repite el enunciado de la pregunta
+//      de cada criterio (solo código + resultado + justificación), así que
+//      el campo `pregunta` queda vacío para los criterios detectados por
+//      esta vía. Si se quiere mostrar la pregunta también, hay que pedirle
+//      a Claude que la incluya — eso se resuelve editando el prompt de
+//      análisis (configuracion_doctrinal.prompt_analisis), no en este
+//      archivo. Pendiente de decisión, no bloqueante.
 
 'use strict';
 
@@ -66,18 +78,6 @@ function badgeResultado(resultado) {
   return `<span class="criterio-resultado na">— N/A</span>`;
 }
 
-function pillRiesgo(nivel) {
-  const mapa = {
-    'BAJO':     { bg: '#1A6B3C', texto: 'Riesgo: BAJO' },
-    'MODERADO': { bg: '#B8860B', texto: 'Riesgo: MODERADO' },
-    'ALTO':     { bg: '#C41230', texto: 'Riesgo: ALTO' },
-    'MUY ALTO': { bg: '#8B0000', texto: 'Riesgo: MUY ALTO' },
-  };
-  const n = (nivel || '').toUpperCase();
-  const p = mapa[n] || mapa['MODERADO'];
-  return `<span class="indicador-pill pill-riesgo" style="background:${p.bg}">${esc(p.texto)}</span>`;
-}
-
 function colorAlerta(gravedad) {
   const g = (gravedad || '').toUpperCase();
   if (g === 'ALTA')                   return { fondo: '#FEF0F0', borde: '#EDAAAA', badge: '#C41230' };
@@ -85,10 +85,18 @@ function colorAlerta(gravedad) {
   return                                     { fondo: '#E8F0F7', borde: '#B5CDE0', badge: '#2A6496' };
 }
 
+// v2.5: normaliza el texto de la celda "Resultado" de la tabla (ej. "**NO**",
+// "SÍ", "SÍ (con reserva)", "N/A") a los códigos internos SI/SI_MATIZ/NO/NA.
+function normalizarResultadoTabla(texto) {
+  const t = (texto || '').toUpperCase().trim();
+  if (/CON RESERVA|CON MATIZ|PARCIAL|MIXTO/.test(t)) return 'SI_MATIZ';
+  if (/^NO\b/.test(t))       return 'NO';
+  if (/^N\/A|^NA\b/.test(t)) return 'NA';
+  if (/^S[IÍ]\b/.test(t))    return 'SI';
+  return 'SI';
+}
+
 // ── CSS del reporte ──────────────────────────────────────────────────────────
-// ARQUITECTURA v2: sin .pagina de height fija.
-// Chrome corta el flujo naturalmente; usamos señales semánticas para guiarlo.
-// @page define márgenes, tamaño y pie automático via margin boxes.
 
 const CSS = `
   /* ── PÁGINA ── */
@@ -97,7 +105,10 @@ const CSS = `
     margin: 18mm 18mm 22mm 18mm;
   }
 
-  /* La portada ocupa toda su página */
+  /* La portada ocupa toda su página. Solo contiene título, subtítulo y
+     puntos clave — contenido corto y acotado que siempre cabe en una
+     página, por lo que este margen cero nunca se desborda a una segunda
+     página (ver changelog v2.4 #12). */
   @page portada {
     margin: 0;
   }
@@ -135,9 +146,6 @@ const CSS = `
     widows: 3;
   }
 
-  /* ═══════════════════════════════════════════════════════════
-     PORTADA — página propia con margin 0
-  ═══════════════════════════════════════════════════════════ */
   .portada {
     page: portada;
     break-after: page;
@@ -193,72 +201,32 @@ const CSS = `
     font-style: italic; font-family: var(--serif); margin-bottom: 36px;
   }
 
-  /* ── INDICADOR GENERAL ── */
-  .indicador-bloque {
-    background: white;
-    border: 1px solid var(--border);
-    border-left: 4px solid var(--green);
-    border-radius: 2px;
-    padding: 20px 26px;
-    margin-bottom: 22px;
-    display: flex;
-    align-items: center;
-    gap: 26px;
+  .puntos-clave {
+    list-style: none;
+    margin: 0 0 28px 0;
+    padding: 0;
   }
 
-  .indicador-puntaje {
-    font-family: var(--serif);
-    font-size: 50px; font-weight: 700;
-    color: var(--green); line-height: 1; flex-shrink: 0;
+  .puntos-clave li {
+    position: relative;
+    padding-left: 20px;
+    margin-bottom: 10px;
+    font-size: 13px;
+    color: var(--text-mid);
+    line-height: 1.55;
+    font-weight: 400;
   }
 
-  .indicador-texto-wrap { flex: 1; }
-
-  .indicador-etiqueta {
-    font-size: 10px; font-weight: 600;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--text-muted); margin-bottom: 4px;
+  .puntos-clave li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 7px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
   }
-
-  .indicador-desc {
-    font-family: var(--serif);
-    font-size: 17px; font-weight: 600;
-    color: var(--text); line-height: 1.3; margin-bottom: 10px;
-  }
-
-  .indicador-pills { display: flex; gap: 8px; flex-wrap: wrap; }
-
-  .indicador-pill {
-    font-size: 11px; font-weight: 600;
-    padding: 3px 10px; border-radius: 2px; letter-spacing: 0.03em;
-  }
-  .pill-riesgo { color: white; }
-  .pill-verde  { background: var(--green-soft); color: var(--green); border: 1px solid #A8D5BA; }
-  .pill-dorado { background: var(--gold-soft); color: var(--gold); border: 1px solid #D4C080; }
-  .pill-muted  { background: var(--bg); color: var(--text-muted); border: 1px solid var(--border); }
-  .pill-rojo   { background: #FEF0F0; color: var(--accent); border: 1px solid #EDAAAA; }
-
-  /* ── RESUMEN EJECUTIVO ── */
-  .resumen-ejecutivo {
-    border-top: 2px solid var(--accent);
-    padding-top: 18px;
-    margin-bottom: 0;
-    flex: 1;
-  }
-
-  .resumen-titulo {
-    font-size: 10px; font-weight: 700;
-    letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--accent); margin-bottom: 12px;
-  }
-
-  .resumen-texto {
-    font-size: 12.5px; color: var(--text-mid);
-    line-height: 1.8; font-weight: 300;
-  }
-
-  .resumen-texto p { margin-bottom: 10px; }
-  .resumen-texto p:last-child { margin-bottom: 0; }
 
   .portada-footer {
     padding: 18px 52px;
@@ -273,10 +241,6 @@ const CSS = `
   .portada-footer-texto {
     font-size: 10px; color: var(--text-muted); line-height: 1.5;
   }
-
-  /* ═══════════════════════════════════════════════════════════
-     CUERPO DEL REPORTE — flujo natural, Chrome decide los cortes
-  ═══════════════════════════════════════════════════════════ */
 
   .seccion-cabecera {
     display: flex;
@@ -308,7 +272,18 @@ const CSS = `
     page-break-after: avoid;
   }
 
-  /* ── CATEGORÍAS ── */
+  .resumen-bloque {
+    break-before: page;
+  }
+
+  .resumen-texto {
+    font-size: 12.5px; color: var(--text-mid);
+    line-height: 1.8; font-weight: 300;
+  }
+
+  .resumen-texto p { margin-bottom: 10px; }
+  .resumen-texto p:last-child { margin-bottom: 0; }
+
   .categoria-bloque {
     break-before: page;
   }
@@ -332,7 +307,6 @@ const CSS = `
     flex-shrink: 0;
   }
 
-  /* ── CRITERIOS ── */
   .criterio {
     padding: 14px 0;
     border-bottom: 1px solid var(--border-subtle);
@@ -378,7 +352,6 @@ const CSS = `
     line-height: 1.65; font-weight: 300;
   }
 
-  /* ── ALERTAS ── */
   .alertas-bloque {
     break-before: page;
   }
@@ -440,7 +413,6 @@ const CSS = `
     border: 1px solid var(--border); letter-spacing: 0.04em;
   }
 
-  /* ── FICHA FINAL ── */
   .ficha-bloque {
     break-before: page;
   }
@@ -456,10 +428,6 @@ const CSS = `
   }
   .ficha-tabla td:last-child { color: var(--text); }
 
-  /* ── PIE DE PÁGINA ──
-     Nota v2.3: esta clase ya no se usa dentro de categorías, alertas ni
-     ficha (ver changelog #9) — se dejó definida por si se reintroduce un
-     pie de página más adelante con un mecanismo distinto. */
   .pie-pagina {
     margin-top: 28px;
     padding-top: 12px;
@@ -489,14 +457,14 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     siMatiz:     0,
     noCount:     0,
     naCount:     0,
-    resumenEjecutivo: '',   // se rellena por Claude más adelante
+    resumenEjecutivo: '',
+    puntosClave: [],
     categorias:  [],
     alertas:     [],
   };
 
   const lineas = reporteTexto.split('\n');
 
-  // ── 1. Extraer puntaje (si el texto trae uno explícito) ────────────────────
   for (const linea of lineas) {
     const matchPct = linea.match(/([\d.]+)%/);
     if (matchPct && !datos.puntaje) {
@@ -505,11 +473,9 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     }
   }
 
-  // ── 2. Extraer nivel de riesgo ─────────────────────────────────────────────
   const matchRiesgo = reporteTexto.match(/NIVEL DE RIESGO LIBERAL[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO)/i);
   if (matchRiesgo) datos.nivelRiesgo = matchRiesgo[1].toUpperCase();
 
-  // ── 3. Parsear categorías y criterios ─────────────────────────────────────
   const CATEGORIAS_NOMBRES = {
     'I':   'Dignidad y Autonomía Individual',
     'II':  'Estado de Derecho e Instituciones',
@@ -530,7 +496,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   for (let i = 0; i < lineas.length; i++) {
     const linea = lineas[i];
 
-    // ── Detectar sección de alertas
     if (/^#{1,4}\s*\d+\.\s*ALERTAS?|^##\s*ALERTAS|ALERTAS? PRINCIPALES/i.test(linea)) {
       enAlertas = true;
       if (criterioActual) {
@@ -544,7 +509,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       continue;
     }
 
-    // ── Ignorar sección conclusión/resumen (Claude la genera externamente)
     if (/conclusi[oó]n|resumen ejecutivo|valoraci[oó]n final/i.test(linea) && linea.startsWith('#')) {
       if (criterioActual) {
         criterioActual.analisis = bufferAnalisis.join(' ').trim();
@@ -554,8 +518,9 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       continue;
     }
 
-    // ── Detectar categoría
-    const matchCat = linea.match(/^#{1,4}\s*CATEGOR[IÍ]A\s+(I{1,3}V?|VI{0,3}|IV)\s*[—–-]+\s*(.*)/i);
+    // ── Detectar categoría (con o sin "#" delante, la muestra real trae
+    // tanto "CATEGORÍA I —" sin almohadilla como "### CATEGORÍA II —")
+    const matchCat = linea.match(/^#{0,4}\s*CATEGOR[IÍ]A\s+(I{1,3}V?|VI{0,3}|IV)\s*[—–-]+\s*(.*)/i);
     if (matchCat) {
       if (criterioActual) {
         criterioActual.analisis = bufferAnalisis.join(' ').trim();
@@ -572,15 +537,24 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       continue;
     }
 
-    // ── Detectar criterio C-XX
-    // PROVISIONAL (6 jul 2026): ampliado para tolerar líneas que empiecen
-    // con "#", "-", ">" o la palabra "Criterio" antes del código — por si
-    // Sonnet 5 formatea distinto a como lo hacía el modelo anterior.
-    // Pendiente confirmar contra el texto real si el conteo sigue en 0.
+    // ── v2.5: Detectar criterio en formato de TABLA MARKDOWN (Sonnet 5) ──────
+    // Ejemplo real: "| C-01 | **NO** | El decreto se inserta en un aparato..."
+    // Se revisa ANTES que el formato de texto (matchCrit, más abajo).
+    const matchCritTabla = linea.match(/^\|\s*(C-\d{2})\s*\|\s*\*{0,2}([^|*]+?)\*{0,2}\s*\|\s*(.+?)\s*\|?\s*$/i);
+    if (matchCritTabla && categoriaActual) {
+      categoriaActual.criterios.push({
+        id:        matchCritTabla[1].toUpperCase(),
+        pregunta:  '', // este formato no repite el enunciado — ver changelog #18
+        resultado: normalizarResultadoTabla(matchCritTabla[2]),
+        analisis:  matchCritTabla[3].replace(/\*\*/g, '').trim(),
+      });
+      criterioActual = null;
+      continue;
+    }
+
+    // ── Detectar criterio en formato de TEXTO (formato anterior, respaldo)
     const matchCrit = linea.match(/^[#>\-\s]*\*{0,2}(?:criterio\s+)?(C-\d{2})\*{0,2}[.\s:]*(.*)/i);
     if (matchCrit && categoriaActual) {
-      // Ignorar notas metodológicas que mencionan códigos de criterio pero no son criterios
-      // Ejemplo: "C-06 se computa como NO (incompatibilidad con marco constitucional vigente)"
       const esNotaMetodologica = /se computa|se compute|computa como|por tanto|N\/A aplicado|los criterios con|se pondera/i.test(linea);
       if (esNotaMetodologica) {
         if (criterioActual) {
@@ -599,7 +573,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       continue;
     }
 
-    // ── Detectar resultado dentro de criterio activo
     if (criterioActual) {
       const matchResultadoB = linea.match(/RESULTADO[:\s*:]+([^\n*]+)/i);
       if (matchResultadoB) {
@@ -624,7 +597,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       continue;
     }
 
-    // ── Alertas
     if (enAlertas) {
       const matchAlerta = linea.match(/^#{1,4}\s*ALERTA\s*\d+[^:]*[:\s]*(.*)/i);
       if (matchAlerta) {
@@ -655,18 +627,15 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     }
   }
 
-  // Volcar buffers finales
   if (criterioActual && bufferAnalisis.length > 0) criterioActual.analisis = bufferAnalisis.join(' ').trim();
   if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); }
 
-  // ── Conteos reales desde criterios parseados ───────────────────────────────
   const todos = datos.categorias.flatMap(c => c.criterios);
   const siPlenosReal = todos.filter(c => c.resultado === 'SI').length;
   const siMatizReal  = todos.filter(c => c.resultado === 'SI_MATIZ').length;
   const noReal       = todos.filter(c => c.resultado === 'NO').length;
   const naReal       = todos.filter(c => c.resultado === 'NA').length;
 
-  // ── LOG DE DIAGNÓSTICO ────────────────────────────────────────────────────
   console.log(`\n   ╔══════════════════════════════════════════════════`);
   console.log(`   ║ DIAGNÓSTICO PARSER [${auditoria_id}]`);
   console.log(`   ╠══════════════════════════════════════════════════`);
@@ -687,7 +656,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   }
   console.log(`   ╚══════════════════════════════════════════════════\n`);
 
-  // Sobreescribir con conteos reales si tenemos criterios
   if (siPlenosReal + siMatizReal + noReal > 0) {
     datos.siPlenos = siPlenosReal;
     datos.siMatiz  = siMatizReal;
@@ -695,12 +663,8 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     datos.naCount  = naReal;
   }
 
-  // ── FIX v2.2: fallback de puntaje calculado desde conteos reales ───────────
-  // Si Claude no incluyó un "%" explícito en el texto (o el regex no lo detectó),
-  // se calcula directamente desde los criterios ya parseados — más confiable
-  // que depender de que el formato de texto libre lo mencione.
   if (datos.puntaje === null) {
-    const aplicables = datos.siPlenos + datos.siMatiz + datos.noCount; // N/A no cuenta como aplicable
+    const aplicables = datos.siPlenos + datos.siMatiz + datos.noCount;
     if (aplicables > 0) {
       datos.puntaje = Math.round(((datos.siPlenos + datos.siMatiz) / aplicables) * 100);
       console.log(`   [parsearReporte] Puntaje calculado desde conteos reales: ${datos.puntaje}%`);
@@ -713,7 +677,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   return datos;
 }
 
-// ── Generar resumen ejecutivo con Claude ─────────────────────────────────────
+// ── Generar resumen ejecutivo + puntos clave con Claude ──────────────────────
 
 async function generarResumenEjecutivo(reporteTexto, datos, metadatos) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -722,7 +686,7 @@ async function generarResumenEjecutivo(reporteTexto, datos, metadatos) {
   const totalCriterios = datos.categorias.reduce((acc, c) => acc + c.criterios.length, 0);
   const { titulo, pais, fecha } = metadatos;
 
-  const prompt = `Eres el redactor institucional de la plataforma Auditoría Cívica Liberal (liberalmente.app), operada por CEDICE y la Fundación Friedrich Naumann. Tu tarea es escribir el RESUMEN EJECUTIVO del reporte de auditoría de un documento jurídico o de política pública venezolana/latinoamericana.
+  const prompt = `Eres el redactor institucional de la plataforma Auditoría Cívica Liberal (liberalmente.app), operada por CEDICE y la Fundación Friedrich Naumann. Tu tarea es escribir el RESUMEN EJECUTIVO y los PUNTOS CLAVE del reporte de auditoría de un documento jurídico o de política pública venezolana/latinoamericana.
 
 DATOS DEL ANÁLISIS:
 - Documento auditado: ${titulo}${pais ? ` (${pais})` : ''}${fecha ? `, ${fecha}` : ''}
@@ -735,36 +699,48 @@ REPORTE COMPLETO (del cual debes extraer las ideas más importantes):
 ${reporteTexto.slice(0, 6000)}
 
 INSTRUCCIONES:
-Escribe un resumen ejecutivo de 3 párrafos. Cada párrafo separado por doble salto de línea. Sin títulos ni viñetas. Sin asteriscos ni markdown.
+Responde ÚNICAMENTE con un JSON válido, sin backticks, sin texto antes ni después, con esta forma exacta:
 
-Párrafo 1 (2-3 oraciones): Qué es el documento, su alcance y contexto político-jurídico.
-Párrafo 2 (3-4 oraciones): Qué encontró el análisis — fortalezas liberales, debilidades y las alertas más graves con criterios específicos.
-Párrafo 3 (2-3 oraciones): Valoración final del riesgo liberal y recomendación al ciudadano.
+{
+  "puntos_clave": ["frase 1", "frase 2", "frase 3", "frase 4", "frase 5"],
+  "resumen": "párrafo 1\\n\\npárrafo 2\\n\\npárrafo 3"
+}
+
+"puntos_clave": entre 3 y 5 frases muy breves (máximo 14 palabras cada una), sin numeración ni viñetas dentro del texto, pensadas para alguien que solo va a leer eso antes de decidir si sigue leyendo. Cada una debe aportar un dato o hallazgo distinto.
+
+"resumen": 3 párrafos separados por doble salto de línea (\\n\\n dentro del JSON), sin títulos ni viñetas, sin asteriscos ni markdown.
+Párrafo 1 (2-3 oraciones): qué es el documento, su alcance y contexto político-jurídico.
+Párrafo 2 (3-4 oraciones): qué encontró el análisis — fortalezas liberales, debilidades y las alertas más graves con criterios específicos.
+Párrafo 3 (2-3 oraciones): valoración final del riesgo liberal y recomendación al ciudadano.
 
 Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con el poder. Lenguaje propio del liberalismo clásico (propiedad privada, Estado de derecho, separación de poderes, subsidiariedad).`;
 
   try {
     const response = await anthropic.messages.create({
       model:      'claude-sonnet-5',
-      // max_tokens subido de 600 a 1200 (3 jul 2026): mismo motivo que en
-      // analizarConClaude — tokenizador nuevo (+30%) y pensamiento adaptativo
-      // comparten este presupuesto. El resumen ya venía generando 2000+
-      // caracteres, cerca del límite anterior incluso sin estos cambios.
       max_tokens: 1200,
       messages:   [{ role: 'user', content: prompt }],
     });
 
-    const texto = response.content
+    const textoRespuesta = response.content
       .filter(b => b.type === 'text')
       .map(b => b.text)
       .join('')
       .trim();
 
-    console.log(`   [generarResumenEjecutivo] Resumen generado (${texto.length} chars)`);
-    return texto;
+    const limpio = textoRespuesta.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(limpio);
+
+    const puntosClave = Array.isArray(parsed.puntos_clave)
+      ? parsed.puntos_clave.filter(Boolean).slice(0, 5)
+      : [];
+    const resumen = typeof parsed.resumen === 'string' ? parsed.resumen : '';
+
+    console.log(`   [generarResumenEjecutivo] Resumen generado (${resumen.length} chars) · ${puntosClave.length} puntos clave`);
+    return { puntosClave, resumen };
 
   } catch (err) {
-    console.error(`   [generarResumenEjecutivo] Error llamando a Claude:`, err.message);
+    console.error(`   [generarResumenEjecutivo] Error llamando a Claude o parseando JSON:`, err.message);
     const totalSI    = siPlenos + siMatiz;
     const aplicables = siPlenos + siMatiz + noCount;
     let resumen = `El documento obtuvo un ${puntaje}% de alineación con los criterios del liberalismo clásico. `;
@@ -773,7 +749,7 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
     if (naCount > 0) resumen += `, ${naCount} N/A`;
     resumen += `. Nivel de riesgo liberal: ${nivelRiesgo}.`;
     if (alertas.length > 0) resumen += ` Alerta principal: ${alertas[0].titulo}.`;
-    return resumen;
+    return { puntosClave: [], resumen };
   }
 }
 
@@ -788,14 +764,11 @@ function generarHTML(datos, metadatos) {
     noCount          = 0,
     naCount          = 0,
     resumenEjecutivo = '',
+    puntosClave      = [],
     categorias       = [],
     alertas          = [],
   } = datos;
 
-  // Nota: usar ?? en vez de un valor por defecto en la destructuración, porque
-  // el default de destructuring NO cubre el caso `null` (solo `undefined`).
-  // parsearReporte ya debería garantizar que puntaje nunca sea null, pero esto
-  // es una segunda barrera de seguridad para la portada.
   const puntaje = puntajeRaw ?? 0;
 
   const {
@@ -808,24 +781,16 @@ function generarHTML(datos, metadatos) {
     generadoEl    = new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
   } = metadatos;
 
-  // v2.3: se separa el conteo real (para saber si hay desglose que mostrar)
-  // del total con fallback a 28 (que es el que se muestra siempre en portada).
   const criteriosParseados  = categorias.reduce((acc, cat) => acc + cat.criterios.length, 0);
   const totalCriterios      = criteriosParseados || 28;
   const criteriosDetectados = criteriosParseados > 0;
 
-  // v2.3: si no se detectaron criterios individuales, se omite el desglose
-  // SÍ/NO/matiz (quedarían todos en 0, lo cual es engañoso) y se deja solo
-  // el % general — tal como se pidió: mejor ocultar el detalle que mostrar
-  // un dato que no se pudo calcular con confianza.
-  const desglosePills = criteriosDetectados ? `
-          <span class="indicador-pill pill-verde">${siPlenos} SÍ plenos</span>
-          <span class="indicador-pill pill-dorado">${siMatiz} SÍ con matiz</span>
-          ${noCount > 0 ? `<span class="indicador-pill pill-rojo">${noCount} NO</span>` : ''}
-          ${naCount > 0 ? `<span class="indicador-pill pill-muted">${naCount} N/A</span>` : ''}` : '';
-
   const desgloseFicha = criteriosDetectados
     ? ` · ${siPlenos} SÍ plenos · ${siMatiz} SÍ con matiz · ${noCount} NO${naCount > 0 ? ` · ${naCount} N/A` : ''}`
+    : '';
+
+  const puntosClaveHTML = (puntosClave && puntosClave.length > 0)
+    ? `<ul class="puntos-clave">${puntosClave.map(p => `<li>${esc(p)}</li>`).join('')}</ul>`
     : '';
 
   const resumenHTML = resumenEjecutivo
@@ -849,25 +814,7 @@ function generarHTML(datos, metadatos) {
     <div class="portada-etiqueta">Reporte de Auditoría · Test de Libertad</div>
     <h1 class="portada-titulo">${esc(titulo)}</h1>
     <div class="portada-subtitulo">${esc(subtitulo || [pais, fecha].filter(Boolean).join(' · '))}</div>
-
-    <div class="indicador-bloque">
-      <div class="indicador-puntaje">${puntaje}%</div>
-      <div class="indicador-texto-wrap">
-        <div class="indicador-etiqueta">Indicador General de Alineación Liberal</div>
-        <div class="indicador-desc">${puntaje}% de alineación · ${totalCriterios} criterios evaluados</div>
-        <div class="indicador-pills">
-          ${pillRiesgo(nivelRiesgo)}
-          ${desglosePills}
-        </div>
-      </div>
-    </div>
-
-    <div class="resumen-ejecutivo">
-      <div class="resumen-titulo">Resumen ejecutivo</div>
-      <div class="resumen-texto">
-        ${resumenHTML || '<p>Ver análisis completo en las páginas siguientes.</p>'}
-      </div>
-    </div>
+    ${puntosClaveHTML}
   </div>
   <div class="portada-footer">
     <div class="portada-footer-texto">
@@ -877,6 +824,18 @@ function generarHTML(datos, metadatos) {
     <div class="portada-footer-texto" style="text-align:right;">
       Generado el ${esc(generadoEl)}
     </div>
+  </div>
+</div>`;
+
+  const htmlResumen = `
+<div class="resumen-bloque">
+  <div class="seccion-cabecera">
+    <div class="seccion-label">Resumen ejecutivo</div>
+    <div class="seccion-referencia">liberalmente.app</div>
+  </div>
+  <div class="seccion-titulo-principal">Resumen Ejecutivo</div>
+  <div class="resumen-texto">
+    ${resumenHTML || '<p>Ver análisis completo en las páginas siguientes.</p>'}
   </div>
 </div>`;
 
@@ -904,9 +863,6 @@ function generarHTML(datos, metadatos) {
     <div class="seccion-referencia">liberalmente.app</div>
   </div>`;
 
-    // v2.3: se eliminó el <div class="pie-pagina"> que cerraba cada bloque
-    // de categoría — en Chrome/CloudConvert podía cortarse y aparecer a
-    // mitad de la página siguiente.
     return `
 <div class="categoria-bloque">
   ${cabecera}
@@ -939,8 +895,6 @@ function generarHTML(datos, metadatos) {
   </div>`;
     }).join('');
 
-    // v2.3: se eliminó el <div class="pie-pagina"> final de este bloque —
-    // mismo motivo que en las categorías.
     htmlAlertas = `
 <div class="alertas-bloque">
   <div class="seccion-cabecera">
@@ -952,9 +906,6 @@ function generarHTML(datos, metadatos) {
 </div>`;
   }
 
-  // v2.3: se eliminó el <div class="pie-pagina"> final de la ficha — mismo
-  // motivo que en categorías y alertas. También se usa desgloseFicha en vez
-  // de mostrar siempre los conteos SÍ/NO/matiz.
   const htmlFicha = `
 <div class="ficha-bloque">
   <div class="seccion-cabecera">
@@ -981,9 +932,6 @@ function generarHTML(datos, metadatos) {
   </table>
 </div>`;
 
-  // v2.3: orden del documento — Portada → Ficha → Categorías → Alertas.
-  // Antes la Ficha quedaba al final; ahora va justo después de la portada,
-  // como se pidió.
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -994,6 +942,7 @@ function generarHTML(datos, metadatos) {
 </head>
 <body>
 ${htmlPortada}
+${htmlResumen}
 ${htmlFicha}
 ${htmlCategorias}
 ${htmlAlertas}
@@ -1122,18 +1071,15 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // ── Función principal exportada ──────────────────────────────────────────────
 
 async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.3`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.5`);
 
   console.log(`   [${auditoria_id}] Paso 1: Parseando reporte...`);
   const datos = parsearReporte(reporteTexto, auditoria_id);
 
-  if (datos.categorias.length === 0) {
-    console.log(`   [${auditoria_id}] ⚠️  Sin categorías — usando texto plano`);
-    datos.resumenEjecutivo = reporteTexto.slice(0, 1200).replace(/\n+/g, ' ').trim();
-  }
-
-  console.log(`   [${auditoria_id}] Paso 2: Generando resumen ejecutivo con Claude...`);
-  datos.resumenEjecutivo = await generarResumenEjecutivo(reporteTexto, datos, metadatos);
+  console.log(`   [${auditoria_id}] Paso 2: Generando resumen ejecutivo y puntos clave con Claude...`);
+  const { puntosClave, resumen } = await generarResumenEjecutivo(reporteTexto, datos, metadatos);
+  datos.resumenEjecutivo = resumen;
+  datos.puntosClave      = puntosClave;
 
   console.log(`   [${auditoria_id}] Paso 3: Generando HTML...`);
   const html     = generarHTML(datos, metadatos);
