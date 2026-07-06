@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker v2.5
+// generarReportePDF.js — ACL Worker v2.6
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
@@ -19,36 +19,47 @@
 //   8. Reordenado: Portada → Ficha → Categorías → Alertas
 //   9. Eliminado el pie de página repetido que se cortaba entre páginas
 //  10. Desglose SÍ/NO se omite si no se detectaron criterios
-//  11. Regex de criterio ampliada (provisional, sin confirmar aún)
 //
 // CAMBIOS v2.4 (7 jul 2026):
-//  12. Resumen Ejecutivo movido a su propia sección con margen normal —
-//      soluciona el bug de márgenes entre la página de portada y la
-//      siguiente cuando el resumen se desbordaba.
-//  13. Reemplazado el "Indicador General" (39% + píldoras) por 3-5 puntos
-//      clave generados por Claude junto con el resumen.
-//  14. Limpieza de CSS/JS ya no usado del indicador eliminado.
-//  15. La regex provisional de v2.3 quedó sin confirmar contra texto real.
+//  11. Resumen Ejecutivo movido a su propia sección con margen normal
+//  12. Reemplazado el "Indicador General" por puntos clave generados por Claude
 //
-// CAMBIOS v2.5 (7 jul 2026) — CONFIRMADO CON TEXTO REAL:
-//  16. CAUSA RAÍZ ENCONTRADA del contenido faltante: Claude (Sonnet 5) está
-//      escribiendo los 28 criterios como una TABLA MARKDOWN —
-//      "| C-01 | **NO** | justificación... |" — no como bloques de texto
-//      con el código al inicio de la línea, que es lo único que el parser
-//      sabía leer hasta ahora. No era un problema de detalles de formato
-//      (guiones, numerales, etc.) sino un cambio de estructura completo.
-//  17. Agregado un detector específico de filas de tabla (matchCritTabla),
-//      revisado ANTES que el formato de texto anterior. Extrae en una sola
-//      línea: código del criterio, resultado y justificación. El formato
-//      de texto anterior (matchCrit) se conserva intacto como respaldo por
-//      si algún reporte viene en ese estilo.
-//  18. LIMITACIÓN CONOCIDA: la tabla no repite el enunciado de la pregunta
-//      de cada criterio (solo código + resultado + justificación), así que
-//      el campo `pregunta` queda vacío para los criterios detectados por
-//      esta vía. Si se quiere mostrar la pregunta también, hay que pedirle
-//      a Claude que la incluya — eso se resuelve editando el prompt de
-//      análisis (configuracion_doctrinal.prompt_analisis), no en este
-//      archivo. Pendiente de decisión, no bloqueante.
+// CAMBIOS v2.5 (7 jul 2026):
+//  13. Detección de criterios en formato de TABLA MARKDOWN (causa raíz real
+//      del contenido faltante — Sonnet 5 escribe los criterios en tabla)
+//  14. Detección de categoría con "#" opcional (la primera venía sin "#")
+//
+// CAMBIOS v2.5.1-v2.5.2 (aplicados manualmente por Moisés, incorporados aquí):
+//  15. .categoria-bloque ya NO fuerza salto de página — las categorías
+//      fluyen continuas entre sí.
+//  16. Eliminado el encabezado "Análisis por criterio (cont.)" que aparecía
+//      repetido en cada categoría a partir de la segunda.
+//
+// CAMBIOS v2.6 (7 jul 2026):
+//  17. Header de portada: "CEDICE / Friedrich Naumann" → "CEDICE / Fundación
+//      Friedrich Naumann".
+//  18. La etiqueta "Reporte de Auditoría · Test de Libertad" ahora incluye
+//      la fecha de generación (antes solo vivía en el pie de portada, que
+//      se eliminó en este mismo cambio — ver #19).
+//  19. Eliminado el pie de portada completo (el bloque que decía "Auditoría
+//      Cívica Liberal para la Transición Democrática... Generado el...").
+//  20. Fondo crema de borde a borde en TODAS las páginas: el color ahora se
+//      pinta también en `html` (no solo en `body`), porque Chrome respeta
+//      el margen de @page para el fondo de body, pero SÍ extiende el fondo
+//      de html hasta el borde físico de la hoja — así los márgenes dejan
+//      de verse en blanco. Los márgenes de @page NO se tocaron (seguían
+//      siendo necesarios para que el contenido multi-página tenga espacio
+//      consistente en cada página — solo cambió el color debajo de ellos).
+//  21. Reintroducido un ÚNICO salto de página, aplicado solo a la primera
+//      categoría (clase .categoria-bloque-primera), para que "Análisis por
+//      Criterio" empiece limpio justo después de la Ficha. Las categorías
+//      II-VII siguen sin forzar salto (ver #15).
+//  22. Agregada una leyenda ("Cómo leer los resultados": SÍ / SÍ* / NO) al
+//      inicio del Análisis por Criterio, y un cuadro resumen con el
+//      desglose por categoría + total general al final (después de la
+//      última categoría, antes de Alertas). El cuadro se omite si no se
+//      detectaron criterios individuales (mismo criterio ya usado en la
+//      Ficha para no mostrar ceros que no reflejan la realidad).
 
 'use strict';
 
@@ -85,8 +96,6 @@ function colorAlerta(gravedad) {
   return                                     { fondo: '#E8F0F7', borde: '#B5CDE0', badge: '#2A6496' };
 }
 
-// v2.5: normaliza el texto de la celda "Resultado" de la tabla (ej. "**NO**",
-// "SÍ", "SÍ (con reserva)", "N/A") a los códigos internos SI/SI_MATIZ/NO/NA.
 function normalizarResultadoTabla(texto) {
   const t = (texto || '').toUpperCase().trim();
   if (/CON RESERVA|CON MATIZ|PARCIAL|MIXTO/.test(t)) return 'SI_MATIZ';
@@ -108,7 +117,7 @@ const CSS = `
   /* La portada ocupa toda su página. Solo contiene título, subtítulo y
      puntos clave — contenido corto y acotado que siempre cabe en una
      página, por lo que este margen cero nunca se desborda a una segunda
-     página (ver changelog v2.4 #12). */
+     página. */
   @page portada {
     margin: 0;
   }
@@ -134,9 +143,20 @@ const CSS = `
     --sans:          Arial, Helvetica, sans-serif;
   }
 
+  /* v2.6: el fondo se pinta en html (no solo en body) porque Chrome
+     respeta el margen de @page para el fondo de body, pero SÍ pinta el
+     fondo de html hasta el borde físico de la hoja — así los márgenes ya
+     no se ven en blanco, quedan del mismo crema de la paleta. Los tamaños
+     de margen de @page no cambiaron, solo el color debajo de ellos. */
+  html {
+    background: var(--bg);
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
   body {
     font-family: var(--sans);
-    background: white;
+    background: var(--bg);
     color: var(--text);
     font-size: 13px;
     line-height: 1.6;
@@ -146,6 +166,9 @@ const CSS = `
     widows: 3;
   }
 
+  /* ═══════════════════════════════════════════════════════════
+     PORTADA — página propia con margin 0
+  ═══════════════════════════════════════════════════════════ */
   .portada {
     page: portada;
     break-after: page;
@@ -228,19 +251,9 @@ const CSS = `
     background: var(--accent);
   }
 
-  .portada-footer {
-    padding: 18px 52px;
-    border-top: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-top: 32px;
-    flex-shrink: 0;
-  }
-
-  .portada-footer-texto {
-    font-size: 10px; color: var(--text-muted); line-height: 1.5;
-  }
+  /* ═══════════════════════════════════════════════════════════
+     CUERPO DEL REPORTE — flujo natural, Chrome decide los cortes
+  ═══════════════════════════════════════════════════════════ */
 
   .seccion-cabecera {
     display: flex;
@@ -284,7 +297,26 @@ const CSS = `
   .resumen-texto p { margin-bottom: 10px; }
   .resumen-texto p:last-child { margin-bottom: 0; }
 
-  .categoria-bloque {
+  .ficha-bloque {
+    break-before: page;
+  }
+
+  .ficha-tabla { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  .ficha-tabla tr { border-bottom: 1px solid var(--border-subtle); }
+  .ficha-tabla tr:last-child { border-bottom: none; }
+  .ficha-tabla td { padding: 10px 12px; font-size: 12.5px; vertical-align: top; }
+  .ficha-tabla td:first-child {
+    width: 180px; font-size: 10px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-muted); padding-top: 12px;
+  }
+  .ficha-tabla td:last-child { color: var(--text); }
+
+  /* v2.6: solo la primera categoría fuerza salto de página — así el
+     Análisis por Criterio empieza limpio justo después de la Ficha, pero
+     las categorías II-VII siguen fluyendo continuas entre sí. */
+  .categoria-bloque-primera {
+    break-before: page;
   }
 
   .categoria-titulo {
@@ -345,10 +377,72 @@ const CSS = `
   .criterio-resultado.no       { background: #FEF0F0; color: var(--accent); border: 1px solid #EDAAAA; }
   .criterio-resultado.na       { background: var(--bg); color: var(--text-muted); border: 1px solid var(--border); }
 
+  /* ── LEYENDA (v2.6) ── */
+  .leyenda-resultados {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 16px 18px;
+    margin-bottom: 24px;
+    page-break-inside: avoid;
+  }
+
+  .leyenda-titulo {
+    font-size: 10px; font-weight: 700;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--text-muted); margin-bottom: 10px;
+  }
+
+  .leyenda-item {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 6px;
+    font-size: 11.5px;
+    color: var(--text-mid);
+    line-height: 1.5;
+  }
+  .leyenda-item:last-child { margin-bottom: 0; }
+
   .criterio-analisis {
     margin-left: 42px;
     font-size: 12px; color: var(--text-mid);
     line-height: 1.65; font-weight: 300;
+  }
+
+  /* ── CUADRO RESUMEN POR CATEGORÍA (v2.6) ── */
+  .tabla-resumen-bloque {
+    margin-top: 28px;
+    page-break-inside: avoid;
+  }
+
+  .resumen-categorias-tabla {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11.5px;
+  }
+  .resumen-categorias-tabla th {
+    text-align: left;
+    font-size: 9.5px; font-weight: 700;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 8px 10px;
+    border-bottom: 2px solid var(--accent);
+  }
+  .resumen-categorias-tabla th:not(:first-child),
+  .resumen-categorias-tabla td:not(:first-child) {
+    text-align: center;
+  }
+  .resumen-categorias-tabla td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-mid);
+  }
+  .resumen-categorias-tabla tfoot td {
+    font-weight: 700;
+    color: var(--text);
+    border-top: 2px solid var(--accent);
+    border-bottom: none;
   }
 
   .alertas-bloque {
@@ -411,21 +505,6 @@ const CSS = `
     background: var(--bg); color: var(--text-muted);
     border: 1px solid var(--border); letter-spacing: 0.04em;
   }
-
-  .ficha-bloque {
-    break-before: page;
-  }
-
-  .ficha-tabla { width: 100%; border-collapse: collapse; margin-top: 8px; }
-  .ficha-tabla tr { border-bottom: 1px solid var(--border-subtle); }
-  .ficha-tabla tr:last-child { border-bottom: none; }
-  .ficha-tabla td { padding: 10px 12px; font-size: 12.5px; vertical-align: top; }
-  .ficha-tabla td:first-child {
-    width: 180px; font-size: 10px; font-weight: 600;
-    letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--text-muted); padding-top: 12px;
-  }
-  .ficha-tabla td:last-child { color: var(--text); }
 
   .pie-pagina {
     margin-top: 28px;
@@ -517,8 +596,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       continue;
     }
 
-    // ── Detectar categoría (con o sin "#" delante, la muestra real trae
-    // tanto "CATEGORÍA I —" sin almohadilla como "### CATEGORÍA II —")
     const matchCat = linea.match(/^#{0,4}\s*CATEGOR[IÍ]A\s+(I{1,3}V?|VI{0,3}|IV)\s*[—–-]+\s*(.*)/i);
     if (matchCat) {
       if (criterioActual) {
@@ -536,14 +613,11 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       continue;
     }
 
-    // ── v2.5: Detectar criterio en formato de TABLA MARKDOWN (Sonnet 5) ──────
-    // Ejemplo real: "| C-01 | **NO** | El decreto se inserta en un aparato..."
-    // Se revisa ANTES que el formato de texto (matchCrit, más abajo).
     const matchCritTabla = linea.match(/^\|\s*(C-\d{2})\s*\|\s*\*{0,2}([^|*]+?)\*{0,2}\s*\|\s*(.+?)\s*\|?\s*$/i);
     if (matchCritTabla && categoriaActual) {
       categoriaActual.criterios.push({
         id:        matchCritTabla[1].toUpperCase(),
-        pregunta:  '', // este formato no repite el enunciado — ver changelog #18
+        pregunta:  '',
         resultado: normalizarResultadoTabla(matchCritTabla[2]),
         analisis:  matchCritTabla[3].replace(/\*\*/g, '').trim(),
       });
@@ -551,7 +625,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       continue;
     }
 
-    // ── Detectar criterio en formato de TEXTO (formato anterior, respaldo)
     const matchCrit = linea.match(/^[#>\-\s]*\*{0,2}(?:criterio\s+)?(C-\d{2})\*{0,2}[.\s:]*(.*)/i);
     if (matchCrit && categoriaActual) {
       const esNotaMetodologica = /se computa|se compute|computa como|por tanto|N\/A aplicado|los criterios con|se pondera/i.test(linea);
@@ -788,6 +861,18 @@ function generarHTML(datos, metadatos) {
     ? ` · ${siPlenos} SÍ plenos · ${siMatiz} SÍ con matiz · ${noCount} NO${naCount > 0 ? ` · ${naCount} N/A` : ''}`
     : '';
 
+  // v2.6: desglose por categoría para el cuadro resumen al final del
+  // Análisis por Criterio.
+  const tallyPorCategoria = categorias.map(cat => ({
+    num:     cat.num,
+    nombre:  cat.nombre,
+    si:      cat.criterios.filter(c => c.resultado === 'SI').length,
+    siMatiz: cat.criterios.filter(c => c.resultado === 'SI_MATIZ').length,
+    no:      cat.criterios.filter(c => c.resultado === 'NO').length,
+    na:      cat.criterios.filter(c => c.resultado === 'NA').length,
+    total:   cat.criterios.length,
+  }));
+
   const puntosClaveHTML = (puntosClave && puntosClave.length > 0)
     ? `<ul class="puntos-clave">${puntosClave.map(p => `<li>${esc(p)}</li>`).join('')}</ul>`
     : '';
@@ -799,6 +884,8 @@ function generarHTML(datos, metadatos) {
     .map(p => `<p>${esc(p)}</p>`)
     .join('');
 
+  // v2.6: header con "Fundación" + etiqueta con fecha de generación (antes
+  // vivía solo en el pie de portada, que se eliminó — ver más abajo).
   const htmlPortada = `
 <div class="portada">
   <div class="portada-cinta"></div>
@@ -806,23 +893,14 @@ function generarHTML(datos, metadatos) {
     <div class="portada-logo"><strong>Liberal</strong><span>mente</span></div>
     <div class="portada-meta-header">
       Auditoría Cívica Liberal<br>
-      liberalmente.app · CEDICE / Friedrich Naumann
+      liberalmente.app · CEDICE / Fundación Friedrich Naumann
     </div>
   </div>
   <div class="portada-body">
-    <div class="portada-etiqueta">Reporte de Auditoría · Test de Libertad</div>
+    <div class="portada-etiqueta">Reporte de Auditoría · Test de Libertad · Generado el ${esc(generadoEl)}</div>
     <h1 class="portada-titulo">${esc(titulo)}</h1>
     <div class="portada-subtitulo">${esc(subtitulo || [pais, fecha].filter(Boolean).join(' · '))}</div>
     ${puntosClaveHTML}
-  </div>
-  <div class="portada-footer">
-    <div class="portada-footer-texto">
-      Auditoría Cívica Liberal para la Transición Democrática<br>
-      liberalmente.app · Marco doctrinal: Manual Cívico Liberal, edición 2026
-    </div>
-    <div class="portada-footer-texto" style="text-align:right;">
-      Generado el ${esc(generadoEl)}
-    </div>
   </div>
 </div>`;
 
@@ -849,17 +927,36 @@ function generarHTML(datos, metadatos) {
     ${crit.analisis ? `<div class="criterio-analisis">${esc(crit.analisis)}</div>` : ''}
   </div>`).join('');
 
-const cabecera = idxCat === 0 ? `
+    // v2.6: leyenda de resultados agregada al final de la cabecera de la
+    // primera categoría (justo antes de empezar las preguntas).
+    const cabecera = idxCat === 0 ? `
   <div class="seccion-cabecera">
     <div class="seccion-label">Análisis por criterio</div>
     <div class="seccion-referencia">Test de Libertad — ${totalCriterios} criterios · 7 categorías</div>
   </div>
   <div class="seccion-titulo-principal">
     Reporte de Auditoría Cívica Liberal: Análisis por Criterio del Test de Libertad
+  </div>
+  <div class="leyenda-resultados">
+    <div class="leyenda-titulo">Cómo leer los resultados</div>
+    <div class="leyenda-item">
+      <span class="criterio-resultado si">✓ SÍ</span>
+      <span>El criterio se cumple plenamente — cuenta a favor del puntaje de alineación liberal.</span>
+    </div>
+    <div class="leyenda-item">
+      <span class="criterio-resultado si-matiz">! SÍ*</span>
+      <span>Se cumple con reservas o matices — cuenta a favor, con salvedades señaladas en el análisis.</span>
+    </div>
+    <div class="leyenda-item">
+      <span class="criterio-resultado no">✗ NO</span>
+      <span>El criterio no se cumple — resta del puntaje de alineación liberal.</span>
+    </div>
   </div>` : '';
 
+    // v2.6: solo la primera categoría fuerza salto de página, con la clase
+    // .categoria-bloque-primera. Las demás siguen fluyendo continuas.
     return `
-<div class="categoria-bloque">
+<div class="categoria-bloque${idxCat === 0 ? ' categoria-bloque-primera' : ''}">
   ${cabecera}
   <div class="categoria-titulo">
     <span class="categoria-num-roman">CAT. ${esc(cat.num)}</span>
@@ -868,6 +965,43 @@ const cabecera = idxCat === 0 ? `
   ${critHTML}
 </div>`;
   }).join('\n');
+
+  // v2.6: cuadro resumen por categoría, al final del Análisis por Criterio.
+  // Se omite si no se detectaron criterios individuales (mismo criterio ya
+  // usado en la Ficha para no mostrar ceros que no reflejan la realidad).
+  const htmlResumenCategorias = criteriosDetectados ? `
+<div class="tabla-resumen-bloque">
+  <div class="seccion-cabecera">
+    <div class="seccion-label">Resumen por categoría</div>
+    <div class="seccion-referencia">liberalmente.app</div>
+  </div>
+  <table class="resumen-categorias-tabla">
+    <thead>
+      <tr><th>Categoría</th><th>SÍ</th><th>SÍ con matiz</th><th>NO</th><th>N/A</th><th>Total</th></tr>
+    </thead>
+    <tbody>
+      ${tallyPorCategoria.map(t => `
+      <tr>
+        <td>CAT. ${esc(t.num)} — ${esc(t.nombre)}</td>
+        <td>${t.si}</td>
+        <td>${t.siMatiz}</td>
+        <td>${t.no}</td>
+        <td>${t.na}</td>
+        <td>${t.total}</td>
+      </tr>`).join('')}
+    </tbody>
+    <tfoot>
+      <tr>
+        <td>Total general</td>
+        <td>${siPlenos}</td>
+        <td>${siMatiz}</td>
+        <td>${noCount}</td>
+        <td>${naCount}</td>
+        <td>${totalCriterios}</td>
+      </tr>
+    </tfoot>
+  </table>
+</div>` : '';
 
   let htmlAlertas = '';
   if (alertas.length > 0) {
@@ -927,6 +1061,8 @@ const cabecera = idxCat === 0 ? `
   </table>
 </div>`;
 
+  // v2.6: orden del documento — Portada → Resumen → Ficha → Categorías →
+  // Cuadro resumen por categoría → Alertas.
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -940,6 +1076,7 @@ ${htmlPortada}
 ${htmlResumen}
 ${htmlFicha}
 ${htmlCategorias}
+${htmlResumenCategorias}
 ${htmlAlertas}
 </body>
 </html>`;
@@ -1066,7 +1203,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // ── Función principal exportada ──────────────────────────────────────────────
 
 async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.5`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v2.6`);
 
   console.log(`   [${auditoria_id}] Paso 1: Parseando reporte...`);
   const datos = parsearReporte(reporteTexto, auditoria_id);

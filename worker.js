@@ -179,6 +179,19 @@ function slugificar(texto) {
     .slice(0, 60);
 }
 
+// Convierte "Decreto 5364 Gaceta 7039" en "Decreto_5364_Gaceta_7039"
+function limpiarIdentificador(identificador) {
+  return (identificador || 'Documento')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9\s]/g, '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(palabra => palabra.charAt(0).toUpperCase() + palabra.slice(1))
+    .join('_')
+    .slice(0, 60) || 'Documento';
+}
+
 async function convertirWavAMp3(rutaWav, rutaMp3) {
   return new Promise((resolve, reject) => {
     ffmpeg(rutaWav)
@@ -884,9 +897,10 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id) {
     // siguen definidas más abajo — reactivar aquí cuando corresponda.
 
     console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo archivos a Drive...`);
-    const carpetaId    = await obtenerCarpetaAuditoria(drive, auditoria_id);
-    const linkOriginal = await subirArchivo(drive, rutaPDF, 'documento-original.pdf', 'application/pdf', carpetaId);
-    const linkReporte  = await subirArchivo(drive, rutaReportePDF, 'reporte.pdf', 'application/pdf', carpetaId);
+    const carpetaId           = await obtenerCarpetaAuditoria(drive, auditoria_id);
+    const identificadorLimpio = limpiarIdentificador(metadatos.identificador || metadatos.titulo);
+    const linkOriginal        = await subirArchivo(drive, rutaPDF, `${identificadorLimpio}_original.pdf`, 'application/pdf', carpetaId);
+    const linkReporte         = await subirArchivo(drive, rutaReportePDF, `Auditoria_de_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 
     await db.query(
       `UPDATE auditorias
@@ -1046,21 +1060,22 @@ async function extraerMetadatos(textoPDF) {
     messages: [{
       role: 'user',
       content: `Analiza este fragmento y responde SOLO con este JSON:
-{"titulo":"título oficial completo","pais":"país o General","categoria":"pais|comparativo|doctrinal"}
+{"titulo":"título oficial completo","identificador":"versión muy corta, máx. 6 palabras, priorizando números de decreto/ley/gaceta si existen (ej: 'Decreto 5364 Gaceta 7039')","pais":"país o General","categoria":"pais|comparativo|doctrinal"}
 
 Fragmento:\n${muestra}`,
-    }],
-  });
+  }],
+});
   try {
     const limpio = extraerTextoRespuesta(respuesta).trim().replace(/```json|```/g, '').trim();
     const datos  = JSON.parse(limpio);
     return {
-      titulo:    datos.titulo    || 'Documento sin título',
-      pais:      datos.pais      || 'General',
-      categoria: ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria) ? datos.categoria : 'pais',
+      titulo:        datos.titulo        || 'Documento sin título',
+      identificador: datos.identificador || datos.titulo || 'Documento',
+      pais:          datos.pais          || 'General',
+      categoria:     ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria) ? datos.categoria : 'pais',
     };
   } catch {
-    return { titulo: 'Documento sin título', pais: 'General', categoria: 'pais' };
+    return { titulo: 'Documento sin título', identificador: 'Documento', pais: 'General', categoria: 'pais' };
   }
 }
 
