@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker v3.0
+// generarReportePDF.js — ACL Worker v3.1
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
@@ -36,6 +36,22 @@
 //      y la leyenda de niveles de riesgo en la portada. La nota dinámica
 //      cuando sí aparece "efecto comadreja" en el texto se conserva como
 //      complemento, no como única vía.
+//
+// CAMBIOS v3.1 (8 jul 2026):
+//  36. FIX DE RAÍZ del párrafo de cierre pegado a C-28 ("la coletilla").
+//      En vez de perseguir por regex una frontera que Claude redacta
+//      distinto en cada corrida, prompt_analisis ahora le pide a Claude
+//      que escriba una línea literal y exacta, "@@CIERRE_AUDITORIA@@",
+//      justo después de terminar C-28 y antes de cualquier otro
+//      contenido. parsearReporte() usa esa línea como corte duro: en
+//      cuanto aparece, se cierra el buffer de C-28 sin importar si lo
+//      que sigue tiene o no un encabezado reconocible. Ver
+//      ubicarMarcadorCierre(). Si el marcador no aparece (poco común,
+//      pero la naturaleza estocástica del modelo no lo garantiza al
+//      100%), el código de respaldo por regex de siempre
+//      (extraerNotaFinalDeTexto por criterio) sigue funcionando
+//      exactamente igual que en v3.0 — nada se rompe, solo se pierde la
+//      mejora de precisión.
 
 'use strict';
 
@@ -106,14 +122,48 @@ function normalizarResultadoTabla(texto) {
 }
 
 function extraerNotaFinalDeTexto(texto) {
-  const m = texto.match(/(Resultados\s+(?:SÍ|SI|NO|N\/A)\s*:\s*\d+[\s\S]{0,150}?NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)\**\s*(?:\([^)]*\))?\s*)([\s\S]*)$/i);
-  if (!m) return null;
-  const idx = texto.indexOf(m[0]);
+  // v3.1: en vez de anticipar la forma exacta en que Claude cuenta los
+  // resultados antes del veredicto (ya vimos 3 variantes distintas), se
+  // ancla en la frase que se mantuvo estable en todas: "NIVEL DE RIESGO".
+  // Desde ahí se busca hacia atrás dónde aparece "Resultados" más cerca, y
+  // se corta ahí — tolera cualquier forma de redactar el conteo previo.
+  const matchNivel = texto.match(/NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)\**\s*(?:\([^)]*\))?\s*/i);
+  if (!matchNivel) return null;
+
+  const idxNivel  = texto.indexOf(matchNivel[0]);
+  const finBloque = idxNivel + matchNivel[0].length;
+
+  // Ventana de 300 caracteres antes de "NIVEL DE RIESGO" para ubicar la
+  // última mención de "Resultados" cercana — ahí suele empezar el conteo.
+  const desde = Math.max(0, idxNivel - 300);
+  const ventanaAntes = texto.slice(desde, idxNivel);
+  const ocurrenciasResultados = [...ventanaAntes.matchAll(/Resultados/gi)];
+  const inicioBloque = ocurrenciasResultados.length > 0
+    ? desde + ocurrenciasResultados[ocurrenciasResultados.length - 1].index
+    : idxNivel;
+
   return {
-    textoLimpio:  texto.slice(0, idx).trim(),
-    nivelRiesgo:  m[2].toUpperCase(),
-    parrafoFinal: m[3].trim(),
+    textoLimpio:  texto.slice(0, inicioBloque).trim(),
+    nivelRiesgo:  matchNivel[1].toUpperCase(),
+    parrafoFinal: texto.slice(finBloque).trim(),
   };
+}
+
+// v3.1: el prompt_analisis le pide a Claude que escriba esta línea, exacta
+// y literal, justo después de terminar la justificación de C-28 — antes
+// de cualquier otro contenido (indicador de riesgo, alertas, resumen).
+const MARCADOR_CIERRE = '@@CIERRE_AUDITORIA@@';
+
+// Ubica el marcador en el texto crudo del reporte. Si aparece, devuelve
+// todo lo que viene después como "texto de cierre" — el bloque que
+// contiene el indicador de riesgo, las alertas y el resumen ejecutivo
+// embebido, ya separado de forma limpia del análisis por criterio. Si no
+// aparece (Claude lo omitió esta vez), marcadorVisto queda en false y el
+// resto del código sigue el mismo camino de respaldo que usaba en v3.0.
+function ubicarMarcadorCierre(reporteTexto) {
+  const idx = reporteTexto.indexOf(MARCADOR_CIERRE);
+  if (idx === -1) return { marcadorVisto: false, textoCierre: '' };
+  return { marcadorVisto: true, textoCierre: reporteTexto.slice(idx + MARCADOR_CIERRE.length) };
 }
 
 // ── CSS del reporte ──────────────────────────────────────────────────────────
@@ -577,9 +627,18 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     alertas:     [],
   };
 
-  const lineas = reporteTexto.split('\n');
+  // v3.1: si el marcador está presente, el puntaje y el nivel de riesgo se
+  // buscan SOLO en el texto de cierre (después de C-28) — más preciso que
+  // buscar en todo el documento, donde un porcentaje mencionado dentro de
+  // la justificación de algún criterio podría confundirse con el puntaje
+  // real. Si el marcador no aparece, se busca en todo el texto como antes.
+  const { marcadorVisto, textoCierre } = ubicarMarcadorCierre(reporteTexto);
+  console.log(`   [parsearReporte] Marcador de cierre @@CIERRE_AUDITORIA@@: ${marcadorVisto ? 'encontrado ✅' : 'NO encontrado — usando respaldo por regex'}`);
 
-  for (const linea of lineas) {
+  const lineas = reporteTexto.split('\n');
+  const textoParaPuntajeYRiesgo = marcadorVisto ? textoCierre : reporteTexto;
+
+  for (const linea of textoParaPuntajeYRiesgo.split('\n')) {
     const matchPct = linea.match(/([\d.]+)%/);
     if (matchPct && !datos.puntaje) {
       const v = parseFloat(matchPct[1]);
@@ -587,7 +646,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     }
   }
 
-  const matchRiesgo = reporteTexto.match(/NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)/i);
+  const matchRiesgo = textoParaPuntajeYRiesgo.match(/NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)/i);
   if (matchRiesgo) datos.nivelRiesgo = matchRiesgo[1].toUpperCase();
 
   const CATEGORIAS_NOMBRES = {
@@ -609,6 +668,19 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
 
   for (let i = 0; i < lineas.length; i++) {
     const linea = lineas[i];
+
+    // v3.1: corte duro — en cuanto aparece el marcador, se cierra
+    // inmediatamente el criterio actual (normalmente C-28) y no se le
+    // vuelve a agregar nada más al buffer. Esto es lo que evita que el
+    // indicador de riesgo o el resumen queden pegados a su justificación,
+    // sin depender de que el texto que sigue tenga un encabezado válido.
+    if (linea.trim() === MARCADOR_CIERRE) {
+      if (criterioActual) {
+        criterioActual.analisis = bufferAnalisis.join(' ').trim();
+        bufferAnalisis = []; criterioActual = null;
+      }
+      continue;
+    }
 
     if (/^#{1,4}\s*\d+\.\s*ALERTAS?|^##\s*ALERTAS|ALERTAS? PRINCIPALES/i.test(linea)) {
       enAlertas = true;
@@ -738,13 +810,28 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   if (criterioActual && bufferAnalisis.length > 0) criterioActual.analisis = bufferAnalisis.join(' ').trim();
   if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); }
 
-  for (const cat of datos.categorias) {
-    for (const crit of cat.criterios) {
-      const extra = extraerNotaFinalDeTexto(crit.analisis || '');
-      if (extra) {
-        crit.analisis     = extra.textoLimpio;
-        datos.nivelRiesgo  = extra.nivelRiesgo;
-        datos.notaFinal    = extra.parrafoFinal;
+  if (marcadorVisto) {
+    // v3.1 — camino limpio: el corte duro de arriba ya garantizó que
+    // ningún texto de cierre quedó pegado a C-28, así que no hace falta
+    // revisar criterio por criterio. El párrafo de cierre se extrae
+    // directo del texto que viene después del marcador.
+    const extra = extraerNotaFinalDeTexto(textoCierre);
+    if (extra) {
+      datos.nivelRiesgo = extra.nivelRiesgo;
+      datos.notaFinal   = extra.parrafoFinal;
+    }
+  } else {
+    // Respaldo tal como funcionaba en v3.0 — por si Claude omitió el
+    // marcador esta vez (la naturaleza estocástica del modelo no lo
+    // garantiza al 100%, aunque el prompt se lo pida explícitamente).
+    for (const cat of datos.categorias) {
+      for (const crit of cat.criterios) {
+        const extra = extraerNotaFinalDeTexto(crit.analisis || '');
+        if (extra) {
+          crit.analisis     = extra.textoLimpio;
+          datos.nivelRiesgo  = extra.nivelRiesgo;
+          datos.notaFinal    = extra.parrafoFinal;
+        }
       }
     }
   }
@@ -766,6 +853,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   console.log(`   ║ NO         : ${noReal}`);
   console.log(`   ║ N/A        : ${naReal}`);
   console.log(`   ╠──────────────────────────────────────────────────`);
+  console.log(`   ║ Marcador de cierre : ${marcadorVisto ? 'sí' : 'no (fallback activo)'}`);
   console.log(`   ║ Puntaje detectado en texto : ${datos.puntaje === null ? 'null (se calculará desde conteos)' : datos.puntaje + '%'}`);
   console.log(`   ║ Riesgo detectado  : ${datos.nivelRiesgo}`);
   console.log(`   ║ Nota final        : ${datos.notaFinal ? 'sí (' + datos.notaFinal.length + ' chars)' : 'no encontrada'}`);
@@ -1266,7 +1354,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // ── Función principal exportada ──────────────────────────────────────────────
 
 async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v3.0`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v3.1`);
 
   console.log(`   [${auditoria_id}] Paso 1: Parseando reporte...`);
   const datos = parsearReporte(reporteTexto, auditoria_id);
