@@ -734,6 +734,157 @@ app.get('/prompts/versiones', async (req, res) => {
   }
 });
 
+const { Readable } = require('stream');
+
+const DRIVE_CARPETA_FUENTES_ID = process.env.DRIVE_CARPETA_FUENTES_ID;
+
+app.post('/fuentes/subir', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { titulo, autor, descripcion, pdf_base64 } = req.body;
+  if (!titulo || !pdf_base64) {
+    return res.status(400).json({ error: 'Faltan campos requeridos (titulo, pdf_base64)' });
+  }
+  if (!DRIVE_CARPETA_FUENTES_ID) {
+    return res.status(500).json({ error: 'Falta configurar DRIVE_CARPETA_FUENTES_ID en las variables de entorno' });
+  }
+  try {
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+
+    const archivo = await drive.files.create({
+      requestBody: { name: `${titulo}.pdf`, parents: [DRIVE_CARPETA_FUENTES_ID] },
+      media: { mimeType: 'application/pdf', body: Readable.from(Buffer.from(pdf_base64, 'base64')) },
+      fields: 'id, webViewLink',
+    });
+
+    await drive.permissions.create({
+      fileId: archivo.data.id,
+      requestBody: { role: 'reader', type: 'anyone' },
+    });
+
+    const ordenResult = await db.query(`SELECT COALESCE(MAX(orden), 0) + 1 AS siguiente FROM fuentes_doctrinales`);
+    const siguienteOrden = ordenResult.rows[0].siguiente;
+
+    const result = await db.query(
+      `INSERT INTO fuentes_doctrinales
+         (titulo, autor, descripcion, drive_file_id, drive_link, orden, activo, creado_en, actualizado_en)
+       VALUES ($1, $2, $3, $4, $5, $6, true, NOW(), NOW())
+       RETURNING id, titulo`,
+      [titulo, autor || null, descripcion || null, archivo.data.id, archivo.data.webViewLink, siguienteOrden]
+    );
+
+    console.log(`   Fuente doctrinal subida: "${result.rows[0].titulo}"`);
+    res.json({ ok: true, id: result.rows[0].id, titulo: result.rows[0].titulo, drive_link: archivo.data.webViewLink });
+  } catch (error) {
+    console.error('❌ Error subiendo fuente doctrinal:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/fuentes/lista-admin', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT id, titulo, autor, descripcion, drive_link, orden, activo, creado_en
+       FROM fuentes_doctrinales ORDER BY orden ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('❌ Error listando fuentes doctrinales:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/fuentes/toggle-visible', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'Falta id' });
+  try {
+    const result = await db.query(
+      `UPDATE fuentes_doctrinales SET activo = NOT activo, actualizado_en = NOW() WHERE id = $1 RETURNING activo`,
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
+    res.json({ ok: true, activo: result.rows[0].activo });
+  } catch (error) {
+    console.error('❌ Error cambiando visibilidad:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/fuentes/reordenar', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { id, direccion } = req.body;
+  if (!id || !['subir', 'bajar'].includes(direccion)) {
+    return res.status(400).json({ error: 'Faltan campos válidos (id, direccion)' });
+  }
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const actual = await client.query(`SELECT orden FROM fuentes_doctrinales WHERE id = $1`, [id]);
+    if (actual.rows.length === 0) throw new Error('No encontrado');
+    const ordenActual = actual.rows[0].orden;
+
+    const vecino = direccion === 'subir'
+      ? await client.query(`SELECT id, orden FROM fuentes_doctrinales WHERE orden < $1 ORDER BY orden DESC LIMIT 1`, [ordenActual])
+      : await client.query(`SELECT id, orden FROM fuentes_doctrinales WHERE orden > $1 ORDER BY orden ASC LIMIT 1`, [ordenActual]);
+
+    if (vecino.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.json({ ok: true, sinCambios: true });
+    }
+
+    await client.query(`UPDATE fuentes_doctrinales SET orden = $1 WHERE id = $2`, [vecino.rows[0].orden, id]);
+    await client.query(`UPDATE fuentes_doctrinales SET orden = $1 WHERE id = $2`, [ordenActual, vecino.rows[0].id]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('❌ Error reordenando fuentes doctrinales:', error.message);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/fuentes/eliminar', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'Falta id' });
+  try {
+    const result = await db.query(`SELECT drive_file_id, titulo FROM fuentes_doctrinales WHERE id = $1`, [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
+    const { drive_file_id, titulo } = result.rows[0];
+
+    if (drive_file_id) {
+      try {
+        const driveAuth = autenticarDrive();
+        const drive = google.drive({ version: 'v3', auth: driveAuth });
+        await drive.files.delete({ fileId: drive_file_id });
+      } catch (errDrive) {
+        console.error(`   No se pudo eliminar el archivo de Drive de "${titulo}":`, errDrive.message);
+      }
+    }
+
+    await db.query(`DELETE FROM fuentes_doctrinales WHERE id = $1`, [id]);
+    console.log(`   Fuente doctrinal eliminada: "${titulo}"`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error eliminando fuente doctrinal:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Elimina una auditoría por completo: la fila en la base de datos y su
 // carpeta en Google Drive (con todos los archivos dentro). Acción
 // IRREVERSIBLE — pensada para que el admin limpie pruebas, duplicados o
