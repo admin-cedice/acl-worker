@@ -690,6 +690,50 @@ app.post('/regenerar-audio', async (req, res) => {
   }
 });
 
+app.post('/prompts/subir-version', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { version, prompt_sistema, prompt_analisis, prompt_semantico, fuentes_activas, basado_en_manual_version } = req.body;
+  if (!version || !prompt_sistema || !prompt_analisis) {
+    return res.status(400).json({ error: 'Faltan campos requeridos (version, prompt_sistema, prompt_analisis)' });
+  }
+  try {
+    const result = await db.query(
+      `INSERT INTO configuracion_doctrinal
+         (version, prompt_sistema, prompt_analisis, prompt_semantico, fuentes_activas, basado_en_manual_version, activo, creado_en, actualizado_en)
+       VALUES ($1, $2, $3, $4, $5, $6, false, NOW(), NOW())
+       RETURNING id, version`,
+      [version, prompt_sistema, prompt_analisis, prompt_semantico || null,
+       fuentes_activas ? JSON.stringify(fuentes_activas) : null,
+       basado_en_manual_version || null]
+    );
+    console.log(`   Nueva versión de prompts creada (inactiva): ${result.rows[0].version}`);
+    res.json({ ok: true, id: result.rows[0].id, version: result.rows[0].version });
+  } catch (error) {
+    console.error('❌ Error subiendo versión de prompts:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/prompts/versiones', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT id, version, activo, creado_en, actualizado_en, basado_en_manual_version,
+              LEFT(prompt_analisis, 200) AS prompt_analisis_preview
+       FROM configuracion_doctrinal
+       ORDER BY creado_en DESC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('❌ Error listando versiones de prompts:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Elimina una auditoría por completo: la fila en la base de datos y su
 // carpeta en Google Drive (con todos los archivos dentro). Acción
 // IRREVERSIBLE — pensada para que el admin limpie pruebas, duplicados o
