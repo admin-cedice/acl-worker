@@ -690,6 +690,56 @@ app.post('/regenerar-audio', async (req, res) => {
   }
 });
 
+// Elimina una auditoría por completo: la fila en la base de datos y su
+// carpeta en Google Drive (con todos los archivos dentro). Acción
+// IRREVERSIBLE — pensada para que el admin limpie pruebas, duplicados o
+// auditorías con error. No bloquea el borrado si Drive o NotebookLM
+// fallan (por ejemplo, si la carpeta ya no existe).
+app.post('/eliminar-auditoria', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { auditoria_id } = req.body;
+  if (!auditoria_id) {
+    return res.status(400).json({ error: 'Falta auditoria_id' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT drive_carpeta_id, notebook_id FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Auditoría no encontrada' });
+    }
+    const { drive_carpeta_id, notebook_id } = result.rows[0];
+
+    if (drive_carpeta_id) {
+      try {
+        const driveAuth = autenticarDrive();
+        const drive = google.drive({ version: 'v3', auth: driveAuth });
+        await drive.files.delete({ fileId: drive_carpeta_id });
+        console.log(`   [${auditoria_id}] Carpeta de Drive eliminada`);
+      } catch (errDrive) {
+        console.error(`   [${auditoria_id}] No se pudo eliminar la carpeta de Drive:`, errDrive.message);
+      }
+    }
+
+    if (notebook_id) {
+      await nlmEliminarNotebook(notebook_id).catch(() => {});
+    }
+
+    await db.query(`DELETE FROM clicks_auditoria WHERE auditoria_id = $1`, [auditoria_id]);
+    await db.query(`DELETE FROM auditorias WHERE id = $1`, [auditoria_id]);
+
+    console.log(`   [${auditoria_id}] Auditoría eliminada por completo`);
+    res.json({ ok: true, eliminado: auditoria_id });
+
+  } catch (error) {
+    console.error(`❌ [${auditoria_id}] Error eliminando auditoría:`, error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Módulo: Manual Cívico Liberal (documento vivo, versionado) ──────────────
 // Agregado 15 jun 2026. Requiere la migración 002_manual_liberalismo.sql.
 // El manual se sube desde el dashboard admin, queda inactivo hasta que se
