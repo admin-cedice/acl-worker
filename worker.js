@@ -885,6 +885,33 @@ app.post('/fuentes/eliminar', async (req, res) => {
   }
 });
 
+// Edita el título, autor y descripción de un documento ya subido. No toca
+// el archivo en Drive — solo los campos de texto.
+app.post('/fuentes/editar', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { id, titulo, autor, descripcion } = req.body;
+  if (!id || !titulo) {
+    return res.status(400).json({ error: 'Faltan campos requeridos (id, titulo)' });
+  }
+  try {
+    const result = await db.query(
+      `UPDATE fuentes_doctrinales
+       SET titulo = $1, autor = $2, descripcion = $3, actualizado_en = NOW()
+       WHERE id = $4
+       RETURNING id, titulo`,
+      [titulo, autor || null, descripcion || null, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
+    console.log(`   Fuente doctrinal editada: "${result.rows[0].titulo}"`);
+    res.json({ ok: true, titulo: result.rows[0].titulo });
+  } catch (error) {
+    console.error('❌ Error editando fuente doctrinal:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Elimina una auditoría por completo: la fila en la base de datos y su
 // carpeta en Google Drive (con todos los archivos dentro). Acción
 // IRREVERSIBLE — pensada para que el admin limpie pruebas, duplicados o
