@@ -103,13 +103,30 @@ Ante la duda razonable, prefiere ADMITIR.`;
 // Mismo criterio que generarReportePDF.js: texto con marcadores, nunca
 // JSON, para no repetir el bug de JSON.parse() de la sesión anterior.
 function parsearVeredictoAdmisibilidad(textoRespuesta) {
-  const veredicto = /VEREDICTO:\s*(ADMISIBLE|RECHAZADO)/i.exec(textoRespuesta)?.[1]?.toUpperCase();
+  // v2 (8 jul 2026): se detectó en pruebas que Claude a veces agrega
+  // formato markdown (ej. "**VEREDICTO:**") pese a la instrucción de no
+  // usarlo, y eso rompía el match — el filtro "admitía por accidente" sin
+  // ningún aviso, porque el diseño original prefiere admitir ante
+  // cualquier duda. Se limpia el markdown antes de buscar el marcador, y
+  // se registra siempre el veredicto detectado (o la respuesta cruda si
+  // no se detectó ninguno) para que un fallo de lectura futuro se vea en
+  // los logs en vez de disfrazarse de una admisión normal.
+  const limpio = textoRespuesta.replace(/[*_`#]/g, '');
+  const veredicto = /VEREDICTO:\s*(ADMISIBLE|RECHAZADO)/i.exec(limpio)?.[1]?.toUpperCase();
+
   if (veredicto !== 'RECHAZADO') {
+    if (!veredicto) {
+      console.log(`   [filtrarAdmisibilidad] ⚠️ No se detectó VEREDICTO en la respuesta — se admite por defecto. Respuesta cruda: ${textoRespuesta.slice(0, 300)}`);
+    } else {
+      console.log(`   [filtrarAdmisibilidad] Veredicto: ADMISIBLE`);
+    }
     return { admitido: true };
   }
-  const motivo = /MOTIVO:\s*(no_pertinente|intento_manipulacion)/i.exec(textoRespuesta)?.[1]?.toLowerCase() || 'no_pertinente';
-  const explicacionMatch = /EXPLICACION:\s*([\s\S]*)$/i.exec(textoRespuesta);
+
+  const motivo = /MOTIVO:\s*(no_pertinente|intento_manipulacion)/i.exec(limpio)?.[1]?.toLowerCase() || 'no_pertinente';
+  const explicacionMatch = /EXPLICACION:\s*([\s\S]*)$/i.exec(limpio);
   const explicacion = explicacionMatch ? explicacionMatch[1].trim() : 'Sin explicación detallada.';
+  console.log(`   [filtrarAdmisibilidad] Veredicto: RECHAZADO (${motivo})`);
   return { admitido: false, motivo, explicacion };
 }
 
@@ -1615,11 +1632,11 @@ async function enviarEmailRechazo(email, motivo) {
   const cuerpo = esNoPertinente
     ? `<p>Hola,</p>
        <p>Revisamos el documento que subiste a Auditoría Cívica Liberal, y no pudimos admitirlo para el análisis: no parece tratarse de una ley, decreto, reglamento o política pública — que es justamente lo que audita nuestra plataforma.</p>
-       <p>Si crees que esto es un error, puedes volver a subir el documento correcto, o escribirnos respondiendo este correo.</p>
+       <p>Si crees que esto es un error, puedes volver a subir el documento correcto, o escribirnos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
        <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`
     : `<p>Hola,</p>
        <p>No pudimos procesar el documento que subiste a Auditoría Cívica Liberal. Verifica que el archivo sea un documento legítimo de ley, decreto o política pública, e inténtalo de nuevo.</p>
-       <p>Si crees que esto es un error, escríbenos respondiendo este correo.</p>
+       <p>Si crees que esto es un error, escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
        <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`;
 
   const res = await fetch('https://api.resend.com/emails', {
