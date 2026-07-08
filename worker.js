@@ -917,6 +917,50 @@ app.post('/fuentes/subir', async (req, res) => {
   }
 });
 
+app.get('/metricas/resumen', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const [
+      totalCiudadanos,
+      totalAuditorias,
+      porEstado,
+      porPais,
+      porMotivoRechazo,
+      porTipoClick,
+      actividad,
+    ] = await Promise.all([
+      db.query(`SELECT COUNT(*)::int AS total FROM ciudadanos`),
+      db.query(`SELECT COUNT(*)::int AS total FROM auditorias`),
+      db.query(`SELECT estado, COUNT(*)::int AS total FROM auditorias GROUP BY estado ORDER BY total DESC`),
+      db.query(`SELECT COALESCE(pais, 'Sin especificar') AS pais, COUNT(*)::int AS total FROM auditorias GROUP BY pais ORDER BY total DESC`),
+      db.query(`SELECT COALESCE(motivo_rechazo_tipo, 'sin_motivo') AS motivo, COUNT(*)::int AS total FROM auditorias WHERE estado = 'rechazada' GROUP BY motivo_rechazo_tipo`),
+      db.query(`SELECT tipo_link, COUNT(*)::int AS total FROM clicks_auditoria GROUP BY tipo_link ORDER BY total DESC`),
+      db.query(`
+        SELECT TO_CHAR(creada_en, 'YYYY-MM-DD') AS fecha, COUNT(*)::int AS total
+        FROM auditorias
+        WHERE creada_en >= NOW() - INTERVAL '30 days'
+        GROUP BY fecha
+        ORDER BY fecha ASC
+      `),
+    ]);
+
+    res.json({
+      totalCiudadanos: totalCiudadanos.rows[0].total,
+      totalAuditorias: totalAuditorias.rows[0].total,
+      porEstado: porEstado.rows,
+      porPais: porPais.rows,
+      porMotivoRechazo: porMotivoRechazo.rows,
+      porTipoClick: porTipoClick.rows,
+      actividad: actividad.rows,
+    });
+  } catch (error) {
+    console.error('❌ Error obteniendo métricas:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/fuentes/lista-admin', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
