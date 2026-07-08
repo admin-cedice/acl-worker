@@ -917,50 +917,6 @@ app.post('/fuentes/subir', async (req, res) => {
   }
 });
 
-app.get('/metricas/resumen', async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
-  try {
-    const [
-      totalCiudadanos,
-      totalAuditorias,
-      porEstado,
-      porPais,
-      porMotivoRechazo,
-      porTipoClick,
-      actividad,
-    ] = await Promise.all([
-      db.query(`SELECT COUNT(*)::int AS total FROM ciudadanos`),
-      db.query(`SELECT COUNT(*)::int AS total FROM auditorias`),
-      db.query(`SELECT estado, COUNT(*)::int AS total FROM auditorias GROUP BY estado ORDER BY total DESC`),
-      db.query(`SELECT COALESCE(pais, 'Sin especificar') AS pais, COUNT(*)::int AS total FROM auditorias GROUP BY pais ORDER BY total DESC`),
-      db.query(`SELECT COALESCE(motivo_rechazo_tipo, 'sin_motivo') AS motivo, COUNT(*)::int AS total FROM auditorias WHERE estado = 'rechazada' GROUP BY motivo_rechazo_tipo`),
-      db.query(`SELECT tipo_link, COUNT(*)::int AS total FROM clicks_auditoria GROUP BY tipo_link ORDER BY total DESC`),
-      db.query(`
-        SELECT TO_CHAR(creada_en, 'YYYY-MM-DD') AS fecha, COUNT(*)::int AS total
-        FROM auditorias
-        WHERE creada_en >= NOW() - INTERVAL '30 days'
-        GROUP BY fecha
-        ORDER BY fecha ASC
-      `),
-    ]);
-
-    res.json({
-      totalCiudadanos: totalCiudadanos.rows[0].total,
-      totalAuditorias: totalAuditorias.rows[0].total,
-      porEstado: porEstado.rows,
-      porPais: porPais.rows,
-      porMotivoRechazo: porMotivoRechazo.rows,
-      porTipoClick: porTipoClick.rows,
-      actividad: actividad.rows,
-    });
-  } catch (error) {
-    console.error('❌ Error obteniendo métricas:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 app.get('/fuentes/lista-admin', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -1395,6 +1351,18 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.error(`❌ [${auditoria_id}] Error:`, error.message);
     await actualizarEstado(auditoria_id, 'error').catch(() => {});
     await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`, [error.message, auditoria_id]).catch(() => {});
+
+    const filaActual = await db.query(`SELECT titulo_documento FROM auditorias WHERE id = $1`, [auditoria_id]).catch(() => null);
+    const tituloConocido = filaActual?.rows?.[0]?.titulo_documento || null;
+
+    await enviarEmailErrorCiudadano(ciudadano_email, tituloConocido).catch(err => {
+      console.error(`   [${auditoria_id}] No se pudo enviar el email de error al ciudadano:`, err.message);
+    });
+
+    await enviarEmailErrorInterno(auditoria_id, tituloConocido, error.message).catch(err => {
+      console.error(`   [${auditoria_id}] No se pudo enviar la alerta interna:`, err.message);
+    });
+
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(`🧹 [${auditoria_id}] Archivos temporales eliminados`);
@@ -1695,6 +1663,75 @@ async function enviarEmailRechazo(email, motivo) {
   });
   if (!res.ok) throw new Error(`Error enviando email de rechazo: ${await res.text()}`);
   console.log(`   ✅ Email de rechazo enviado a ${email}`);
+}
+
+// Email al ciudadano cuando la auditoría falla por un error técnico
+// genuino (no un rechazo del filtro — eso ya tiene su propio correo).
+// Nunca incluye el mensaje de error crudo: solo tranquiliza y avisa que
+// el equipo ya está al tanto.
+async function enviarEmailErrorCiudadano(email, titulo) {
+  const cuerpo = `<p>Hola,</p>
+       <p>Tuvimos un problema técnico procesando ${titulo ? `<strong>${titulo}</strong>` : 'el documento que subiste'} a Auditoría Cívica Liberal. Nuestro equipo ya fue notificado y lo está revisando.</p>
+       <p>No necesitas hacer nada por ahora — te escribiremos en cuanto esté resuelto. Si prefieres, también puedes intentar subir el documento de nuevo más tarde.</p>
+       <p>Disculpa el inconveniente.</p>
+       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+    body: JSON.stringify({
+      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+      to: email,
+      subject: 'Estamos revisando tu documento',
+      html: cuerpo,
+    }),
+  });
+  if (!res.ok) throw new Error(`Error enviando email de error al ciudadano: ${await res.text()}`);
+  console.log(`   ✅ Email de error (ciudadano) enviado a ${email}`);
+}
+
+// Alerta interna al equipo. Lee los destinatarios de la tabla
+// configuracion_alertas (tipo = 'error_procesamiento') — así se puede
+// cambiar a quién le llega sin tocar código. Si esa tabla está vacía
+// (nunca se configuró), cae en un correo de respaldo fijo para que la
+// alerta nunca se pierda por accidente.
+async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
+  let destinatarios = [];
+  try {
+    const { rows } = await db.query(
+      `SELECT email FROM configuracion_alertas WHERE tipo = 'error_procesamiento' AND activo = true`
+    );
+    destinatarios = rows.map(r => r.email);
+  } catch {
+    // si la tabla falla por cualquier razón, seguimos al respaldo de abajo
+  }
+  if (destinatarios.length === 0) destinatarios = ['admin@liberalmente.app'];
+
+  const cuerpo = `<p>Se produjo un error procesando una auditoría.</p>
+    <ul>
+      <li><strong>ID:</strong> ${auditoria_id}</li>
+      <li><strong>Documento:</strong> ${titulo || '(título aún no determinado)'}</li>
+      <li><strong>Error:</strong> ${mensajeError}</li>
+    </ul>
+    <p><a href="https://liberalmente.app/admin/auditorias">Ver en el panel de administración →</a></p>`;
+
+  for (const email of destinatarios) {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+        to: email,
+        subject: `⚠️ Error procesando auditoría — ${titulo || auditoria_id}`,
+        html: cuerpo,
+      }),
+    });
+    if (!res.ok) {
+      console.error(`   No se pudo alertar a ${email}: ${await res.text()}`);
+    } else {
+      console.log(`   ✅ Alerta interna enviada a ${email}`);
+    }
+  }
 }
 
 // ── Arrancar servidor ────────────────────────────────────────────────────────
