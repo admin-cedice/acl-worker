@@ -918,24 +918,27 @@ app.post('/fuentes/subir', async (req, res) => {
   }
 });
 
-// Sube una fuente doctrinal que es audio o video (no PDF) — usa binario
-// crudo en vez de base64 dentro de JSON, mismo patrón que ya funciona en
-// /completar-audio, porque un video puede pesar mucho más que un PDF y el
-// límite de JSON (50mb) lo rechazaría de entrada.
-app.post('/fuentes/subir-media', express.raw({ type: '*/*', limit: '300mb' }), async (req, res) => {
+// Helper: obtiene un token de acceso válido para llamar a la API de Drive directamente
+async function obtenerTokenDrive() {
+  const auth = autenticarDrive();
+  const { token } = await auth.getAccessToken();
+  return token;
+}
+
+// Paso 1 de la subida directa: le pide a Drive una URL de subida temporal
+// (sesión "resumable") y se la entrega al navegador. El archivo en sí
+// nunca pasa por aquí — por eso esto nunca choca con el límite de 5
+// minutos de Railway, sin importar cuánto pese el video.
+app.post('/fuentes/iniciar-subida-media', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
   }
-  const titulo = req.headers['x-titulo'] ? decodeURIComponent(req.headers['x-titulo']) : null;
-  const autor = req.headers['x-autor'] ? decodeURIComponent(req.headers['x-autor']) || null : null;
-  const descripcion = req.headers['x-descripcion'] ? decodeURIComponent(req.headers['x-descripcion']) || null : null;
-  const tipoArchivo = req.headers['x-tipo-archivo'];
-
-  if (!titulo || !tipoArchivo || !req.body?.length) {
-    return res.status(400).json({ error: 'Faltan título, tipo de archivo o el archivo mismo' });
+  const { titulo, tipoArchivo, tamano } = req.body;
+  if (!titulo || !tipoArchivo) {
+    return res.status(400).json({ error: 'Faltan título o tipo de archivo' });
   }
   if (!['mp4', 'mp3'].includes(tipoArchivo)) {
-    return res.status(400).json({ error: 'Tipo de archivo no admitido (solo mp4 o mp3, además de PDF)' });
+    return res.status(400).json({ error: 'Tipo de archivo no admitido' });
   }
   if (!DRIVE_CARPETA_FUENTES_ID) {
     return res.status(500).json({ error: 'Falta configurar DRIVE_CARPETA_FUENTES_ID' });
@@ -944,19 +947,62 @@ app.post('/fuentes/subir-media', express.raw({ type: '*/*', limit: '300mb' }), a
   const mimeType = tipoArchivo === 'mp4' ? 'video/mp4' : 'audio/mpeg';
 
   try {
+    const token = await obtenerTokenDrive();
+    const initRes = await fetch(
+      'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json; charset=UTF-8',
+          'X-Upload-Content-Type': mimeType,
+          ...(tamano ? { 'X-Upload-Content-Length': String(tamano) } : {}),
+        },
+        body: JSON.stringify({
+          name: `${titulo}.${tipoArchivo}`,
+          parents: [DRIVE_CARPETA_FUENTES_ID],
+        }),
+      }
+    );
+
+    if (!initRes.ok) {
+      const texto = await initRes.text();
+      throw new Error(`Drive rechazó iniciar la subida: ${texto}`);
+    }
+
+    const uploadUrl = initRes.headers.get('location');
+    if (!uploadUrl) throw new Error('Drive no devolvió una URL de subida');
+
+    console.log(`   [fuentes] Sesión de subida directa iniciada para "${titulo}"`);
+    res.json({ ok: true, uploadUrl });
+  } catch (error) {
+    console.error('❌ Error iniciando subida directa a Drive:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Paso 2: una vez que el navegador ya subió el archivo directo a Drive,
+// esto solo guarda los metadatos en la base de datos. Rápido, sin archivo
+// de por medio.
+app.post('/fuentes/completar-subida-media', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { titulo, autor, descripcion, driveFileId } = req.body;
+  if (!titulo || !driveFileId) {
+    return res.status(400).json({ error: 'Faltan título o driveFileId' });
+  }
+
+  try {
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
 
-    const archivo = await drive.files.create({
-      requestBody: { name: `${titulo}.${tipoArchivo}`, parents: [DRIVE_CARPETA_FUENTES_ID] },
-      media: { mimeType, body: Readable.from(req.body) },
-      fields: 'id, webViewLink',
-    });
-
     await drive.permissions.create({
-      fileId: archivo.data.id,
+      fileId: driveFileId,
       requestBody: { role: 'reader', type: 'anyone' },
     });
+
+    const archivo = await drive.files.get({ fileId: driveFileId, fields: 'webViewLink' });
 
     const ordenResult = await db.query(`SELECT COALESCE(MAX(orden), 0) + 1 AS siguiente FROM fuentes_doctrinales`);
     const siguienteOrden = ordenResult.rows[0].siguiente;
@@ -966,13 +1012,13 @@ app.post('/fuentes/subir-media', express.raw({ type: '*/*', limit: '300mb' }), a
          (titulo, autor, descripcion, drive_file_id, drive_link, orden, activo, creado_en, actualizado_en)
        VALUES ($1, $2, $3, $4, $5, $6, true, NOW(), NOW())
        RETURNING id, titulo`,
-      [titulo, autor, descripcion, archivo.data.id, archivo.data.webViewLink, siguienteOrden]
+      [titulo, autor || null, descripcion || null, driveFileId, archivo.data.webViewLink, siguienteOrden]
     );
 
-    console.log(`   Fuente doctrinal (media) subida: "${result.rows[0].titulo}"`);
+    console.log(`   Fuente doctrinal (subida directa) guardada: "${result.rows[0].titulo}"`);
     res.json({ ok: true, id: result.rows[0].id, titulo: result.rows[0].titulo, drive_link: archivo.data.webViewLink });
   } catch (error) {
-    console.error('❌ Error subiendo fuente doctrinal (media):', error.message);
+    console.error('❌ Error completando subida directa:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
