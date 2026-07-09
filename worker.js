@@ -917,6 +917,65 @@ app.post('/fuentes/subir', async (req, res) => {
   }
 });
 
+// Sube una fuente doctrinal que es audio o video (no PDF) — usa binario
+// crudo en vez de base64 dentro de JSON, mismo patrón que ya funciona en
+// /completar-audio, porque un video puede pesar mucho más que un PDF y el
+// límite de JSON (50mb) lo rechazaría de entrada.
+app.post('/fuentes/subir-media', express.raw({ type: '*/*', limit: '300mb' }), async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const titulo = req.headers['x-titulo'] ? decodeURIComponent(req.headers['x-titulo']) : null;
+  const autor = req.headers['x-autor'] ? decodeURIComponent(req.headers['x-autor']) || null : null;
+  const descripcion = req.headers['x-descripcion'] ? decodeURIComponent(req.headers['x-descripcion']) || null : null;
+  const tipoArchivo = req.headers['x-tipo-archivo'];
+
+  if (!titulo || !tipoArchivo || !req.body?.length) {
+    return res.status(400).json({ error: 'Faltan título, tipo de archivo o el archivo mismo' });
+  }
+  if (!['mp4', 'mp3'].includes(tipoArchivo)) {
+    return res.status(400).json({ error: 'Tipo de archivo no admitido (solo mp4 o mp3, además de PDF)' });
+  }
+  if (!DRIVE_CARPETA_FUENTES_ID) {
+    return res.status(500).json({ error: 'Falta configurar DRIVE_CARPETA_FUENTES_ID' });
+  }
+
+  const mimeType = tipoArchivo === 'mp4' ? 'video/mp4' : 'audio/mpeg';
+
+  try {
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+
+    const archivo = await drive.files.create({
+      requestBody: { name: `${titulo}.${tipoArchivo}`, parents: [DRIVE_CARPETA_FUENTES_ID] },
+      media: { mimeType, body: Readable.from(req.body) },
+      fields: 'id, webViewLink',
+    });
+
+    await drive.permissions.create({
+      fileId: archivo.data.id,
+      requestBody: { role: 'reader', type: 'anyone' },
+    });
+
+    const ordenResult = await db.query(`SELECT COALESCE(MAX(orden), 0) + 1 AS siguiente FROM fuentes_doctrinales`);
+    const siguienteOrden = ordenResult.rows[0].siguiente;
+
+    const result = await db.query(
+      `INSERT INTO fuentes_doctrinales
+         (titulo, autor, descripcion, drive_file_id, drive_link, orden, activo, creado_en, actualizado_en)
+       VALUES ($1, $2, $3, $4, $5, $6, true, NOW(), NOW())
+       RETURNING id, titulo`,
+      [titulo, autor, descripcion, archivo.data.id, archivo.data.webViewLink, siguienteOrden]
+    );
+
+    console.log(`   Fuente doctrinal (media) subida: "${result.rows[0].titulo}"`);
+    res.json({ ok: true, id: result.rows[0].id, titulo: result.rows[0].titulo, drive_link: archivo.data.webViewLink });
+  } catch (error) {
+    console.error('❌ Error subiendo fuente doctrinal (media):', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/fuentes/lista-admin', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
