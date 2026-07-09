@@ -925,58 +925,24 @@ async function obtenerTokenDrive() {
   return token;
 }
 
-// Paso 1 de la subida directa: le pide a Drive una URL de subida temporal
-// (sesión "resumable") y se la entrega al navegador. El archivo en sí
-// nunca pasa por aquí — por eso esto nunca choca con el límite de 5
-// minutos de Railway, sin importar cuánto pese el video.
-app.post('/fuentes/iniciar-subida-media', async (req, res) => {
+// Genera un token de acceso temporal de Drive para que el navegador suba
+// el archivo directo, de principio a fin, sin pasar por el worker. Esto
+// reemplaza a /fuentes/iniciar-subida-media: Drive exige que la sesión de
+// subida se inicie desde el MISMO origen que hace la subida real — si el
+// worker inicia la sesión, Drive la rechaza por CORS cuando el navegador
+// intenta usarla después, porque el origen no coincide.
+app.post('/fuentes/token-subida-directa', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
-  }
-  const { titulo, tipoArchivo, tamano } = req.body;
-  if (!titulo || !tipoArchivo) {
-    return res.status(400).json({ error: 'Faltan título o tipo de archivo' });
-  }
-  if (!['mp4', 'mp3'].includes(tipoArchivo)) {
-    return res.status(400).json({ error: 'Tipo de archivo no admitido' });
   }
   if (!DRIVE_CARPETA_FUENTES_ID) {
     return res.status(500).json({ error: 'Falta configurar DRIVE_CARPETA_FUENTES_ID' });
   }
-
-  const mimeType = tipoArchivo === 'mp4' ? 'video/mp4' : 'audio/mpeg';
-
   try {
     const token = await obtenerTokenDrive();
-    const initRes = await fetch(
-      'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id',
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json; charset=UTF-8',
-          'X-Upload-Content-Type': mimeType,
-          ...(tamano ? { 'X-Upload-Content-Length': String(tamano) } : {}),
-        },
-        body: JSON.stringify({
-          name: `${titulo}.${tipoArchivo}`,
-          parents: [DRIVE_CARPETA_FUENTES_ID],
-        }),
-      }
-    );
-
-    if (!initRes.ok) {
-      const texto = await initRes.text();
-      throw new Error(`Drive rechazó iniciar la subida: ${texto}`);
-    }
-
-    const uploadUrl = initRes.headers.get('location');
-    if (!uploadUrl) throw new Error('Drive no devolvió una URL de subida');
-
-    console.log(`   [fuentes] Sesión de subida directa iniciada para "${titulo}"`);
-    res.json({ ok: true, uploadUrl });
+    res.json({ ok: true, token, carpetaId: DRIVE_CARPETA_FUENTES_ID });
   } catch (error) {
-    console.error('❌ Error iniciando subida directa a Drive:', error.message);
+    console.error('❌ Error generando token de subida directa:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
