@@ -638,12 +638,13 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   const lineas = reporteTexto.split('\n');
   const textoParaPuntajeYRiesgo = marcadorVisto ? textoCierre : reporteTexto;
 
-  for (const linea of textoParaPuntajeYRiesgo.split('\n')) {
-    const matchPct = linea.match(/([\d.]+)%/);
-    if (matchPct && !datos.puntaje) {
-      const v = parseFloat(matchPct[1]);
-      if (v > 10 && v <= 100) { datos.puntaje = Math.round(v); }
-    }
+  let puntajeMencionado = null;
+    for (const linea of textoParaPuntajeYRiesgo.split('\n')) {
+      const matchPct = linea.match(/([\d.]+)%/);
+      if (matchPct && puntajeMencionado === null) {
+        const v = parseFloat(matchPct[1]);
+        if (v > 10 && v <= 100) { puntajeMencionado = Math.round(v); }
+      }
   }
 
   const matchRiesgo = textoParaPuntajeYRiesgo.match(/NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)/i);
@@ -854,7 +855,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   console.log(`   ║ N/A        : ${naReal}`);
   console.log(`   ╠──────────────────────────────────────────────────`);
   console.log(`   ║ Marcador de cierre : ${marcadorVisto ? 'sí' : 'no (fallback activo)'}`);
-  console.log(`   ║ Puntaje detectado en texto : ${datos.puntaje === null ? 'null (se calculará desde conteos)' : datos.puntaje + '%'}`);
+  console.log(`   ║ Puntaje mencionado en texto : ${puntajeMencionado === null ? '(ninguno)' : puntajeMencionado + '%'}`);
   console.log(`   ║ Riesgo detectado  : ${datos.nivelRiesgo}`);
   console.log(`   ║ Nota final        : ${datos.notaFinal ? 'sí (' + datos.notaFinal.length + ' chars)' : 'no encontrada'}`);
   console.log(`   ║ Alertas           : ${datos.alertas.length}`);
