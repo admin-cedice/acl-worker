@@ -871,15 +871,31 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     datos.naCount  = naReal;
   }
 
-  if (datos.puntaje === null) {
+  // v3.3 — Única fuente de verdad: el puntaje se calcula SIEMPRE desde el
+    // conteo real (SÍ plenos / total aplicable) — SÍ con matiz ya NO cuenta
+    // como alineación plena. El porcentaje que Claude escribió en el texto
+    // libre ya no determina datos.puntaje, solo se registra como
+    // diagnóstico en los logs.
+    //
+    // Si no hay ningún SÍ pleno (todo NO, o el único positivo fue SÍ con
+    // matiz) o si no hay ningún criterio aplicable (todo N/A), NO se
+    // calcula un total general — mostrar "0%" en esos casos sería engañoso
+    // (borraría matices reales). datos.puntaje queda en null; el reporte
+    // sigue mostrando el desglose por categoría y criterio igual.
     const aplicables = datos.siPlenos + datos.siMatiz + datos.noCount;
-    if (aplicables > 0) {
-      datos.puntaje = Math.round(((datos.siPlenos + datos.siMatiz) / aplicables) * 100);
-      console.log(`   [parsearReporte] Puntaje calculado desde conteos reales: ${datos.puntaje}%`);
+    if (aplicables > 0 && datos.siPlenos > 0) {
+      datos.puntaje = Math.round((datos.siPlenos / aplicables) * 100);
+      console.log(`   [parsearReporte] Puntaje calculado (SÍ plenos / aplicables): ${datos.puntaje}%`);
     } else {
-      datos.puntaje = 0;
-      console.log(`   [parsearReporte] ⚠️  No se pudo calcular puntaje (sin criterios aplicables) — usando 0%`);
+      datos.puntaje = null;
+      console.log(`   [parsearReporte] Sin total general: ${aplicables === 0 ? 'no hay criterios aplicables (todo N/A)' : 'ningún criterio con SÍ pleno'}.`);
     }
+    if (puntajeMencionado !== null) {
+      if (datos.puntaje !== null && Math.abs(puntajeMencionado - datos.puntaje) > 5) {
+        console.warn(`   [parsearReporte] ⚠️  DISCREPANCIA: Claude mencionó ${puntajeMencionado}% en el texto, pero el cálculo real da ${datos.puntaje}%. Se usa el calculado. Si se repite, revisar prompt_analisis.`);
+      } else if (datos.puntaje === null) {
+        console.warn(`   [parsearReporte] ⚠️  Claude mencionó ${puntajeMencionado}% en el texto, pero no hay total general calculable (SÍ plenos=${datos.siPlenos}, aplicables=${aplicables}).`);
+      }
   }
 
   return datos;
@@ -902,7 +918,7 @@ async function generarResumenEjecutivo(reporteTexto, datos, metadatos) {
 
 DATOS DEL ANÁLISIS:
 - Documento auditado: ${titulo}${pais ? ` (${pais})` : ''}${fecha ? `, ${fecha}` : ''}
-- Puntaje de alineación liberal: ${puntaje}%
+- Puntaje de alineación liberal: ${puntaje !== null ? puntaje + '%' : 'sin total general — ningún criterio con SÍ pleno; ver desglose SÍ/SÍ con matiz/NO'}
 - Nivel de riesgo liberal: ${nivelRiesgo}
 - Criterios evaluados: ${totalCriterios} (${siPlenos} SÍ plenos, ${siMatiz} SÍ con reserva, ${noCount} NO, ${naCount} N/A)
 ${alertas.length > 0 ? `- Alertas principales: ${alertas.map(a => a.titulo).join('; ')}` : ''}
@@ -967,7 +983,9 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
     console.error(`   [generarResumenEjecutivo] Error llamando a Claude:`, err.message);
     const totalSI    = siPlenos + siMatiz;
     const aplicables = siPlenos + siMatiz + noCount;
-    let resumen = `El documento obtuvo un ${puntaje}% de alineación con los criterios del liberalismo clásico. `;
+    let resumen = puntaje !== null
+	      ? `El documento obtuvo un ${puntaje}% de alineación con los criterios del liberalismo clásico. `
+      : `El documento no registró ningún criterio con SÍ pleno, por lo que no se calcula un total general de alineación liberal. `;
     resumen += `De ${aplicables} criterios aplicables: ${totalSI} SÍ (${siPlenos} plenos, ${siMatiz} con reserva)`;
     if (noCount > 0) resumen += `, ${noCount} NO`;
     if (naCount > 0) resumen += `, ${naCount} N/A`;
@@ -994,7 +1012,7 @@ function generarHTML(datos, metadatos) {
     alertas          = [],
   } = datos;
 
-  const puntaje = puntajeRaw ?? 0;
+  const puntaje = puntajeRaw; // puede ser null — se maneja en la Ficha, no se fuerza a 0
 
   const {
     titulo        = 'Documento auditado',
@@ -1207,10 +1225,10 @@ function generarHTML(datos, metadatos) {
     <tr><td>Generado el</td><td>${esc(generadoEl)}</td></tr>
     <tr><td>Criterios aplicados</td><td>${totalCriterios} criterios en 7 categorías del Test de Libertad</td></tr>
     <tr>
-      <td>Resultado</td>
-      <td>
-        ${puntaje}% de alineación · Riesgo Liberal: ${esc(nivelRiesgo)}${desgloseFicha}
-      </td>
+	      <td>Resultado</td>
+	      <td>
+	        ${puntaje !== null ? `${puntaje}% de alineación · ` : ''}Riesgo Liberal: ${esc(nivelRiesgo)}${desgloseFicha}
+	      </td>
     </tr>
   </table>
 </div>`;
