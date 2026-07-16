@@ -89,49 +89,73 @@ const CATEGORIAS_NOMBRES = {
 // API limita a 24 parámetros opcionales por request, y este diseño no
 // necesita ninguno (todo required = grammar más simple y liviana).
 
+// v4.1 (16 jul 2026): la API rechazó el diseño original con un 400 —
+// "For 'array' type, 'minItems' values other than 0 or 1 are not
+// supported". El minItems:7/maxItems:7 que usaba para garantizar
+// "exactamente 7 categorías" no es una opción real en Structured Outputs.
+// Se logra la misma garantía sin arreglos con longitud forzada: en vez de
+// un ARREGLO de 7 categorías, "categorias" ahora es un OBJETO con una
+// clave fija por cada número romano (I a VII), las 7 marcadas
+// "required" — los objetos con propiedades required sí están soportados
+// sin restricción de este tipo. normalizarDatosEstructurados() se encarga
+// de convertir ese objeto de vuelta a la forma de arreglo que usa
+// generarHTML(), así que nada más en el archivo tuvo que cambiar.
+const NUMEROS_CATEGORIA = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'];
+
+function schemaCriterios() {
+  return {
+    type: 'array',
+    items: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          description: 'Código del criterio, formato "C-01" a "C-28".',
+        },
+        resultado: {
+          type: 'string',
+          enum: ['SI', 'SI_MATIZ', 'NO', 'NA'],
+          description: 'SI: se cumple plenamente. SI_MATIZ: se cumple con reservas o matices. NO: no se cumple. NA: no aplica a este documento.',
+        },
+        analisis: {
+          type: 'string',
+          description: 'De 3 a 5 oraciones en prosa razonada explicando el resultado, citando artículos o elementos concretos del documento cuando aplique.',
+        },
+      },
+      required: ['id', 'resultado', 'analisis'],
+      additionalProperties: false,
+    },
+  };
+}
+
+function schemaCategoriaUnica() {
+  return {
+    type: 'object',
+    properties: {
+      criterios: schemaCriterios(),
+    },
+    required: ['criterios'],
+    additionalProperties: false,
+  };
+}
+
 const SCHEMA_ANALISIS_AUDITORIA = {
   type: 'object',
   properties: {
     categorias: {
-      type: 'array',
-      minItems: 7,
-      maxItems: 7,
-      description: 'Las 7 categorías del Test de Libertad, en orden (I a VII), cada una con todos sus criterios evaluados.',
-      items: {
-        type: 'object',
-        properties: {
-          numero: {
-            type: 'string',
-            enum: ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'],
-            description: 'Número romano de la categoría.',
-          },
-          criterios: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                id: {
-                  type: 'string',
-                  description: 'Código del criterio, formato "C-01" a "C-28".',
-                },
-                resultado: {
-                  type: 'string',
-                  enum: ['SI', 'SI_MATIZ', 'NO', 'NA'],
-                  description: 'SI: se cumple plenamente. SI_MATIZ: se cumple con reservas o matices. NO: no se cumple. NA: no aplica a este documento.',
-                },
-                analisis: {
-                  type: 'string',
-                  description: 'De 3 a 5 oraciones en prosa razonada explicando el resultado, citando artículos o elementos concretos del documento cuando aplique.',
-                },
-              },
-              required: ['id', 'resultado', 'analisis'],
-              additionalProperties: false,
-            },
-          },
-        },
-        required: ['numero', 'criterios'],
-        additionalProperties: false,
+      type: 'object',
+      description: 'Las 7 categorías del Test de Libertad — una clave por cada número romano (I a VII), cada una con todos sus criterios evaluados. Las 7 claves son obligatorias.',
+      properties: {
+        I:   schemaCategoriaUnica(),
+        II:  schemaCategoriaUnica(),
+        III: schemaCategoriaUnica(),
+        IV:  schemaCategoriaUnica(),
+        V:   schemaCategoriaUnica(),
+        VI:  schemaCategoriaUnica(),
+        VII: schemaCategoriaUnica(),
       },
+      required: NUMEROS_CATEGORIA,
+      additionalProperties: false,
     },
     alertas: {
       type: 'array',
@@ -670,10 +694,24 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A') {
     );
   }
 
-  const categorias = (resultado.categorias || []).map(cat => ({
-    num:       cat.numero,
-    nombre:    CATEGORIAS_NOMBRES[cat.numero] || `Categoría ${cat.numero}`,
-    criterios: cat.criterios || [],
+  // "categorias" llega como objeto { I: {criterios:[...]}, II: {...}, ... }
+  // (ver v4.1 en el schema) — se recorre siempre en el mismo orden fijo
+  // I→VII y se devuelve como arreglo, que es la forma que espera
+  // generarHTML() desde v3.1 y no tuvo que cambiar.
+  const categoriasFaltantes = NUMEROS_CATEGORIA.filter(
+    num => !resultado.categorias || !resultado.categorias[num]
+  );
+  if (categoriasFaltantes.length > 0) {
+    // Con las 7 claves marcadas "required" en el schema esto no debería
+    // poder pasar nunca — si aparece, revisar SCHEMA_ANALISIS_AUDITORIA o
+    // la llamada a la API, no un texto mal escrito.
+    console.warn(`   ⚠️ [${auditoria_id}] Categorías ausentes en la respuesta: ${categoriasFaltantes.join(', ')}.`);
+  }
+
+  const categorias = NUMEROS_CATEGORIA.map(num => ({
+    num,
+    nombre:    CATEGORIAS_NOMBRES[num],
+    criterios: resultado.categorias?.[num]?.criterios || [],
   }));
 
   const todos    = categorias.flatMap(c => c.criterios);
@@ -695,14 +733,6 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A') {
   console.log(`   ╠──────────────────────────────────────────────────`);
   console.log(`   ║ Alertas    : ${(resultado.alertas || []).length}`);
   console.log(`   ╚══════════════════════════════════════════════════\n`);
-
-  if (categorias.length !== 7) {
-    // Con el schema (minItems/maxItems: 7) esto no debería poder pasar
-    // nunca en una auditoría nueva. Si aparece, el problema está en el
-    // schema o en cómo se está llamando a la API, no en un texto mal
-    // escrito — vale la pena mirarlo de inmediato.
-    console.warn(`   ⚠️ [${auditoria_id}] Se esperaban 7 categorías, llegaron ${categorias.length}. Revisar SCHEMA_ANALISIS_AUDITORIA / la llamada a la API.`);
-  }
 
   const aplicables = siPlenos + siMatiz + noCount;
   const puntaje = (aplicables > 0 && siPlenos > 0)
