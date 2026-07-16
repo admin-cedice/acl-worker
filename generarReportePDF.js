@@ -62,6 +62,16 @@
 //   FROM auditorias WHERE id = '...';
 
 
+// CAMBIOS v4.2 (16 jul 2026):
+//  43. FIX: el schema no pedía el campo "pregunta" (enunciado del
+//      criterio) — solo id/resultado/analisis. generarHTML() siempre
+//      esperó crit.pregunta para mostrarlo junto al código (ej. "C-01:
+//      ¿...?"), pero como nunca se pidió, llegaba vacío en todos los
+//      reportes generados con el pipeline nuevo. Agregado a
+//      SCHEMA_ANALISIS_AUDITORIA como campo required; no hizo falta tocar
+//      normalizarDatosEstructurados() ni generarHTML(), porque ambos ya
+//      pasaban/leían ese campo — solo faltaba pedírselo a Claude.
+
 'use strict';
 
 const fs      = require('fs');
@@ -112,6 +122,10 @@ function schemaCriterios() {
           type: 'string',
           description: 'Código del criterio, formato "C-01" a "C-28".',
         },
+        pregunta: {
+          type: 'string',
+          description: 'El enunciado completo y exacto de la pregunta de este criterio, tal como aparece en el Test de Libertad (prompt_analisis). No lo resumas ni lo parafrasees.',
+        },
         resultado: {
           type: 'string',
           enum: ['SI', 'SI_MATIZ', 'NO', 'NA'],
@@ -122,7 +136,7 @@ function schemaCriterios() {
           description: 'De 3 a 5 oraciones en prosa razonada explicando el resultado, citando artículos o elementos concretos del documento cuando aplique.',
         },
       },
-      required: ['id', 'resultado', 'analisis'],
+      required: ['id', 'pregunta', 'resultado', 'analisis'],
       additionalProperties: false,
     },
   };
