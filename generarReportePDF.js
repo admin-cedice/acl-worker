@@ -52,6 +52,30 @@
 //      (extraerNotaFinalDeTexto por criterio) sigue funcionando
 //      exactamente igual que en v3.0 — nada se rompe, solo se pierde la
 //      mejora de precisión.
+//
+// CAMBIOS v3.5 (16 jul 2026):
+//  37. ELIMINADO POR COMPLETO el mecanismo de "la coletilla" (v3.1, #36).
+//      En la práctica, tanto "@@CIERRE_AUDITORIA@@" como el ancla
+//      posterior "ALINEACIÓN LIBERAL: X%" fallaron en el 100% de las
+//      corridas reales observadas — pedirle a un modelo que reproduzca
+//      un string literal exacto, sin desviarse, al final de una
+//      generación larga (25.000+ caracteres) resultó poco confiable de
+//      forma sistemática, no ocasional. En vez de seguir puliendo el
+//      ancla, se recortó prompt_analisis: de los 6 puntos que antes se
+//      le pedían a Claude después de los 28 criterios (Ficha, Resultado
+//      por criterio, Alineación, Alertas, Efecto Comadreja, Resumen),
+//      solo "Resultado por criterio" se usaba realmente en el código —
+//      los otros 5 no se parseaban en ningún lado (la Ficha se arma
+//      desde metadatos, la Alineación siempre se recalcula desde los
+//      conteos reales, "efecto comadreja" se detecta con una búsqueda de
+//      texto simple en conNotaComadreja(), y el Resumen Ejecutivo lo
+//      genera un llamado aparte en generarResumenEjecutivo()). Se le
+//      pide a Claude que termine la respuesta justo después de C-28, sin
+//      nada más — así no hay contenido sobrante que pueda quedar mal
+//      delimitado. extraerNotaFinalDeTexto(), MARCADOR_CIERRE,
+//      ubicarMarcadorCierre() y el campo notaFinal se eliminaron por
+//      completo (dead code — ya no había nada que buscar).
+
 
 'use strict';
 
@@ -110,50 +134,6 @@ function normalizarResultadoTabla(texto) {
   if (/^N\/A|^NA\b/.test(t)) return 'NA';
   if (/^S[IÍ]\b/.test(t))    return 'SI';
   return 'SI';
-}
-
-function extraerNotaFinalDeTexto(texto) {
-  // v3.4 — el ancla cambió de "NIVEL DE RIESGO: <categoría>" a
-  // "ALINEACIÓN LIBERAL: <porcentaje>%" — las 4 categorías (Bajo/Moderado/
-  // Alto/Crítico) se eliminaron por decisión del 15 jul 2026. La función
-  // ya no devuelve ningún nivel, solo sigue sirviendo para encontrar dónde
-  // cortar el párrafo de cierre.
-  const matchAlineacion = texto.match(/ALINEACI[OÓ]N LIBERAL[^:]*:\s*\**\s*\[?\s*[\d.]+\s*\]?\s*%?/i);
-  if (!matchAlineacion) return null;
-
-  const idxAlineacion = texto.indexOf(matchAlineacion[0]);
-  const finBloque      = idxAlineacion + matchAlineacion[0].length;
-
-  // Ventana de 300 caracteres antes de "ALINEACIÓN LIBERAL" para ubicar la
-  // última mención de "Resultados" cercana — ahí suele empezar el conteo.
-  const desde = Math.max(0, idxAlineacion - 300);
-  const ventanaAntes = texto.slice(desde, idxAlineacion);
-  const ocurrenciasResultados = [...ventanaAntes.matchAll(/Resultados/gi)];
-  const inicioBloque = ocurrenciasResultados.length > 0
-    ? desde + ocurrenciasResultados[ocurrenciasResultados.length - 1].index
-    : idxAlineacion;
-
-  return {
-    textoLimpio:  texto.slice(0, inicioBloque).trim(),
-    parrafoFinal: texto.slice(finBloque).trim(),
-  };
-}
-
-// v3.1: el prompt_analisis le pide a Claude que escriba esta línea, exacta
-// y literal, justo después de terminar la justificación de C-28 — antes
-// de cualquier otro contenido (indicador de riesgo, alertas, resumen).
-const MARCADOR_CIERRE = '@@CIERRE_AUDITORIA@@';
-
-// Ubica el marcador en el texto crudo del reporte. Si aparece, devuelve
-// todo lo que viene después como "texto de cierre" — el bloque que
-// contiene el indicador de riesgo, las alertas y el resumen ejecutivo
-// embebido, ya separado de forma limpia del análisis por criterio. Si no
-// aparece (Claude lo omitió esta vez), marcadorVisto queda en false y el
-// resto del código sigue el mismo camino de respaldo que usaba en v3.0.
-function ubicarMarcadorCierre(reporteTexto) {
-  const idx = reporteTexto.indexOf(MARCADOR_CIERRE);
-  if (idx === -1) return { marcadorVisto: false, textoCierre: '' };
-  return { marcadorVisto: true, textoCierre: reporteTexto.slice(idx + MARCADOR_CIERRE.length) };
 }
 
 // ── CSS del reporte ──────────────────────────────────────────────────────────
@@ -626,30 +606,11 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     naCount:     0,
     resumenEjecutivo: '',
     puntosClave: [],
-    notaFinal:   null,
     categorias:  [],
     alertas:     [],
   };
 
-  // v3.1: si el marcador está presente, el puntaje y el nivel de riesgo se
-  // buscan SOLO en el texto de cierre (después de C-28) — más preciso que
-  // buscar en todo el documento, donde un porcentaje mencionado dentro de
-  // la justificación de algún criterio podría confundirse con el puntaje
-  // real. Si el marcador no aparece, se busca en todo el texto como antes.
-  const { marcadorVisto, textoCierre } = ubicarMarcadorCierre(reporteTexto);
-  console.log(`   [parsearReporte] Marcador de cierre @@CIERRE_AUDITORIA@@: ${marcadorVisto ? 'encontrado ✅' : 'NO encontrado — usando respaldo por regex'}`);
-
   const lineas = reporteTexto.split('\n');
-  const textoParaPuntajeYRiesgo = marcadorVisto ? textoCierre : reporteTexto;
-
-  let puntajeMencionado = null;
-  for (const linea of textoParaPuntajeYRiesgo.split('\n')) {
-    const matchPct = linea.match(/([\d.]+)%/);
-    if (matchPct && puntajeMencionado === null) {
-      const v = parseFloat(matchPct[1]);
-      if (v > 10 && v <= 100) { puntajeMencionado = Math.round(v); }
-    }
-  }
 
   const CATEGORIAS_NOMBRES = {
     'I':   'Dignidad y Autonomía Individual',
@@ -670,19 +631,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
 
   for (let i = 0; i < lineas.length; i++) {
     const linea = lineas[i];
-
-    // v3.1: corte duro — en cuanto aparece el marcador, se cierra
-    // inmediatamente el criterio actual (normalmente C-28) y no se le
-    // vuelve a agregar nada más al buffer. Esto es lo que evita que el
-    // indicador de riesgo o el resumen queden pegados a su justificación,
-    // sin depender de que el texto que sigue tenga un encabezado válido.
-    if (linea.trim() === MARCADOR_CIERRE) {
-      if (criterioActual) {
-        criterioActual.analisis = bufferAnalisis.join(' ').trim();
-        bufferAnalisis = []; criterioActual = null;
-      }
-      continue;
-    }
 
     if (/^#{1,4}\s*\d+\.\s*ALERTAS?|^##\s*ALERTAS|ALERTAS? PRINCIPALES/i.test(linea)) {
       enAlertas = true;
@@ -812,30 +760,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   if (criterioActual && bufferAnalisis.length > 0) criterioActual.analisis = bufferAnalisis.join(' ').trim();
   if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); }
 
-  if (marcadorVisto) {
-    // v3.1 — camino limpio: el corte duro de arriba ya garantizó que
-    // ningún texto de cierre quedó pegado a C-28, así que no hace falta
-    // revisar criterio por criterio. El párrafo de cierre se extrae
-    // directo del texto que viene después del marcador.
-    const extra = extraerNotaFinalDeTexto(textoCierre);
-    if (extra) {
-      datos.notaFinal = extra.parrafoFinal;
-    }
-  } else {
-    // Respaldo tal como funcionaba en v3.0 — por si Claude omitió el
-    // marcador esta vez (la naturaleza estocástica del modelo no lo
-    // garantiza al 100%, aunque el prompt se lo pida explícitamente).
-    for (const cat of datos.categorias) {
-      for (const crit of cat.criterios) {
-        const extra = extraerNotaFinalDeTexto(crit.analisis || '');
-        if (extra) {
-          crit.analisis   = extra.textoLimpio;
-          datos.notaFinal = extra.parrafoFinal;
-        }
-      }
-    }
-  }
-
   const todos = datos.categorias.flatMap(c => c.criterios);
   const siPlenosReal = todos.filter(c => c.resultado === 'SI').length;
   const siMatizReal  = todos.filter(c => c.resultado === 'SI_MATIZ').length;
@@ -853,9 +777,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   console.log(`   ║ NO         : ${noReal}`);
   console.log(`   ║ N/A        : ${naReal}`);
   console.log(`   ╠──────────────────────────────────────────────────`);
-  console.log(`   ║ Marcador de cierre : ${marcadorVisto ? 'sí' : 'no (fallback activo)'}`);
-  console.log(`   ║ Puntaje mencionado en texto : ${puntajeMencionado === null ? '(ninguno)' : puntajeMencionado + '%'}`);
-  console.log(`   ║ Nota final        : ${datos.notaFinal ? 'sí (' + datos.notaFinal.length + ' chars)' : 'no encontrada'}`);
   console.log(`   ║ Alertas           : ${datos.alertas.length}`);
   if (datos.categorias.length > 0) {
     console.log(`   ╠── Distribución de resultados por criterio:`);
@@ -877,13 +798,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   } else {
     datos.puntaje = null;
     console.log(`   [parsearReporte] Sin total general: ${aplicables === 0 ? 'no hay criterios aplicables (todo N/A)' : 'ningún criterio con SÍ pleno'}.`);
-  }
-  if (puntajeMencionado !== null) {
-    if (datos.puntaje !== null && Math.abs(puntajeMencionado - datos.puntaje) > 5) {
-      console.warn(`   [parsearReporte] ⚠️  DISCREPANCIA: Claude mencionó ${puntajeMencionado}% en el texto, pero el cálculo real da ${datos.puntaje}%. Se usa el calculado. Si se repite, revisar prompt_analisis.`);
-    } else if (datos.puntaje === null) {
-      console.warn(`   [parsearReporte] ⚠️  Claude mencionó ${puntajeMencionado}% en el texto, pero no hay total general calculable (SÍ plenos=${datos.siPlenos}, aplicables=${aplicables}).`);
-    }
   }
 
   return datos;
@@ -993,7 +907,6 @@ function generarHTML(datos, metadatos) {
     naCount          = 0,
     resumenEjecutivo = '',
     puntosClave      = [],
-    notaFinal        = null,
     categorias       = [],
     alertas          = [],
   } = datos;
@@ -1086,7 +999,6 @@ function generarHTML(datos, metadatos) {
     <tbody>${filasTabla}</tbody>
     <tfoot>${filaTotalTabla}</tfoot>
   </table>
-  ${notaFinal ? `<div class="nota-final-texto">${conNotaComadreja(notaFinal)}</div>` : ''}
 </div>` : '';
 
   const htmlPortada = `
