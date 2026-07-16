@@ -1,80 +1,65 @@
-// generarReportePDF.js — ACL Worker v3.1
+// generarReportePDF.js — ACL Worker v4.0
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
-// CAMBIOS v2-v2.6 (jun-jul 2026): ver versiones anteriores del archivo.
-//   Resumen ejecutivo por Claude, detección de criterios en tabla markdown,
-//   Manual/Ficha reordenados, Indicador General reemplazado por puntos
-//   clave, fondo crema de borde a borde, salto de página solo antes de la
-//   primera categoría, leyenda SÍ/SÍ*/NO, cuadro resumen por categoría.
+// CAMBIOS v2-v3.1 (jun-jul 2026): ver versiones anteriores del archivo en el
+// historial. Resumen: resumen ejecutivo por Claude, detección de criterios
+// en tabla markdown, Manual/Ficha reordenados, indicador general
+// reemplazado por puntos clave, fondo crema de borde a borde, salto de
+// página solo antes de la primera categoría, leyenda SÍ/SÍ*/NO, cuadro
+// resumen por categoría, fix del párrafo de cierre pegado al último
+// criterio ("la coletilla", v3.1), fix de niveles de riesgo (4 niveles
+// reales: Bajo/Moderado/Alto/Crítico — "MUY ALTO" nunca existió).
 //
-// CAMBIOS v2.7-v2.9 (7 jul 2026):
-//   Fix del párrafo de cierre pegado al último criterio + inconsistencia
-//   de nivel de riesgo (CRÍTICO reconocido). Cuadro resumen duplicado en
-//   portada, espaciado de bullets reducido, numeración de páginas, nota de
-//   "efecto comadreja", leyenda de niveles de riesgo (rangos confirmados:
-//   Bajo 85-100% / Moderado 65-84% / Alto 40-64% / Crítico 0-39% — "MUY
-//   ALTO" nunca existió en la doctrina real). Cuadro/leyenda duplicados al
-//   final del Análisis por Criterio eliminados (quedaban redundantes con
-//   la portada). Ficha movida a después de la última categoría.
+// CAMBIOS v3.5 (16 jul 2026, sesión anterior):
+//  37. Eliminado el mecanismo de "la coletilla" (marcador
+//      @@CIERRE_AUDITORIA@@) — falló el 100% de las corridas reales
+//      observadas. Ya no hacía falta: solo "Resultado por criterio" se
+//      usaba realmente en el código.
 //
-// CAMBIOS v3.0 (7 jul 2026):
-//  34. FIX DE RAÍZ (puntos clave vacíos + resumen ejecutivo reducido a una
-//      línea): generarResumenEjecutivo() pedía la respuesta en JSON con el
-//      resumen de 3 párrafos embebido en un campo de texto. Un texto largo
-//      con saltos de línea dentro de un string JSON es frágil — basta que
-//      Claude use un salto de línea real en vez de "\n" escapado para que
-//      JSON.parse() falle, y eso es exactamente lo que estaba pasando: al
-//      fallar, la función caía al texto mecánico de respaldo (una sola
-//      oración) y devolvía puntosClave vacío. Se dejó de usar JSON — ahora
-//      se pide un formato de texto plano con marcadores ("PUNTOS_CLAVE:" /
-//      "RESUMEN:") que no tiene sintaxis que romper con un salto de línea.
-//  35. El link al Manual de Liberalismo ya NO depende de que Claude escriba
-//      literalmente "efecto comadreja" en su análisis (frase que varía de
-//      una corrida a otra). Ahora aparece SIEMPRE en dos lugares que se
-//      renderizan en todo reporte: la fila "Marco doctrinal" de la Ficha,
-//      y la leyenda de niveles de riesgo en la portada. La nota dinámica
-//      cuando sí aparece "efecto comadreja" en el texto se conserva como
-//      complemento, no como única vía.
+// CAMBIOS v4.0 (16 jul 2026) — MIGRACIÓN A SALIDA ESTRUCTURADA:
+//  38. ELIMINADO POR COMPLETO parsearReporte() y toda la familia de regex
+//      que interpretaba texto libre de Claude (matchCat, matchCritTabla,
+//      matchCrit, matchResultadoB, normalizarResultadoTabla). Motivo: cada
+//      variación de formato que Claude decidía usar (tabla vs. prosa, con o
+//      sin "LIBERAL" en "NIVEL DE RIESGO", encabezados con distinto
+//      separador) rompía el parser de una forma distinta, y cada arreglo
+//      era un parche reactivo sobre el síntoma más reciente, no sobre la
+//      causa. La causa real: un modelo de lenguaje generando texto libre
+//      nunca garantiza una forma exacta — no es un bug de nuestro código,
+//      es una discordancia de arquitectura entre "texto libre" y "regex que
+//      asume una forma fija".
+//  39. analizarConClaude() (en worker.js) ahora usa la función de
+//      Structured Outputs de la API de Claude (output_config.format, GA
+//      para claude-sonnet-5, compatible con el pensamiento adaptativo) para
+//      forzar que la respuesta sea JSON válido según
+//      SCHEMA_ANALISIS_AUDITORIA — exactamente 7 categorías, cada criterio
+//      con id/resultado/analisis. reporte_texto en la BD sigue siendo un
+//      string de principio a fin, pero ahora ese string es JSON garantizado
+//      en vez de markdown/prosa libre.
+//  40. normalizarDatosEstructurados() reemplaza a parsearReporte(): ya no
+//      "adivina" nada de un texto ambiguo, solo organiza datos que la API
+//      ya garantizó válidos (agrega el nombre de cada categoría, cuenta
+//      resultados, calcula el puntaje). Un fallo aquí solo puede significar
+//      que el JSON no vino con la forma esperada — imposible en auditorías
+//      nuevas, posible solo si se intenta reprocesar una auditoría vieja
+//      (pre-16-jul-2026) cuyo reporte_texto todavía es markdown; el error
+//      lo dice explícitamente en vez de fallar en silencio.
+//  41. generarResumenEjecutivo() ya no recibe reporteTexto ni hace
+//      reporteTexto.slice(0, 6000) como contexto — arma su propio resumen
+//      compacto a partir de los datos ya estructurados
+//      (resumirParaPrompt()), sin depender de dónde cae el corte de 6000
+//      caracteres en un texto narrativo.
+//  42. normalizarResultadoTabla() eliminada — dead code. Ya no hace falta
+//      "normalizar" el resultado de un criterio: el schema garantiza que
+//      solo puede venir como SI | SI_MATIZ | NO | NA.
 //
-// CAMBIOS v3.1 (8 jul 2026):
-//  36. FIX DE RAÍZ del párrafo de cierre pegado a C-28 ("la coletilla").
-//      En vez de perseguir por regex una frontera que Claude redacta
-//      distinto en cada corrida, prompt_analisis ahora le pide a Claude
-//      que escriba una línea literal y exacta, "@@CIERRE_AUDITORIA@@",
-//      justo después de terminar C-28 y antes de cualquier otro
-//      contenido. parsearReporte() usa esa línea como corte duro: en
-//      cuanto aparece, se cierra el buffer de C-28 sin importar si lo
-//      que sigue tiene o no un encabezado reconocible. Ver
-//      ubicarMarcadorCierre(). Si el marcador no aparece (poco común,
-//      pero la naturaleza estocástica del modelo no lo garantiza al
-//      100%), el código de respaldo por regex de siempre
-//      (extraerNotaFinalDeTexto por criterio) sigue funcionando
-//      exactamente igual que en v3.0 — nada se rompe, solo se pierde la
-//      mejora de precisión.
+// Para depurar una auditoría nueva ya no hace falta SUBSTRING a ciegas:
+//   SELECT jsonb_array_length(reporte_texto::jsonb -> 'categorias')
+//   FROM auditorias WHERE id = '...';
 //
-// CAMBIOS v3.5 (16 jul 2026):
-//  37. ELIMINADO POR COMPLETO el mecanismo de "la coletilla" (v3.1, #36).
-//      En la práctica, tanto "@@CIERRE_AUDITORIA@@" como el ancla
-//      posterior "ALINEACIÓN LIBERAL: X%" fallaron en el 100% de las
-//      corridas reales observadas — pedirle a un modelo que reproduzca
-//      un string literal exacto, sin desviarse, al final de una
-//      generación larga (25.000+ caracteres) resultó poco confiable de
-//      forma sistemática, no ocasional. En vez de seguir puliendo el
-//      ancla, se recortó prompt_analisis: de los 6 puntos que antes se
-//      le pedían a Claude después de los 28 criterios (Ficha, Resultado
-//      por criterio, Alineación, Alertas, Efecto Comadreja, Resumen),
-//      solo "Resultado por criterio" se usaba realmente en el código —
-//      los otros 5 no se parseaban en ningún lado (la Ficha se arma
-//      desde metadatos, la Alineación siempre se recalcula desde los
-//      conteos reales, "efecto comadreja" se detecta con una búsqueda de
-//      texto simple en conNotaComadreja(), y el Resumen Ejecutivo lo
-//      genera un llamado aparte en generarResumenEjecutivo()). Se le
-//      pide a Claude que termine la respuesta justo después de C-28, sin
-//      nada más — así no hay contenido sobrante que pueda quedar mal
-//      delimitado. extraerNotaFinalDeTexto(), MARCADOR_CIERRE,
-//      ubicarMarcadorCierre() y el campo notaFinal se eliminaron por
-//      completo (dead code — ya no había nada que buscar).
+//   SELECT jsonb_pretty(reporte_texto::jsonb -> 'categorias' -> 6) -- cat. VII
+//   FROM auditorias WHERE id = '...';
 
 
 'use strict';
@@ -86,6 +71,87 @@ const Anthropic = require('@anthropic-ai/sdk');
 // ── Constantes doctrinales ──────────────────────────────────────────────────
 
 const URL_MANUAL = 'https://liberalmente.app/manual-de-liberalismo.pdf';
+
+const CATEGORIAS_NOMBRES = {
+  'I':   'Dignidad y Autonomía Individual',
+  'II':  'Estado de Derecho e Instituciones',
+  'III': 'Propiedad Privada y Libre Empresa',
+  'IV':  'Competencia y Rechazo al Rentismo',
+  'V':   'Límites al Estado y Subsidiariedad',
+  'VI':  'Igualdad de Oportunidades y Política Social',
+  'VII': 'Integridad Semántica y Soberanía',
+};
+
+// ── Schema de Structured Outputs para analizarConClaude() (worker.js) ───────
+// Se define y exporta desde aquí porque este archivo es "el dueño" de la
+// forma que debe tener un reporte de auditoría — worker.js solo lo importa
+// y lo pasa en output_config.format. Cero campos opcionales a propósito: la
+// API limita a 24 parámetros opcionales por request, y este diseño no
+// necesita ninguno (todo required = grammar más simple y liviana).
+
+const SCHEMA_ANALISIS_AUDITORIA = {
+  type: 'object',
+  properties: {
+    categorias: {
+      type: 'array',
+      minItems: 7,
+      maxItems: 7,
+      description: 'Las 7 categorías del Test de Libertad, en orden (I a VII), cada una con todos sus criterios evaluados.',
+      items: {
+        type: 'object',
+        properties: {
+          numero: {
+            type: 'string',
+            enum: ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'],
+            description: 'Número romano de la categoría.',
+          },
+          criterios: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: {
+                  type: 'string',
+                  description: 'Código del criterio, formato "C-01" a "C-28".',
+                },
+                resultado: {
+                  type: 'string',
+                  enum: ['SI', 'SI_MATIZ', 'NO', 'NA'],
+                  description: 'SI: se cumple plenamente. SI_MATIZ: se cumple con reservas o matices. NO: no se cumple. NA: no aplica a este documento.',
+                },
+                analisis: {
+                  type: 'string',
+                  description: 'De 3 a 5 oraciones en prosa razonada explicando el resultado, citando artículos o elementos concretos del documento cuando aplique.',
+                },
+              },
+              required: ['id', 'resultado', 'analisis'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['numero', 'criterios'],
+        additionalProperties: false,
+      },
+    },
+    alertas: {
+      type: 'array',
+      description: 'Alertas principales del documento. Arreglo vacío si no hay ninguna.',
+      items: {
+        type: 'object',
+        properties: {
+          titulo:      { type: 'string' },
+          gravedad:    { type: 'string', enum: ['ALTA', 'MODERADA-ALTA', 'MODERADA', 'BAJA'] },
+          descripcion: { type: 'string', description: '2 a 4 oraciones describiendo la alerta.' },
+          criterios:   { type: 'array', items: { type: 'string' }, description: 'Códigos relacionados, ej. ["C-19","C-08"].' },
+        },
+        required: ['titulo', 'gravedad', 'descripcion', 'criterios'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['categorias', 'alertas'],
+  additionalProperties: false,
+};
 
 // ── Helpers de HTML ──────────────────────────────────────────────────────────
 
@@ -100,7 +166,7 @@ function esc(str) {
 
 // Como esc(), pero además inserta la nota doctrinal cuando el texto
 // menciona "efecto comadreja". Complementa (no reemplaza) el link fijo que
-// ahora vive en la Ficha y en la leyenda de riesgo — ver changelog v3.0 #35.
+// vive en la Ficha y en la leyenda de riesgo — ver changelog v3.0.
 function conNotaComadreja(textoPlano) {
   const escapado = esc(textoPlano);
   return escapado.replace(
@@ -127,16 +193,7 @@ function colorAlerta(gravedad) {
   return                                     { fondo: '#E8F0F7', borde: '#B5CDE0', badge: '#2A6496' };
 }
 
-function normalizarResultadoTabla(texto) {
-  const t = (texto || '').toUpperCase().trim();
-  if (/CON RESERVA|CON MATIZ|PARCIAL|MIXTO/.test(t)) return 'SI_MATIZ';
-  if (/^NO\b/.test(t))       return 'NO';
-  if (/^N\/A|^NA\b/.test(t)) return 'NA';
-  if (/^S[IÍ]\b/.test(t))    return 'SI';
-  return 'SI';
-}
-
-// ── CSS del reporte ──────────────────────────────────────────────────────────
+// ── CSS del reporte (sin cambios respecto a v3.1) ────────────────────────────
 
 const CSS = `
   @page {
@@ -595,221 +652,91 @@ const CSS = `
   }
 `;
 
-// ── Parsear el reporte de texto plano ────────────────────────────────────────
+// ── Normalizar los datos ya estructurados (reemplaza a parsearReporte) ──────
+// Ya no interpreta texto ambiguo: solo organiza un JSON que la API de
+// Claude ya garantizó válido según SCHEMA_ANALISIS_AUDITORIA. Si esto
+// lanza un error, significa que reporte_texto no es JSON (probablemente
+// una auditoría de antes del 16 jul 2026, previa a esta migración).
 
-function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
-  const datos = {
-    puntaje:     null,
-    siPlenos:    0,
-    siMatiz:     0,
-    noCount:     0,
-    naCount:     0,
-    resumenEjecutivo: '',
-    puntosClave: [],
-    categorias:  [],
-    alertas:     [],
-  };
-
-  const lineas = reporteTexto.split('\n');
-
-  const CATEGORIAS_NOMBRES = {
-    'I':   'Dignidad y Autonomía Individual',
-    'II':  'Estado de Derecho e Instituciones',
-    'III': 'Propiedad Privada y Libre Empresa',
-    'IV':  'Competencia y Rechazo al Rentismo',
-    'V':   'Límites al Estado y Subsidiariedad',
-    'VI':  'Igualdad de Oportunidades y Política Social',
-    'VII': 'Integridad Semántica y Soberanía',
-  };
-
-  let categoriaActual = null;
-  let criterioActual  = null;
-  let bufferAnalisis  = [];
-  let enAlertas       = false;
-  let alertaActual    = null;
-  let bufferAlerta    = [];
-
-  for (let i = 0; i < lineas.length; i++) {
-    const linea = lineas[i];
-
-    if (/^#{1,4}\s*\d+\.\s*ALERTAS?|^##\s*ALERTAS|ALERTAS? PRINCIPALES/i.test(linea)) {
-      enAlertas = true;
-      if (criterioActual) {
-        criterioActual.analisis = bufferAnalisis.join(' ').trim();
-        bufferAnalisis = []; criterioActual = null;
-      }
-      if (alertaActual) {
-        alertaActual.descripcion = bufferAlerta.join(' ').trim();
-        bufferAlerta = []; datos.alertas.push(alertaActual); alertaActual = null;
-      }
-      continue;
-    }
-
-    if (/conclusi[oó]n|resumen ejecutivo|valoraci[oó]n final/i.test(linea) && linea.startsWith('#')) {
-      if (criterioActual) {
-        criterioActual.analisis = bufferAnalisis.join(' ').trim();
-        bufferAnalisis = []; criterioActual = null;
-      }
-      enAlertas = false;
-      continue;
-    }
-
-    const matchCat = linea.match(/^#{0,4}\s*CATEGOR[IÍ]A\s+(I{1,3}V?|VI{0,3}|IV)\s*[—–-]+\s*(.*)/i);
-    if (matchCat) {
-      if (criterioActual) {
-        criterioActual.analisis = bufferAnalisis.join(' ').trim();
-        bufferAnalisis = []; criterioActual = null;
-      }
-      enAlertas = false;
-      const numRom  = matchCat[1].toUpperCase();
-      const nombre  = matchCat[2].trim() || CATEGORIAS_NOMBRES[numRom] || `Categoría ${numRom}`;
-      const nombreFmt = nombre === nombre.toUpperCase()
-        ? (CATEGORIAS_NOMBRES[numRom] || nombre.charAt(0) + nombre.slice(1).toLowerCase())
-        : nombre;
-      categoriaActual = { num: numRom, nombre: nombreFmt, criterios: [] };
-      datos.categorias.push(categoriaActual);
-      continue;
-    }
-
-    const matchCritTabla = linea.match(/^\|\s*(C-\d{2})\s*\|\s*\*{0,2}([^|*]+?)\*{0,2}\s*\|\s*(.+?)\s*\|?\s*$/i);
-    if (matchCritTabla && categoriaActual) {
-      categoriaActual.criterios.push({
-        id:        matchCritTabla[1].toUpperCase(),
-        pregunta:  '',
-        resultado: normalizarResultadoTabla(matchCritTabla[2]),
-        analisis:  matchCritTabla[3].replace(/\*\*/g, '').trim(),
-      });
-      criterioActual = null;
-      continue;
-    }
-
-    const matchCrit = linea.match(/^[#>\-\s]*\*{0,2}(?:criterio\s+)?(C-\d{2})\*{0,2}[.\s:]*(.*)/i);
-    if (matchCrit && categoriaActual) {
-      const esNotaMetodologica = /se computa|se compute|computa como|por tanto|N\/A aplicado|los criterios con|se pondera/i.test(linea);
-      if (esNotaMetodologica) {
-        if (criterioActual) {
-          const limpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
-          if (limpia) bufferAnalisis.push(limpia);
-        }
-        continue;
-      }
-      if (criterioActual) {
-        criterioActual.analisis = bufferAnalisis.join(' ').trim();
-        bufferAnalisis = [];
-      }
-      const pregunta = matchCrit[2].replace(/\*\*/g, '').trim();
-      criterioActual = { id: matchCrit[1].toUpperCase(), pregunta, resultado: 'SI', analisis: '' };
-      categoriaActual.criterios.push(criterioActual);
-      continue;
-    }
-
-    if (criterioActual) {
-      const matchResultadoB = linea.match(/RESULTADO[:\s*:]+([^\n*]+)/i);
-      if (matchResultadoB) {
-        const texto = matchResultadoB[1].toUpperCase().trim();
-        if      (/^NO\b|MIXTO.*NO|ALERTA MAYOR/.test(texto))        criterioActual.resultado = 'NO';
-        else if (/^N\/A|^NA\b/.test(texto))                          criterioActual.resultado = 'NA';
-        else if (/CON RESERVA|CON MATIZ|PARCIAL|MIXTO/.test(texto)) criterioActual.resultado = 'SI_MATIZ';
-        else if (/^SÍ|^SI/.test(texto))                              criterioActual.resultado = 'SI';
-        continue;
-      }
-
-      if      (/✅\s*SÍ\s*\*|✓\s*SÍ\s*\*|SÍ\s*con\s*matiz/i.test(linea))         criterioActual.resultado = 'SI_MATIZ';
-      else if (/✅\s*SÍ|✓\s*SÍ|'\s*\*\*SÍ\*\*/i.test(linea) && !linea.includes('*')) criterioActual.resultado = 'SI';
-      else if (/✗\s*NO|❌\s*NO/i.test(linea))                                         criterioActual.resultado = 'NO';
-
-      if (linea.trim() && !linea.startsWith('#') && !linea.startsWith('---')
-          && !linea.startsWith('**RESULTADO') && !linea.startsWith('|')
-          && !/^\*\*Cálculo|Criterios aplicables|Resultados SÍ|Porcentaje de alineación/i.test(linea)) {
-        const limpia = linea.replace(/\*\*/g, '').replace(/^[\s>*-]+/, '').trim();
-        if (limpia) bufferAnalisis.push(limpia);
-      }
-      continue;
-    }
-
-    if (enAlertas) {
-      const matchAlerta = linea.match(/^#{1,4}\s*ALERTA\s*\d+[^:]*[:\s]*(.*)/i);
-      if (matchAlerta) {
-        if (alertaActual) {
-          alertaActual.descripcion = bufferAlerta.join(' ').trim();
-          datos.alertas.push(alertaActual); bufferAlerta = [];
-        }
-        alertaActual = {
-          titulo:      matchAlerta[1].replace(/\*\*/g, '').trim(),
-          gravedad:    'MODERADA',
-          descripcion: '',
-          criterios:   [],
-        };
-        if      (/CRÍT|CRÍTICA|CRÍTICO/i.test(alertaActual.titulo))   alertaActual.gravedad = 'ALTA';
-        else if (/ALTA/i.test(alertaActual.titulo))                    alertaActual.gravedad = 'ALTA';
-        else if (/MODERADA?[- ]ALTA/i.test(alertaActual.titulo))      alertaActual.gravedad = 'MODERADA-ALTA';
-        else if (/MODERADA?/i.test(alertaActual.titulo))               alertaActual.gravedad = 'MODERADA';
-        continue;
-      }
-      if (alertaActual) {
-        const matchGrav = linea.match(/Gravedad[:\s]+\**(ALTA|MODERADA[- ]ALTA|MODERADA|BAJA)\**/i);
-        if (matchGrav) { alertaActual.gravedad = matchGrav[1].toUpperCase(); continue; }
-        const matchCrits = linea.match(/C-\d{2}/g);
-        if (matchCrits) alertaActual.criterios.push(...matchCrits.filter(c => !alertaActual.criterios.includes(c)));
-        const limpia = linea.replace(/\*\*/g, '').replace(/^[>\s*#-]+/, '').trim();
-        if (limpia && !linea.startsWith('#')) bufferAlerta.push(limpia);
-      }
-    }
+function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A') {
+  let resultado;
+  try {
+    resultado = typeof reporteJSON === 'string' ? JSON.parse(reporteJSON) : reporteJSON;
+  } catch (err) {
+    throw new Error(
+      `[${auditoria_id}] reporte_texto no es JSON válido — ¿es una auditoría de antes de la ` +
+      `migración a salida estructurada (16 jul 2026)? Ese formato ya no es compatible; ` +
+      `bórrala con /eliminar-auditoria y reprocésala desde cero. Detalle: ${err.message}`
+    );
   }
 
-  if (criterioActual && bufferAnalisis.length > 0) criterioActual.analisis = bufferAnalisis.join(' ').trim();
-  if (alertaActual) { alertaActual.descripcion = bufferAlerta.join(' ').trim(); datos.alertas.push(alertaActual); }
+  const categorias = (resultado.categorias || []).map(cat => ({
+    num:       cat.numero,
+    nombre:    CATEGORIAS_NOMBRES[cat.numero] || `Categoría ${cat.numero}`,
+    criterios: cat.criterios || [],
+  }));
 
-  const todos = datos.categorias.flatMap(c => c.criterios);
-  const siPlenosReal = todos.filter(c => c.resultado === 'SI').length;
-  const siMatizReal  = todos.filter(c => c.resultado === 'SI_MATIZ').length;
-  const noReal       = todos.filter(c => c.resultado === 'NO').length;
-  const naReal       = todos.filter(c => c.resultado === 'NA').length;
+  const todos    = categorias.flatMap(c => c.criterios);
+  const siPlenos = todos.filter(c => c.resultado === 'SI').length;
+  const siMatiz  = todos.filter(c => c.resultado === 'SI_MATIZ').length;
+  const noCount  = todos.filter(c => c.resultado === 'NO').length;
+  const naCount  = todos.filter(c => c.resultado === 'NA').length;
 
   console.log(`\n   ╔══════════════════════════════════════════════════`);
-  console.log(`   ║ DIAGNÓSTICO PARSER [${auditoria_id}]`);
+  console.log(`   ║ DIAGNÓSTICO [${auditoria_id}] (salida estructurada)`);
   console.log(`   ╠══════════════════════════════════════════════════`);
-  console.log(`   ║ Categorías encontradas : ${datos.categorias.length}`);
-  console.log(`   ║ Total criterios        : ${todos.length}`);
+  console.log(`   ║ Categorías : ${categorias.length} (se esperan 7)`);
+  console.log(`   ║ Criterios  : ${todos.length}`);
   console.log(`   ╠──────────────────────────────────────────────────`);
-  console.log(`   ║ SÍ plenos  : ${siPlenosReal}`);
-  console.log(`   ║ SÍ con *   : ${siMatizReal}`);
-  console.log(`   ║ NO         : ${noReal}`);
-  console.log(`   ║ N/A        : ${naReal}`);
+  console.log(`   ║ SÍ plenos  : ${siPlenos}`);
+  console.log(`   ║ SÍ con *   : ${siMatiz}`);
+  console.log(`   ║ NO         : ${noCount}`);
+  console.log(`   ║ N/A        : ${naCount}`);
   console.log(`   ╠──────────────────────────────────────────────────`);
-  console.log(`   ║ Alertas           : ${datos.alertas.length}`);
-  if (datos.categorias.length > 0) {
-    console.log(`   ╠── Distribución de resultados por criterio:`);
-    todos.forEach(c => console.log(`   ║   ${c.id} → ${c.resultado}`));
-  }
+  console.log(`   ║ Alertas    : ${(resultado.alertas || []).length}`);
   console.log(`   ╚══════════════════════════════════════════════════\n`);
 
-  if (siPlenosReal + siMatizReal + noReal > 0) {
-    datos.siPlenos = siPlenosReal;
-    datos.siMatiz  = siMatizReal;
-    datos.noCount  = noReal;
-    datos.naCount  = naReal;
+  if (categorias.length !== 7) {
+    // Con el schema (minItems/maxItems: 7) esto no debería poder pasar
+    // nunca en una auditoría nueva. Si aparece, el problema está en el
+    // schema o en cómo se está llamando a la API, no en un texto mal
+    // escrito — vale la pena mirarlo de inmediato.
+    console.warn(`   ⚠️ [${auditoria_id}] Se esperaban 7 categorías, llegaron ${categorias.length}. Revisar SCHEMA_ANALISIS_AUDITORIA / la llamada a la API.`);
   }
 
-  const aplicables = datos.siPlenos + datos.siMatiz + datos.noCount;
-  if (aplicables > 0 && datos.siPlenos > 0) {
-    datos.puntaje = Math.round((datos.siPlenos / aplicables) * 100);
-    console.log(`   [parsearReporte] Puntaje calculado (SÍ plenos / aplicables): ${datos.puntaje}%`);
-  } else {
-    datos.puntaje = null;
-    console.log(`   [parsearReporte] Sin total general: ${aplicables === 0 ? 'no hay criterios aplicables (todo N/A)' : 'ningún criterio con SÍ pleno'}.`);
-  }
+  const aplicables = siPlenos + siMatiz + noCount;
+  const puntaje = (aplicables > 0 && siPlenos > 0)
+    ? Math.round((siPlenos / aplicables) * 100)
+    : null;
 
-  return datos;
+  return {
+    puntaje, siPlenos, siMatiz, noCount, naCount,
+    resumenEjecutivo: '', puntosClave: [],
+    categorias,
+    alertas: resultado.alertas || [],
+  };
+}
+
+// Arma un texto compacto y limpio a partir de los datos ya estructurados,
+// para usar como contexto en el llamado de generarResumenEjecutivo(). Ya no
+// depende de reporteTexto.slice(0, 6000) — ese corte podía caer a mitad de
+// un criterio en un texto narrativo largo.
+function resumirParaPrompt(datos) {
+  return datos.categorias.map(cat =>
+    `CATEGORÍA ${cat.num} — ${cat.nombre}\n` +
+    cat.criterios.map(c => `${c.id} [${c.resultado}]: ${c.analisis}`).join('\n')
+  ).join('\n\n');
 }
 
 // ── Generar resumen ejecutivo + puntos clave con Claude ──────────────────────
-// v3.0: formato de texto plano con marcadores, NO JSON. Un texto largo con
-// saltos de línea dentro de un string JSON es frágil (basta un salto de
-// línea sin escapar para romper JSON.parse) — este formato no tiene
-// sintaxis que se pueda romper así.
+// v3.0: formato de texto plano con marcadores, NO JSON — un texto largo con
+// saltos de línea dentro de un string JSON es frágil. Esto sigue siendo
+// válido en v4.0: aquí SÍ queremos que Claude escriba prosa libre (es un
+// resumen para humanos, no datos para parsear), así que no tiene sentido
+// forzarlo con Structured Outputs — el problema de fondo que resolvimos hoy
+// era específico de los 28 criterios estructurados, no de este texto.
 
-async function generarResumenEjecutivo(reporteTexto, datos, metadatos) {
+async function generarResumenEjecutivo(datos, metadatos) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   const { puntaje, siPlenos, siMatiz, noCount, naCount, alertas } = datos;
@@ -824,8 +751,8 @@ DATOS DEL ANÁLISIS:
 - Criterios evaluados: ${totalCriterios} (${siPlenos} SÍ plenos, ${siMatiz} SÍ con reserva, ${noCount} NO, ${naCount} N/A)
 ${alertas.length > 0 ? `- Alertas principales: ${alertas.map(a => a.titulo).join('; ')}` : ''}
 
-REPORTE COMPLETO (del cual debes extraer las ideas más importantes):
-${reporteTexto.slice(0, 6000)}
+ANÁLISIS COMPLETO POR CRITERIO (del cual debes extraer las ideas más importantes):
+${resumirParaPrompt(datos).slice(0, 6000)}
 
 INSTRUCCIONES:
 Responde ÚNICAMENTE con el siguiente formato de texto plano — NO uses JSON, ni backticks, ni markdown. Empieza directamente con "PUNTOS_CLAVE:", sin nada antes:
@@ -897,6 +824,9 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
 }
 
 // ── Generar HTML ─────────────────────────────────────────────────────────────
+// Sin cambios respecto a v3.1 — consume la misma forma de "datos" que
+// devolvía parsearReporte(), y normalizarDatosEstructurados() la respeta a
+// propósito para no tener que tocar nada de esto.
 
 function generarHTML(datos, metadatos) {
   const {
@@ -1037,7 +967,7 @@ function generarHTML(datos, metadatos) {
   <div class="criterio">
     <div class="criterio-header">
       <span class="criterio-codigo">${esc(crit.id)}</span>
-      <span class="criterio-pregunta">${esc(crit.pregunta)}</span>
+      <span class="criterio-pregunta">${esc(crit.pregunta || '')}</span>
       ${badgeResultado(crit.resultado)}
     </div>
     ${crit.analisis ? `<div class="criterio-analisis">${conNotaComadreja(crit.analisis)}</div>` : ''}
@@ -1169,6 +1099,7 @@ function registrarRutaHTMLTemporal(app) {
 }
 
 // ── Conversión HTML → PDF vía CloudConvert ───────────────────────────────────
+// Sin cambios respecto a v3.1.
 
 async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
   const CLOUDCONVERT_API_KEY = process.env.CLOUDCONVERT_API_KEY;
@@ -1276,14 +1207,14 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 
 // ── Función principal exportada ──────────────────────────────────────────────
 
-async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v3.1`);
+async function generarReportePDF(reporteJSON, metadatos, rutaSalida, auditoria_id) {
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v4.0 (salida estructurada)`);
 
-  console.log(`   [${auditoria_id}] Paso 1: Parseando reporte...`);
-  const datos = parsearReporte(reporteTexto, auditoria_id);
+  console.log(`   [${auditoria_id}] Paso 1: Normalizando datos estructurados...`);
+  const datos = normalizarDatosEstructurados(reporteJSON, auditoria_id);
 
   console.log(`   [${auditoria_id}] Paso 2: Generando resumen ejecutivo y puntos clave con Claude...`);
-  const { puntosClave, resumen } = await generarResumenEjecutivo(reporteTexto, datos, metadatos);
+  const { puntosClave, resumen } = await generarResumenEjecutivo(datos, metadatos);
   datos.resumenEjecutivo = resumen;
   datos.puntosClave      = puntosClave;
 
@@ -1306,7 +1237,8 @@ async function generarReportePDF(reporteTexto, metadatos, rutaSalida, auditoria_
 
 module.exports = {
   generarReportePDF,
-  parsearReporte,
+  normalizarDatosEstructurados,
   generarHTML,
   registrarRutaHTMLTemporal,
+  SCHEMA_ANALISIS_AUDITORIA,
 };

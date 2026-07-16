@@ -28,10 +28,22 @@
 // (mismo patrón de versionado que los otros 3 prompts); si esa versión no
 // lo tiene lleno, se usa PROMPT_ADMISIBILIDAD_RESPALDO como red de
 // seguridad, para que el filtro nunca quede desactivado por accidente.
+//
+// SALIDA ESTRUCTURADA (16 jul 2026): analizarConClaude() migró de pedirle a
+// Claude que escriba texto libre con instrucciones de formato (que podía
+// incumplir — pasó con la tabla markdown del 7 jul, y con un conteo de
+// categorías erróneo el 16 jul) a exigir la estructura vía
+// output_config.format (Structured Outputs de la API de Claude, GA para
+// claude-sonnet-5, compatible con el pensamiento adaptativo). El schema
+// (SCHEMA_ANALISIS_AUDITORIA) vive en generarReportePDF.js, que también
+// reemplazó su parser de regex (parsearReporte) por
+// normalizarDatosEstructurados(), que solo organiza JSON ya garantizado
+// válido. reporte_texto en la BD sigue siendo un string igual que antes,
+// solo que ahora ese string es JSON en vez de markdown/prosa libre.
 
 'use strict';
 const { generarPodcastPrueba } = require('./testPodcast');
-const { generarReportePDF, registrarRutaHTMLTemporal } = require('./generarReportePDF');
+const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA } = require('./generarReportePDF');
 const express    = require('express');
 const { google } = require('googleapis');
 const { GoogleAuth } = require('google-auth-library');
@@ -68,6 +80,10 @@ const DIRECTORIO_TEMP = '/tmp/acl-worker';
 // antepone un bloque { type: 'thinking' } al bloque { type: 'text' } dentro
 // de response.content. Leer siempre content[0].text ya no es seguro. Esta
 // función busca el bloque de tipo 'text' sin importar en qué posición venga.
+// Sigue haciendo falta con Structured Outputs: la gramática de
+// output_config.format solo restringe el bloque de texto final, no el
+// bloque de thinking que puede venir antes (confirmado en la documentación
+// de Anthropic).
 function extraerTextoRespuesta(response) {
   const bloqueTexto = response.content.find(b => b.type === 'text');
   if (!bloqueTexto) {
@@ -499,6 +515,13 @@ function laminaAlerta(pres, alerta, numero, total) {
 }
 
 // ── Extraer estructura del reporte con Claude ─────────────────────────────────
+// PAUSADO junto con generarPresentacion() y generarMapaMental() (ver
+// changelog v3.4 en el encabezado del archivo). Nota para cuando se
+// reactive: extraerEstructura() todavía le pide a Claude "reinterpretar" el
+// reporte en texto libre, pero desde la migración a Structured Outputs
+// (16 jul 2026) el reporte YA es JSON estructurado — al reactivar esta
+// función probablemente ya no haga falta llamar a Claude otra vez, se
+// puede construir "estructura" directamente a partir del JSON parseado.
 
 const PROMPT_EXTRACCION = `Eres un asistente que convierte reportes de auditoría liberal en estructuras JSON para generar presentaciones y mapas mentales.
 Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks.
@@ -1590,6 +1613,15 @@ Fragmento:\n${muestra}`,
   }
 }
 
+// SALIDA ESTRUCTURADA (16 jul 2026): reemplaza el bloque FORMATO_RESPUESTA
+// que le pedía a Claude en texto plano que no usara tablas, que agrupara
+// bajo encabezados de categoría reconocibles, etc. — esa instrucción era
+// una petición, no una garantía, y Claude la incumplió en más de una
+// corrida real (tabla markdown el 7 jul, conteo de categorías erróneo el
+// 16 jul). output_config.format fuerza la estructura a nivel de la API: la
+// respuesta SIEMPRE es JSON válido según SCHEMA_ANALISIS_AUDITORIA
+// (definido en generarReportePDF.js), exactamente 7 categorías, sin
+// importar cómo redacte Claude ese día.
 async function analizarConClaude(textoPDF, config, manualActivo = null) {
   // Si hay una versión activa del manual, se agrega al final del system prompt
   // ya configurado en configuracion_doctrinal — no lo reemplaza, lo complementa.
@@ -1597,32 +1629,35 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
     ? `${config.prompt_sistema}\n\n---\n\nMANUAL CÍVICO LIBERAL (versión ${manualActivo.version}) — fuente doctrinal completa para este análisis:\n\n${manualActivo.contenido_texto}`
     : config.prompt_sistema;
 
-// FORMATO_RESPUESTA (7 jul 2026): Sonnet 5 empezó a responder los 28
-  // criterios como tabla markdown compacta en vez de prosa razonada. Esta
-  // instrucción no toca las 28 preguntas en sí (eso vive en
-  // config.prompt_analisis, en la base de datos) — solo le dice a Claude
-  // cómo presentar la respuesta.
-  const FORMATO_RESPUESTA = `
-FORMATO DE RESPUESTA OBLIGATORIO PARA CADA CRITERIO:
-No uses tablas markdown ni listas de una sola línea. Para cada uno de los 28 criterios, escribe:
-
-**C-XX: [enunciado completo de la pregunta del criterio]**
-RESULTADO: [SÍ | SÍ (con reserva) | NO | N/A]
-
-[Un párrafo de 3 a 5 oraciones en prosa corrida y bien razonada, explicando por qué se llegó a ese resultado, citando artículos o elementos concretos del documento cuando aplique.]
-
-Agrupa los criterios bajo el encabezado de su categoría (### CATEGORÍA [número romano] — [nombre]).`;
-
-  const respuesta = await anthropic.messages.create({
+  const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
     max_tokens: 24000,
     system: systemFinal,
     messages: [{
       role: 'user',
-      content: `${config.prompt_analisis}\n${FORMATO_RESPUESTA}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}`
+      content: `${config.prompt_analisis}\n\n---\n\nTEXTO DEL DOCUMENTO:\n\n${textoPDF}`,
     }],
+    output_config: {
+      format: {
+        type: 'json_schema',
+        schema: SCHEMA_ANALISIS_AUDITORIA,
+      },
+    },
   });
-  return extraerTextoRespuesta(respuesta);
+
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error('analizarConClaude: respuesta cortada por max_tokens (24000) — el análisis quedó incompleto. Subir max_tokens.');
+  }
+  if (response.stop_reason === 'refusal') {
+    throw new Error('analizarConClaude: Claude rehusó generar el análisis para este documento (stop_reason: refusal).');
+  }
+
+  // extraerTextoRespuesta() sigue haciendo falta: el pensamiento adaptativo
+  // sigue anteponiendo un bloque 'thinking' antes del bloque de texto final
+  // incluso con output_config activo — la gramática de Structured Outputs
+  // solo restringe el bloque de texto, no el thinking. El texto devuelto es
+  // JSON garantizado, listo para JSON.parse() en normalizarDatosEstructurados().
+  return extraerTextoRespuesta(response);
 }
 
 async function convertirTXTaPDF(rutaTXT, rutaPDF, titulo) {
@@ -1813,6 +1848,7 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`\n⚙️  ACL Worker v3.4 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
+  console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
   console.log(`   PAUSADO: Audio (NotebookLM), PPTX y mapa mental — pendiente definir`);
   console.log(`   nuevo camino de audio (Google Vertex AI+TTS / ElevenLabs) y revisar diseño`);
   console.log(`   Funciones intactas y listas para reactivar: dispararNotebookLM(),`);
