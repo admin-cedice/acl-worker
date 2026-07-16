@@ -63,15 +63,6 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const URL_MANUAL = 'https://liberalmente.app/manual-de-liberalismo.pdf';
 
-const RANGOS_RIESGO = [
-  { nivel: 'BAJO',     rango: '85–100%', desc: 'Alineación sólida con los principios del liberalismo clásico.' },
-  { nivel: 'MODERADO', rango: '65–84%',  desc: 'Alineación mayoritaria, con debilidades puntuales que no son estructurales.' },
-  { nivel: 'ALTO',     rango: '40–64%',  desc: 'Debilidades significativas frente al marco doctrinal liberal.' },
-  { nivel: 'CRÍTICO',  rango: '0–39%',   desc: 'Configuración normativa que contradice de forma extensa y estructural los principios del liberalismo clásico.' },
-];
-
-const LEYENDA_RIESGO_LISTA = true;
-
 // ── Helpers de HTML ──────────────────────────────────────────────────────────
 
 function esc(str) {
@@ -122,29 +113,28 @@ function normalizarResultadoTabla(texto) {
 }
 
 function extraerNotaFinalDeTexto(texto) {
-  // v3.1: en vez de anticipar la forma exacta en que Claude cuenta los
-  // resultados antes del veredicto (ya vimos 3 variantes distintas), se
-  // ancla en la frase que se mantuvo estable en todas: "NIVEL DE RIESGO".
-  // Desde ahí se busca hacia atrás dónde aparece "Resultados" más cerca, y
-  // se corta ahí — tolera cualquier forma de redactar el conteo previo.
-  const matchNivel = texto.match(/NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)\**\s*(?:\([^)]*\))?\s*/i);
-  if (!matchNivel) return null;
+  // v3.4 — el ancla cambió de "NIVEL DE RIESGO: <categoría>" a
+  // "ALINEACIÓN LIBERAL: <porcentaje>%" — las 4 categorías (Bajo/Moderado/
+  // Alto/Crítico) se eliminaron por decisión del 15 jul 2026. La función
+  // ya no devuelve ningún nivel, solo sigue sirviendo para encontrar dónde
+  // cortar el párrafo de cierre.
+  const matchAlineacion = texto.match(/ALINEACI[OÓ]N LIBERAL[^:]*:\s*\**\s*[\d.]+\s*%?/i);
+  if (!matchAlineacion) return null;
 
-  const idxNivel  = texto.indexOf(matchNivel[0]);
-  const finBloque = idxNivel + matchNivel[0].length;
+  const idxAlineacion = texto.indexOf(matchAlineacion[0]);
+  const finBloque      = idxAlineacion + matchAlineacion[0].length;
 
-  // Ventana de 300 caracteres antes de "NIVEL DE RIESGO" para ubicar la
+  // Ventana de 300 caracteres antes de "ALINEACIÓN LIBERAL" para ubicar la
   // última mención de "Resultados" cercana — ahí suele empezar el conteo.
-  const desde = Math.max(0, idxNivel - 300);
-  const ventanaAntes = texto.slice(desde, idxNivel);
+  const desde = Math.max(0, idxAlineacion - 300);
+  const ventanaAntes = texto.slice(desde, idxAlineacion);
   const ocurrenciasResultados = [...ventanaAntes.matchAll(/Resultados/gi)];
   const inicioBloque = ocurrenciasResultados.length > 0
     ? desde + ocurrenciasResultados[ocurrenciasResultados.length - 1].index
-    : idxNivel;
+    : idxAlineacion;
 
   return {
     textoLimpio:  texto.slice(0, inicioBloque).trim(),
-    nivelRiesgo:  matchNivel[1].toUpperCase(),
     parrafoFinal: texto.slice(finBloque).trim(),
   };
 }
@@ -473,27 +463,42 @@ const CSS = `
   }
   .leyenda-item:last-child { margin-bottom: 0; }
 
-  .leyenda-riesgo {
-    background: var(--bg-alt);
-    border: 1px solid var(--border);
-    border-radius: 2px;
-    padding: 14px 16px;
-    margin-top: 16px;
-    page-break-inside: avoid;
+  .alineacion-bloque {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    margin-bottom: 14px;
   }
-  .leyenda-riesgo .leyenda-titulo {
-    font-size: 9.5px; font-weight: 700;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--text-muted); margin-bottom: 8px;
+  .alineacion-numero {
+    font-family: var(--serif);
+    font-weight: 700;
+    font-size: 40px;
+    color: var(--accent);
+    line-height: 1;
   }
-  .leyenda-riesgo .leyenda-item-riesgo {
-    font-size: 11px;
+  .alineacion-label {
+    font-size: 12px;
     color: var(--text-mid);
-    line-height: 1.5;
-    margin-bottom: 5px;
+    max-width: 160px;
+    line-height: 1.4;
   }
-  .leyenda-riesgo .leyenda-item-riesgo:last-child { margin-bottom: 0; }
-  .leyenda-riesgo .leyenda-item-riesgo strong { color: var(--text); }
+  .alineacion-desglose {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+  }
+  .alineacion-badge {
+    padding: 3px 9px;
+    border-radius: 2px;
+    font-size: 10.5px;
+    font-weight: 700;
+    border: 1px solid;
+  }
+  .alineacion-badge.si       { background: var(--green-soft); color: var(--green); border-color: #A8D5BA; }
+  .alineacion-badge.si-matiz { background: var(--gold-soft);  color: var(--gold);  border-color: #D4C080; }
+  .alineacion-badge.no       { background: #FEF0F0; color: var(--accent); border-color: #EDAAAA; }
+  .alineacion-badge.na       { background: var(--bg); color: var(--text-muted); border-color: var(--border); }
 
   .criterio-analisis {
     margin-left: 42px;
@@ -615,7 +620,6 @@ const CSS = `
 function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   const datos = {
     puntaje:     null,
-    nivelRiesgo: 'MODERADO',
     siPlenos:    0,
     siMatiz:     0,
     noCount:     0,
@@ -639,16 +643,13 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   const textoParaPuntajeYRiesgo = marcadorVisto ? textoCierre : reporteTexto;
 
   let puntajeMencionado = null;
-    for (const linea of textoParaPuntajeYRiesgo.split('\n')) {
-      const matchPct = linea.match(/([\d.]+)%/);
-      if (matchPct && puntajeMencionado === null) {
-        const v = parseFloat(matchPct[1]);
-        if (v > 10 && v <= 100) { puntajeMencionado = Math.round(v); }
-      }
+  for (const linea of textoParaPuntajeYRiesgo.split('\n')) {
+    const matchPct = linea.match(/([\d.]+)%/);
+    if (matchPct && puntajeMencionado === null) {
+      const v = parseFloat(matchPct[1]);
+      if (v > 10 && v <= 100) { puntajeMencionado = Math.round(v); }
+    }
   }
-
-  const matchRiesgo = textoParaPuntajeYRiesgo.match(/NIVEL DE RIESGO(?:\s+LIBERAL)?[^:]*:\s*\**\s*(BAJO|MODERADO|ALTO|MUY ALTO|CR[IÍ]TICO)/i);
-  if (matchRiesgo) datos.nivelRiesgo = matchRiesgo[1].toUpperCase();
 
   const CATEGORIAS_NOMBRES = {
     'I':   'Dignidad y Autonomía Individual',
@@ -818,8 +819,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     // directo del texto que viene después del marcador.
     const extra = extraerNotaFinalDeTexto(textoCierre);
     if (extra) {
-      datos.nivelRiesgo = extra.nivelRiesgo;
-      datos.notaFinal   = extra.parrafoFinal;
+      datos.notaFinal = extra.parrafoFinal;
     }
   } else {
     // Respaldo tal como funcionaba en v3.0 — por si Claude omitió el
@@ -829,9 +829,8 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
       for (const crit of cat.criterios) {
         const extra = extraerNotaFinalDeTexto(crit.analisis || '');
         if (extra) {
-          crit.analisis     = extra.textoLimpio;
-          datos.nivelRiesgo  = extra.nivelRiesgo;
-          datos.notaFinal    = extra.parrafoFinal;
+          crit.analisis   = extra.textoLimpio;
+          datos.notaFinal = extra.parrafoFinal;
         }
       }
     }
@@ -856,7 +855,6 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
   console.log(`   ╠──────────────────────────────────────────────────`);
   console.log(`   ║ Marcador de cierre : ${marcadorVisto ? 'sí' : 'no (fallback activo)'}`);
   console.log(`   ║ Puntaje mencionado en texto : ${puntajeMencionado === null ? '(ninguno)' : puntajeMencionado + '%'}`);
-  console.log(`   ║ Riesgo detectado  : ${datos.nivelRiesgo}`);
   console.log(`   ║ Nota final        : ${datos.notaFinal ? 'sí (' + datos.notaFinal.length + ' chars)' : 'no encontrada'}`);
   console.log(`   ║ Alertas           : ${datos.alertas.length}`);
   if (datos.categorias.length > 0) {
@@ -872,31 +870,20 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
     datos.naCount  = naReal;
   }
 
-  // v3.3 — Única fuente de verdad: el puntaje se calcula SIEMPRE desde el
-    // conteo real (SÍ plenos / total aplicable) — SÍ con matiz ya NO cuenta
-    // como alineación plena. El porcentaje que Claude escribió en el texto
-    // libre ya no determina datos.puntaje, solo se registra como
-    // diagnóstico en los logs.
-    //
-    // Si no hay ningún SÍ pleno (todo NO, o el único positivo fue SÍ con
-    // matiz) o si no hay ningún criterio aplicable (todo N/A), NO se
-    // calcula un total general — mostrar "0%" en esos casos sería engañoso
-    // (borraría matices reales). datos.puntaje queda en null; el reporte
-    // sigue mostrando el desglose por categoría y criterio igual.
-    const aplicables = datos.siPlenos + datos.siMatiz + datos.noCount;
-    if (aplicables > 0 && datos.siPlenos > 0) {
-      datos.puntaje = Math.round((datos.siPlenos / aplicables) * 100);
-      console.log(`   [parsearReporte] Puntaje calculado (SÍ plenos / aplicables): ${datos.puntaje}%`);
-    } else {
-      datos.puntaje = null;
-      console.log(`   [parsearReporte] Sin total general: ${aplicables === 0 ? 'no hay criterios aplicables (todo N/A)' : 'ningún criterio con SÍ pleno'}.`);
+  const aplicables = datos.siPlenos + datos.siMatiz + datos.noCount;
+  if (aplicables > 0 && datos.siPlenos > 0) {
+    datos.puntaje = Math.round((datos.siPlenos / aplicables) * 100);
+    console.log(`   [parsearReporte] Puntaje calculado (SÍ plenos / aplicables): ${datos.puntaje}%`);
+  } else {
+    datos.puntaje = null;
+    console.log(`   [parsearReporte] Sin total general: ${aplicables === 0 ? 'no hay criterios aplicables (todo N/A)' : 'ningún criterio con SÍ pleno'}.`);
+  }
+  if (puntajeMencionado !== null) {
+    if (datos.puntaje !== null && Math.abs(puntajeMencionado - datos.puntaje) > 5) {
+      console.warn(`   [parsearReporte] ⚠️  DISCREPANCIA: Claude mencionó ${puntajeMencionado}% en el texto, pero el cálculo real da ${datos.puntaje}%. Se usa el calculado. Si se repite, revisar prompt_analisis.`);
+    } else if (datos.puntaje === null) {
+      console.warn(`   [parsearReporte] ⚠️  Claude mencionó ${puntajeMencionado}% en el texto, pero no hay total general calculable (SÍ plenos=${datos.siPlenos}, aplicables=${aplicables}).`);
     }
-    if (puntajeMencionado !== null) {
-      if (datos.puntaje !== null && Math.abs(puntajeMencionado - datos.puntaje) > 5) {
-        console.warn(`   [parsearReporte] ⚠️  DISCREPANCIA: Claude mencionó ${puntajeMencionado}% en el texto, pero el cálculo real da ${datos.puntaje}%. Se usa el calculado. Si se repite, revisar prompt_analisis.`);
-      } else if (datos.puntaje === null) {
-        console.warn(`   [parsearReporte] ⚠️  Claude mencionó ${puntajeMencionado}% en el texto, pero no hay total general calculable (SÍ plenos=${datos.siPlenos}, aplicables=${aplicables}).`);
-      }
   }
 
   return datos;
@@ -911,7 +898,7 @@ function parsearReporte(reporteTexto, auditoria_id = 'N/A') {
 async function generarResumenEjecutivo(reporteTexto, datos, metadatos) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-  const { puntaje, nivelRiesgo, siPlenos, siMatiz, noCount, naCount, alertas } = datos;
+  const { puntaje, siPlenos, siMatiz, noCount, naCount, alertas } = datos;
   const totalCriterios = datos.categorias.reduce((acc, c) => acc + c.criterios.length, 0);
   const { titulo, pais, fecha } = metadatos;
 
@@ -919,8 +906,7 @@ async function generarResumenEjecutivo(reporteTexto, datos, metadatos) {
 
 DATOS DEL ANÁLISIS:
 - Documento auditado: ${titulo}${pais ? ` (${pais})` : ''}${fecha ? `, ${fecha}` : ''}
-- Puntaje de alineación liberal: ${puntaje !== null ? puntaje + '%' : 'sin total general — ningún criterio con SÍ pleno; ver desglose SÍ/SÍ con matiz/NO'}
-- Nivel de riesgo liberal: ${nivelRiesgo}
+- Alineación con postulados liberales: ${puntaje !== null ? puntaje + '%' : 'sin total general — ningún criterio con SÍ pleno; ver desglose SÍ/SÍ con matiz/NO'}
 - Criterios evaluados: ${totalCriterios} (${siPlenos} SÍ plenos, ${siMatiz} SÍ con reserva, ${noCount} NO, ${naCount} N/A)
 ${alertas.length > 0 ? `- Alertas principales: ${alertas.map(a => a.titulo).join('; ')}` : ''}
 
@@ -947,7 +933,7 @@ Reglas:
 - RESUMEN: exactamente 3 párrafos, separados entre sí por una línea completamente en blanco. Sin títulos, sin viñetas, sin asteriscos ni markdown dentro de los párrafos.
   Párrafo 1 (2-3 oraciones): qué es el documento, su alcance y contexto político-jurídico.
   Párrafo 2 (3-4 oraciones): qué encontró el análisis — fortalezas liberales, debilidades y las alertas más graves con criterios específicos.
-  Párrafo 3 (2-3 oraciones): valoración final del riesgo liberal y recomendación al ciudadano.
+  Párrafo 3 (2-3 oraciones): valoración final de la alineación con los postulados liberales y recomendación al ciudadano.
 - No escribas nada antes de "PUNTOS_CLAVE:" ni nada después del último párrafo del resumen.
 
 Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con el poder. Lenguaje propio del liberalismo clásico (propiedad privada, Estado de derecho, separación de poderes, subsidiariedad).`;
@@ -985,12 +971,12 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
     const totalSI    = siPlenos + siMatiz;
     const aplicables = siPlenos + siMatiz + noCount;
     let resumen = puntaje !== null
-	      ? `El documento obtuvo un ${puntaje}% de alineación con los criterios del liberalismo clásico. `
+      ? `El documento obtuvo un ${puntaje}% de alineación con los postulados liberales. `
       : `El documento no registró ningún criterio con SÍ pleno, por lo que no se calcula un total general de alineación liberal. `;
     resumen += `De ${aplicables} criterios aplicables: ${totalSI} SÍ (${siPlenos} plenos, ${siMatiz} con reserva)`;
     if (noCount > 0) resumen += `, ${noCount} NO`;
     if (naCount > 0) resumen += `, ${naCount} N/A`;
-    resumen += `. Nivel de riesgo liberal: ${nivelRiesgo}.`;
+    resumen += `.`;
     if (alertas.length > 0) resumen += ` Alerta principal: ${alertas[0].titulo}.`;
     return { puntosClave: [], resumen };
   }
@@ -1001,7 +987,6 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
 function generarHTML(datos, metadatos) {
   const {
     puntaje: puntajeRaw,
-    nivelRiesgo      = 'BAJO',
     siPlenos         = 0,
     siMatiz          = 0,
     noCount          = 0,
@@ -1054,15 +1039,22 @@ function generarHTML(datos, metadatos) {
     .map(p => `<p>${conNotaComadreja(p)}</p>`)
     .join('');
 
-  // v3.0: el link al Manual ahora es fijo (última línea), no depende de
-  // que aparezca la frase "efecto comadreja".
-  const htmlLeyendaRiesgo = LEYENDA_RIESGO_LISTA ? `
-<div class="leyenda-riesgo">
-  <div class="leyenda-titulo">Niveles de riesgo liberal</div>
-  ${RANGOS_RIESGO.map(r => `
-  <div class="leyenda-item-riesgo"><strong>${esc(r.nivel)} (${esc(r.rango)})</strong> — ${esc(r.desc)}</div>`).join('')}
-  <div class="leyenda-item-riesgo">Consulta el <a href="${URL_MANUAL}" class="nota-doctrinal">Manual de Liberalismo completo</a> para el marco doctrinal detrás de este Test.</div>
-</div>` : '';
+  // v3.4: reemplaza la leyenda de 4 niveles de riesgo por el número de
+  // alineación (o solo el desglose si no hay ningún SÍ pleno). El link al
+  // Manual sigue siendo fijo (no depende de la frase "efecto comadreja").
+  const htmlAlineacion = criteriosDetectados ? `
+<div class="alineacion-bloque">
+  ${puntaje !== null ? `
+  <span class="alineacion-numero">${puntaje}%</span>
+  <span class="alineacion-label">de alineación con postulados liberales</span>` : ''}
+</div>
+<div class="alineacion-desglose">
+  <span class="alineacion-badge si">${siPlenos} SÍ</span>
+  <span class="alineacion-badge si-matiz">${siMatiz} SÍ*</span>
+  <span class="alineacion-badge no">${noCount} NO</span>
+  <span class="alineacion-badge na">${naCount} N/A</span>
+</div>
+<div class="nota-final-texto" style="margin-top:10px;">Consulta el <a href="${URL_MANUAL}" class="nota-doctrinal">Manual de Liberalismo completo</a> para el marco doctrinal detrás de este Test.</div>` : '';
 
   const filasTabla = tallyPorCategoria.map(t => `
       <tr>
@@ -1086,6 +1078,7 @@ function generarHTML(datos, metadatos) {
 
   const htmlResumenCompacto = criteriosDetectados ? `
 <div class="resumen-portada-bloque">
+  ${htmlAlineacion}
   <table class="resumen-categorias-tabla resumen-categorias-tabla--compacta">
     <thead>
       <tr><th>Categoría</th><th>SÍ</th><th>SÍ*</th><th>NO</th><th>N/A</th><th>Total</th></tr>
@@ -1093,7 +1086,6 @@ function generarHTML(datos, metadatos) {
     <tbody>${filasTabla}</tbody>
     <tfoot>${filaTotalTabla}</tfoot>
   </table>
-  ${htmlLeyendaRiesgo}
   ${notaFinal ? `<div class="nota-final-texto">${conNotaComadreja(notaFinal)}</div>` : ''}
 </div>` : '';
 
@@ -1226,10 +1218,10 @@ function generarHTML(datos, metadatos) {
     <tr><td>Generado el</td><td>${esc(generadoEl)}</td></tr>
     <tr><td>Criterios aplicados</td><td>${totalCriterios} criterios en 7 categorías del Test de Libertad</td></tr>
     <tr>
-	      <td>Resultado</td>
-	      <td>
-	        ${puntaje !== null ? `${puntaje}% de alineación · ` : ''}Riesgo Liberal: ${esc(nivelRiesgo)}${desgloseFicha}
-	      </td>
+      <td>Resultado</td>
+      <td>
+        ${puntaje !== null ? `${puntaje}% de alineación con postulados liberales` : 'Sin total general'}${desgloseFicha}
+      </td>
     </tr>
   </table>
 </div>`;

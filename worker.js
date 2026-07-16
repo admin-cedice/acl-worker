@@ -1372,20 +1372,20 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} chars)`);
 
     console.log(`📄 [${auditoria_id}] PASO 6: Generando PDF del reporte (diseño institucional)...`);
-	    const datosReporte = await generarReportePDF(
-	      reporte,
-	      {
-	        titulo:         metadatos.titulo,
-	        pais:           metadatos.pais     || '',
-	        fecha:          metadatos.fecha    || '',
-	        paginas:        metadatos.paginas  || '',
-	        marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026',
-	        generadoEl:     new Date().toLocaleDateString('es-VE', { year:'numeric', month:'long', day:'numeric' }),
-	      },
-	      rutaReportePDF,
-	      auditoria_id
-	    );
-    console.log(`✅ [${auditoria_id}] PDF del reporte generado — puntaje: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'} · riesgo: ${datosReporte.nivelRiesgo}`);
+    const datosReporte = await generarReportePDF(
+      reporte,
+      {
+        titulo:         metadatos.titulo,
+        pais:           metadatos.pais     || '',
+        fecha:          metadatos.fecha    || '',
+        paginas:        metadatos.paginas  || '',
+        marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026',
+        generadoEl:     new Date().toLocaleDateString('es-VE', { year:'numeric', month:'long', day:'numeric' }),
+      },
+      rutaReportePDF,
+      auditoria_id
+    );
+    console.log(`✅ [${auditoria_id}] PDF del reporte generado — alineación: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'}`);
 
     // ── PASOS TEMPORALMENTE DESACTIVADOS (3 jul 2026) ──────────────────────
     // NotebookLM (audio), PPTX y mapa mental quedan en pausa mientras se
@@ -1401,13 +1401,13 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     const linkReporte         = await subirArchivo(drive, rutaReportePDF, `Auditoria_de_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 
     await db.query(
-	      `UPDATE auditorias
-	       SET estado = 'completada',
-	           link_original = $1, link_reporte = $2,
-	           drive_carpeta_id = $3, completada_en = NOW(),
-	           puntaje = $5, nivel_riesgo = $6
-	       WHERE id = $4`,
-	      [linkOriginal, linkReporte, carpetaId, auditoria_id, datosReporte.puntaje, datosReporte.nivelRiesgo]
+      `UPDATE auditorias
+       SET estado = 'completada',
+           link_original = $1, link_reporte = $2,
+           drive_carpeta_id = $3, completada_en = NOW(),
+           puntaje = $5
+       WHERE id = $4`,
+      [linkOriginal, linkReporte, carpetaId, auditoria_id, datosReporte.puntaje]
     );
     console.log(`✅ [${auditoria_id}] Archivos subidos a Drive`);
 
