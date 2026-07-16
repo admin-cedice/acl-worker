@@ -118,7 +118,7 @@ function extraerNotaFinalDeTexto(texto) {
   // Alto/Crítico) se eliminaron por decisión del 15 jul 2026. La función
   // ya no devuelve ningún nivel, solo sigue sirviendo para encontrar dónde
   // cortar el párrafo de cierre.
-  const matchAlineacion = texto.match(/ALINEACI[OÓ]N LIBERAL[^:]*:\s*\**\s*[\d.]+\s*%?/i);
+  const matchAlineacion = texto.match(/ALINEACI[OÓ]N LIBERAL[^:]*:\s*\**\s*\[?\s*[\d.]+\s*\]?\s*%?/i);
   if (!matchAlineacion) return null;
 
   const idxAlineacion = texto.indexOf(matchAlineacion[0]);
