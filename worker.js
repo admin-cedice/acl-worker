@@ -43,7 +43,8 @@
 
 'use strict';
 const { generarPodcastPrueba } = require('./testPodcast');
-const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA } = require('./generarReportePDF');
+const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA, normalizarDatosEstructurados } = require('./generarReportePDF');
+const { generarYRevisarGuion } = require('./generarGuionPresentacion');
 const express    = require('express');
 const { google } = require('googleapis');
 const { GoogleAuth } = require('google-auth-library');
@@ -734,7 +735,79 @@ app.post('/test-reporte', async (req, res) => {
   }
 });
 
-// PRUEBA TEMPORAL — eliminar después de validar
+// PRUEBA TEMPORAL — endpoint para probar generarGuionPresentacion.js
+// (generador + revisor del guion de la Presentación) sin tocar Drive ni
+// escribir nada en la base de datos más allá de LEER el reporte_texto que
+// ya existe. GET + texto plano a propósito: se abre pegando la URL
+// directo en el navegador, sin Postman, sin PowerShell, sin terminal —
+// mismo patrón que /test-podcast. Eliminar después de validar.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/test-guion?secret=acl-worker-2026-secreto
+//   (sin auditoria_id: usa la auditoría completada más reciente)
+//
+//   https://acl-worker-production.up.railway.app/test-guion?secret=acl-worker-2026-secreto&auditoria_id=ID_AQUI
+//   (una auditoría específica)
+app.get('/test-guion', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+  res.type('text/plain; charset=utf-8');
+
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    let fila;
+
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      // Sin auditoria_id en la URL: toma la más reciente ya completada,
+      // para que se pueda probar solo pegando el link, sin buscar ningún id.
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais
+         FROM auditorias
+         WHERE estado = 'completada' AND reporte_texto IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+
+    if (!fila?.reporte_texto) {
+      return res.status(404).send('No se encontró ninguna auditoría completada con reporte_texto.');
+    }
+
+    console.log(`   [TEST-GUION] Generando guion para: ${fila.titulo_documento}`);
+    const datos = normalizarDatosEstructurados(fila.reporte_texto, fila.id);
+    const resultado = await generarYRevisarGuion(datos, { titulo: fila.titulo_documento, pais: fila.pais || '' });
+    console.log(`   [TEST-GUION] ✅ Listo — veredicto del revisor: ${resultado.veredicto}`);
+
+    res.send(`AUDITORÍA: ${fila.titulo_documento}
+PAÍS: ${fila.pais || '(sin especificar)'}
+ALINEACIÓN: ${datos.puntaje !== null ? datos.puntaje + '%' : 'sin total general'}
+
+════════════════ VEREDICTO DEL REVISOR (Opus 4.8) ════════════════
+${resultado.veredicto}
+
+NOTAS:
+${resultado.notasRevision || '(sin notas — no hizo falta ningún cambio)'}
+
+════════════════ GUION ORIGINAL (Sonnet 5, antes de revisión) ════════════════
+${resultado.guionOriginal}
+
+════════════════ GUION FINAL (después de la revisión) ════════════════
+${resultado.guionFinal}
+`);
+
+  } catch (error) {
+    console.error('   [TEST-GUION] ❌ Error:', error.message);
+    res.status(500).send('Error: ' + error.message);
+  }
+});
+
 app.get('/test-podcast', async (req, res) => {
   if (req.query.secret !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
