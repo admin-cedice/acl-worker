@@ -71,6 +71,19 @@
 //      SCHEMA_ANALISIS_AUDITORIA como campo required; no hizo falta tocar
 //      normalizarDatosEstructurados() ni generarHTML(), porque ambos ya
 //      pasaban/leían ese campo — solo faltaba pedírselo a Claude.
+//
+// CAMBIOS v4.3 (16 jul 2026):
+//  44. FIX: en una auditoría real (Ley de Hidrocarburos) Claude anidó
+//      C-24/C-25/C-26 bajo la clave "V" en vez de "VI", dejando la
+//      Categoría VI vacía — los 28 criterios estaban completos y bien
+//      evaluados, solo mal ubicados. El schema garantiza que las 7 claves
+//      existan, pero no que Claude clasifique bien cada criterio dentro
+//      de ellas (es contenido, no forma). Se agregó CRITERIO_A_CATEGORIA,
+//      un mapa fijo id→categoría conocido de antemano;
+//      normalizarDatosEstructurados() ahora aplana todos los criterios
+//      recibidos e ignora bajo qué clave llegaron, reclasificándolos con
+//      ese mapa. Log nuevo: conteo de criterios por categoría en cada
+//      corrida, y aviso si el total no da 28.
 
 'use strict';
 
@@ -111,6 +124,22 @@ const CATEGORIAS_NOMBRES = {
 // de convertir ese objeto de vuelta a la forma de arreglo que usa
 // generarHTML(), así que nada más en el archivo tuvo que cambiar.
 const NUMEROS_CATEGORIA = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'];
+
+// Mapa fijo criterio → categoría, según la estructura real del Test de
+// Libertad (28 criterios, 7 categorías: I=5, II=5, III=5, IV=4, V=4, VI=3,
+// VII=2). Se usa en normalizarDatosEstructurados() para volver a clasificar
+// cada criterio por su propio id, sin confiar en bajo qué clave de
+// categoría lo haya anidado Claude — ver v4.3 en el changelog.
+const CRITERIO_A_CATEGORIA = (() => {
+  const rangos = { I: [1, 5], II: [6, 10], III: [11, 15], IV: [16, 19], V: [20, 23], VI: [24, 26], VII: [27, 28] };
+  const mapa = {};
+  for (const [num, [desde, hasta]] of Object.entries(rangos)) {
+    for (let n = desde; n <= hasta; n++) {
+      mapa[`C-${String(n).padStart(2, '0')}`] = num;
+    }
+  }
+  return mapa;
+})();
 
 function schemaCriterios() {
   return {
@@ -722,10 +751,53 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A') {
     console.warn(`   ⚠️ [${auditoria_id}] Categorías ausentes en la respuesta: ${categoriasFaltantes.join(', ')}.`);
   }
 
+  // v4.3 (16 jul 2026) — FIX: se detectó en una auditoría real (Ley de
+  // Hidrocarburos) que Claude clasificó C-24/C-25/C-26 dentro de la clave
+  // "V" en vez de "VI", dejando la Categoría VI vacía. Los 28 criterios
+  // estaban completos y bien evaluados — el contenido era correcto — solo
+  // la UBICACIÓN estaba mal. El schema (Structured Outputs) garantiza que
+  // existan las 7 claves y que cada criterio tenga id/pregunta/resultado/
+  // analisis válidos, pero NO puede garantizar que Claude decida bien bajo
+  // cuál de las 7 claves anidar cada uno — eso es una decisión de
+  // contenido, no de forma. Solución: se ignora por completo bajo qué
+  // clave llegó cada criterio. Se aplanan TODOS los criterios recibidos
+  // (sin importar su categoría de origen) y se re-clasifican en código
+  // usando CRITERIO_A_CATEGORIA, que es fijo y no depende de nada que
+  // escriba Claude — mismo principio de toda esta migración, aplicado un
+  // nivel más profundo.
+  const todosLosCriteriosRecibidos = NUMEROS_CATEGORIA.flatMap(
+    num => resultado.categorias?.[num]?.criterios || []
+  );
+
+  const criteriosPorCategoria = {};
+  NUMEROS_CATEGORIA.forEach(num => { criteriosPorCategoria[num] = []; });
+
+  const sinMapeoConocido = [];
+  for (const crit of todosLosCriteriosRecibidos) {
+    const categoriaReal = CRITERIO_A_CATEGORIA[crit.id];
+    if (!categoriaReal) {
+      sinMapeoConocido.push(crit.id);
+      continue;
+    }
+    criteriosPorCategoria[categoriaReal].push(crit);
+  }
+  if (sinMapeoConocido.length > 0) {
+    // Solo puede pasar si Claude inventa un id fuera de C-01..C-28 —
+    // no debería ocurrir, pero si pasa, mejor que quede visible en el log
+    // a que el criterio desaparezca en silencio.
+    console.warn(`   ⚠️ [${auditoria_id}] Criterios con id no reconocido (no mapean a C-01..C-28): ${sinMapeoConocido.join(', ')}`);
+  }
+
+  // Orden interno estable dentro de cada categoría, sin importar el orden
+  // en que Claude los haya escrito.
+  NUMEROS_CATEGORIA.forEach(num => {
+    criteriosPorCategoria[num].sort((a, b) => a.id.localeCompare(b.id));
+  });
+
   const categorias = NUMEROS_CATEGORIA.map(num => ({
     num,
     nombre:    CATEGORIAS_NOMBRES[num],
-    criterios: resultado.categorias?.[num]?.criterios || [],
+    criterios: criteriosPorCategoria[num],
   }));
 
   const todos    = categorias.flatMap(c => c.criterios);
@@ -738,7 +810,11 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A') {
   console.log(`   ║ DIAGNÓSTICO [${auditoria_id}] (salida estructurada)`);
   console.log(`   ╠══════════════════════════════════════════════════`);
   console.log(`   ║ Categorías : ${categorias.length} (se esperan 7)`);
-  console.log(`   ║ Criterios  : ${todos.length}`);
+  console.log(`   ║ Criterios  : ${todos.length} (se esperan 28)`);
+  if (todos.length !== 28) {
+    console.warn(`   ⚠️ [${auditoria_id}] Se esperaban 28 criterios en total, llegaron ${todos.length}.`);
+  }
+  categorias.forEach(cat => console.log(`   ║   Cat. ${cat.num.padEnd(3)}: ${cat.criterios.length} criterios`));
   console.log(`   ╠──────────────────────────────────────────────────`);
   console.log(`   ║ SÍ plenos  : ${siPlenos}`);
   console.log(`   ║ SÍ con *   : ${siMatiz}`);
