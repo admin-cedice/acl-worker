@@ -742,6 +742,16 @@ app.post('/test-reporte', async (req, res) => {
 // directo en el navegador, sin Postman, sin PowerShell, sin terminal —
 // mismo patrón que /test-podcast. Eliminar después de validar.
 //
+// FIX (17 jul 2026): la primera versión se quedaba callada mientras
+// esperaba los dos llamados a Claude (1-3 minutos) y el navegador
+// terminaba con ERR_CONNECTION_CLOSED — confirmado en los logs de Railway
+// que el proceso SÍ terminaba bien las 4 veces que se probó, el problema
+// era que algún proxy en el camino (parece que el de Railway también)
+// corta conexiones que llevan mucho tiempo sin recibir ni un byte del
+// servidor, aunque el proceso siga vivo. Ahora se manda un mensaje al
+// empezar y un "latido" (un espacio) cada 12s mientras se espera —
+// suficiente para que ningún proxy la dé por muerta.
+//
 // En el navegador:
 //   https://acl-worker-production.up.railway.app/test-guion?secret=acl-worker-2026-secreto
 //   (sin auditoria_id: usa la auditoría completada más reciente)
@@ -752,12 +762,11 @@ app.get('/test-guion', async (req, res) => {
   if (req.query.secret !== WORKER_SECRET) {
     return res.status(401).type('text/plain').send('No autorizado');
   }
-  res.type('text/plain; charset=utf-8');
 
+  // Parte rápida (consulta a la BD) — sin latido, no hace falta.
+  let fila;
   try {
     const auditoria_id = req.query.auditoria_id;
-    let fila;
-
     if (auditoria_id) {
       const result = await db.query(
         `SELECT id, reporte_texto, titulo_documento, pais FROM auditorias WHERE id = $1`,
@@ -775,17 +784,33 @@ app.get('/test-guion', async (req, res) => {
       );
       fila = result.rows[0];
     }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
 
-    if (!fila?.reporte_texto) {
-      return res.status(404).send('No se encontró ninguna auditoría completada con reporte_texto.');
-    }
+  if (!fila?.reporte_texto) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría completada con reporte_texto.');
+  }
 
+  // Parte lenta (dos llamados largos a Claude) — acá sí hace falta el
+  // latido. Una vez que se llama a res.write() por primera vez, la
+  // respuesta queda "comprometida" a HTTP 200 — por eso los errores de
+  // acá en adelante se informan en el cuerpo del texto, no con un código
+  // de estado distinto.
+  res.type('text/plain; charset=utf-8');
+  res.write('Generando el guion — esto puede tardar 1 a 3 minutos, no cierres esta pestaña...\n');
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  try {
     console.log(`   [TEST-GUION] Generando guion para: ${fila.titulo_documento}`);
     const datos = normalizarDatosEstructurados(fila.reporte_texto, fila.id);
     const resultado = await generarYRevisarGuion(datos, { titulo: fila.titulo_documento, pais: fila.pais || '' });
     console.log(`   [TEST-GUION] ✅ Listo — veredicto del revisor: ${resultado.veredicto}`);
 
-    res.send(`AUDITORÍA: ${fila.titulo_documento}
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
 PAÍS: ${fila.pais || '(sin especificar)'}
 ALINEACIÓN: ${datos.puntaje !== null ? datos.puntaje + '%' : 'sin total general'}
 
@@ -803,8 +828,9 @@ ${resultado.guionFinal}
 `);
 
   } catch (error) {
+    clearInterval(heartbeat);
     console.error('   [TEST-GUION] ❌ Error:', error.message);
-    res.status(500).send('Error: ' + error.message);
+    res.end('\n\nError: ' + error.message);
   }
 });
 
