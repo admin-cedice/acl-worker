@@ -221,11 +221,24 @@ async function generarGuion(datos, metadatos) {
 
   console.log(`   [generarGuion] Escenas seleccionadas: ${escenas.nucleo.length} del núcleo, balance: ${escenas.balance ? escenas.balance.id : 'ninguno'}, tono: ${escenas.tonoGeneral}`);
 
+  // FIX (17 jul 2026): con max_tokens: 4000 el guion se cortó a media
+  // palabra en la primera prueba real (Hidrocarburos) — casi con certeza
+  // porque el pensamiento adaptativo de Sonnet 5 consume del mismo
+  // presupuesto de max_tokens (misma lección del 3 jul con
+  // analizarConClaude, que por esto mismo subió de 8000 a 16000). Subido
+  // a 8000 acá como colchón; si vuelve a pasar, el chequeo de abajo lo va
+  // a decir explícitamente en vez de dejar pasar un guion roto en
+  // silencio (que además le quita al revisor la posibilidad de hacer una
+  // revisión de calidad real — termina "parchando" un corte, no editando).
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 4000,
+    max_tokens: 8000,
     messages: [{ role: 'user', content: prompt }],
   });
+
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error('generarGuion: respuesta cortada por max_tokens (8000) — el guion quedó incompleto. Subir max_tokens más, o revisar si el prompt está pidiendo demasiado.');
+  }
 
   const guion = extraerTextoRespuesta(response);
   console.log(`   [generarGuion] Guion generado (${guion.length} chars)`);
@@ -236,17 +249,25 @@ async function revisarGuion(guion, escenas) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const prompt = construirPromptRevisor(guion, escenas);
 
+  // Mismo colchón que el generador — el revisor tiene que poder devolver
+  // el guion completo (GUION_FINAL) más las notas, así que necesita al
+  // menos el mismo margen.
   const response = await anthropic.messages.create({
     model: 'claude-opus-4-8',
-    max_tokens: 4000,
+    max_tokens: 8000,
     messages: [{ role: 'user', content: prompt }],
   });
+
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error('revisarGuion: respuesta cortada por max_tokens (8000) — la revisión quedó incompleta.');
+  }
 
   const textoRespuesta = extraerTextoRespuesta(response);
   const revision = parsearRevision(textoRespuesta);
   console.log(`   [revisarGuion] Veredicto: ${revision.veredicto}${revision.notas ? ' — ' + revision.notas.slice(0, 120) : ''}`);
   return revision;
 }
+
 
 // Función combinada — genera y revisa en un solo llamado a este módulo.
 async function generarYRevisarGuion(datos, metadatos) {
