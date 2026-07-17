@@ -120,17 +120,26 @@ Análisis: ${balance.analisis}`;
 
 // ── Paso 2: prompt del generador ─────────────────────────────────────────────
 
-function construirPromptGenerador(escenas, metadatos, puntaje) {
+function construirPromptGenerador(escenas, datos, metadatos) {
   const { titulo, pais } = metadatos;
   const { nucleo, balance, tonoGeneral, hayPocoPositivo } = escenas;
+  const { puntaje, siPlenos, siMatiz, noCount, naCount } = datos;
+  const aplicables = siPlenos + siMatiz + noCount;
+  const totalCriterios = aplicables + naCount;
 
   const escenasTexto = nucleo.map(formatearEscena).join('\n\n');
   const balanceTexto = formatearBalance(balance);
 
-  return `Eres el guionista de Auditoría Cívica Liberal (liberalmente.app), una plataforma de CEDICE y la Fundación Friedrich Naumann que audita leyes y políticas públicas latinoamericanas con criterios del liberalismo clásico. Tu tarea es escribir un guion de podcast a dos voces que explique los hallazgos de una auditoría real a una audiencia NO especializada — personas que no están particularmente interesadas en el liberalismo como doctrina, y que no van a leer el reporte completo de 28 criterios.
+  return `Eres el guionista de Auditoría Cívica Liberal (liberalmente.app), una plataforma de CEDICE y la Fundación Friedrich Naumann que audita leyes y políticas públicas latinoamericanas con criterios del liberalismo clásico. Tu tarea es escribir un guion de podcast a dos voces que explique los hallazgos de una auditoría real a una audiencia NO especializada — personas que no están particularmente interesadas en el liberalismo como doctrina, y que no van a leer el reporte completo.
 
 DOCUMENTO AUDITADO: ${titulo}${pais ? ` (${pais})` : ''}
-ALINEACIÓN LIBERAL: ${puntaje !== null ? puntaje + '%' : 'sin total general (ningún criterio con SÍ pleno)'}
+
+RESULTADO GENERAL DE LA AUDITORÍA — estos son los ÚNICOS números reales que existen. Si mencionas cualquier cifra o total en el guion, tiene que ser exactamente uno de estos, nunca uno inventado o redondeado distinto:
+- Total de criterios evaluados: ${totalCriterios} (${aplicables} aplicables a este documento, ${naCount} no aplicables)
+- SÍ pleno: ${siPlenos}
+- SÍ con matiz: ${siMatiz}
+- NO se cumple: ${noCount}
+- Alineación general: ${puntaje !== null ? puntaje + '%' : 'no se calcula un porcentaje general (la fórmula requiere al menos un SÍ pleno, y este documento no tiene ninguno) — NO digas "cero por ciento", eso es un dato distinto y falso; di que no hay total general, o describe el desglose real de arriba'}
 
 LAS VOCES:
 - JANET: la analista. Seria, precisa, pero cálida — explica sin condescendencia.
@@ -146,15 +155,15 @@ ${tonoGeneral === 'mayoritariamente_alineado' ? 'NOTA DE ENFOQUE: este documento
 
 REGLAS DE ESCRITURA:
 
-1. ESTRUCTURA: Apertura (una frase que plantee qué está en juego para alguien como el oyente — nunca empieces con el porcentaje ni con "esta ley regula...") → una escena por cada hallazgo del material seleccionado → escena de balance (si existe) → cierre (menciona el porcentaje de alineación aquí, como remate, no como titular; termina con "Defiende la libertad. Audita el poder.").
+1. ESTRUCTURA: Apertura (una frase que plantee qué está en juego para alguien como el oyente — nunca empieces con el porcentaje ni con "esta ley regula...") → una escena por cada hallazgo del material seleccionado → escena de balance (si existe) → cierre (menciona la alineación general aquí, como remate, no como titular, usando exactamente los números de arriba; termina con "Defiende la libertad. Audita el poder.").
 
-2. METÁFORAS — ECONOMÍA, NO DECORACIÓN: usa como máximo 2-3 metáforas distintas en TODO el guion, nunca una por escena. Antes de usar una metáfora en una escena, pregúntate: ¿esto se entiende solo, en lenguaje llano, o de verdad hace falta una imagen para aterrizarlo? Si se entiende solo (por ejemplo, "el precio lo fija una oficina, no el mercado"), no le pongas metáfora encima. Resérvalas para lo estructural o abstracto (poder discrecional, efecto comadreja, ese tipo de cosas). Si reusas una metáfora en más de una escena, que sea una extensión natural de la misma imagen, no una repetición forzada — y verifica que la comparación sea lógicamente correcta: no le atribuyas a la metáfora algo que no le corresponde (ej. no compares un privilegio otorgado por el poder con algo que alguien elige voluntariamente).
+2. METÁFORAS — ECONOMÍA, NO DECORACIÓN: usa como máximo 2-3 metáforas distintas en TODO el guion, nunca una por escena. Antes de usar una metáfora en una escena, pregúntate: ¿esto se entiende solo, en lenguaje llano, o de verdad hace falta una imagen para aterrizarlo? Si se entiende solo (por ejemplo, "el precio lo fija una oficina, no el mercado"), no le pongas metáfora encima. Resérvalas para lo estructural o abstracto (poder discrecional, efecto comadreja, ese tipo de cosas). Si reusas una metáfora en más de una escena, que sea una extensión natural de la misma imagen, no una repetición forzada — y verifica que la comparación sea lógicamente correcta: no le atribuyas a la metáfora algo que no le corresponde (ej. no compares un privilegio otorgado por el poder con algo que alguien elige voluntariamente, ni le agregues un matiz temporal o de otro tipo que no esté en el hecho real que describe).
 
 3. TONO CONVERSACIONAL: diálogo real, con interjecciones, pausas, alguna interrupción — no un monólogo de Janet cortado artificialmente en dos. Roderick pregunta, reacciona, a veces bromea con algo de ironía. Nada de humor cruel ni sarcasmo hacia las personas — el blanco es el poder mal ejercido, nunca un grupo de personas.
 
 4. FILTRO DOCTRINAL: la línea que separa lo aceptable de lo problemático es liberal-democrático vs. populista/autoritario/totalitario — nunca izquierda vs. derecha. No conviertas esto en un panfleto partidista.
 
-5. FIDELIDAD: cada afirmación del guion debe corresponder a algo real del material seleccionado arriba. No exageres, no inventes artículos ni cifras que no estén ahí.
+5. FIDELIDAD — SIN EXCEPCIONES: cada afirmación del guion debe corresponder a algo real del material seleccionado arriba o a los números de "RESULTADO GENERAL". Esto incluye cifras, conteos, totales y porcentajes, no solo artículos o hechos narrativos — no inventes ni redondees ningún número que no esté explícitamente dado arriba, aunque te parezca plausible o "razonable" para un caso como este.
 
 FORMATO DE RESPUESTA — texto plano, sin JSON, sin markdown, empieza directo con la primera línea de diálogo:
 
@@ -217,7 +226,7 @@ function parsearRevision(textoRespuesta) {
 async function generarGuion(datos, metadatos) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const escenas = seleccionarEscenas(datos);
-  const prompt = construirPromptGenerador(escenas, metadatos, datos.puntaje);
+  const prompt = construirPromptGenerador(escenas, datos, metadatos);
 
   console.log(`   [generarGuion] Escenas seleccionadas: ${escenas.nucleo.length} del núcleo, balance: ${escenas.balance ? escenas.balance.id : 'ninguno'}, tono: ${escenas.tonoGeneral}`);
 
