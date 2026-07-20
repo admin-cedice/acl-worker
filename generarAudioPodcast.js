@@ -179,25 +179,34 @@ function parsearTiempoASegundos(valor) {
 // que la voz se siga escuchando clara por encima.
 
 function agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, opciones = {}) {
-  const { volumenMusica = 0.12, duracionFadeSegundos = 1, inicioSegundos = 0 } = opciones;
+  const {
+    volumenMusica          = 0.12,
+    duracionFadeSegundos   = 1,
+    inicioSegundos         = 0,
+    silencioAntesSegundos  = 2.5, // música sola antes de que entre la voz
+    silencioDespuesSegundos = 2.5, // música sola después de que termina la voz
+  } = opciones;
   return new Promise((resolve, reject) => {
     ffmpeg.ffprobe(rutaVoz, (err, metadata) => {
       if (err) return reject(err);
-      const duracionVoz = metadata.format.duration;
-      const inicioFadeOut = Math.max(0, duracionVoz - duracionFadeSegundos);
-      const finRecorte = inicioSegundos + duracionVoz;
+      const duracionVoz   = metadata.format.duration;
+      const duracionTotal = silencioAntesSegundos + duracionVoz + silencioDespuesSegundos;
+      const inicioFadeOut = Math.max(0, duracionTotal - duracionFadeSegundos);
+      const finRecorte    = inicioSegundos + duracionTotal;
+      const retrasoMs     = Math.round(silencioAntesSegundos * 1000);
 
       ffmpeg()
         .input(rutaVoz)
         .input(rutaMusica)
         .complexFilter([
-          // atrim recorta el segmento [inicioSegundos, finRecorte] de la pista
-          // original; asetpts resetea sus marcas de tiempo a partir de 0 —
-          // sin esto, el segmento recortado queda "fuera de sincronía" al
-          // mezclarlo con la voz (que sí empieza en 0), y el fade/mezcla
-          // salen mal calculados.
+          // La música se recorta a la duración TOTAL (colchón + voz + colchón),
+          // no solo a la duración de la voz como antes.
           `[1:a]atrim=${inicioSegundos}:${finRecorte},asetpts=PTS-STARTPTS,volume=${volumenMusica},afade=t=in:st=0:d=${duracionFadeSegundos},afade=t=out:st=${inicioFadeOut}:d=${duracionFadeSegundos}[musica]`,
-          `[0:a][musica]amix=inputs=2:duration=first:dropout_transition=0[salida]`,
+          // La voz se retrasa (adelay) para que entre después del colchón inicial.
+          `[0:a]adelay=${retrasoMs}|${retrasoMs}:all=1[voz]`,
+          // duration=longest (no "first") — ahora la música es más larga que la
+          // voz a propósito, y no queremos que se corte al terminar la voz.
+          `[voz][musica]amix=inputs=2:duration=longest:dropout_transition=0[salida]`,
         ], 'salida')
         .audioCodec('libmp3lame')
         .on('error', reject)
