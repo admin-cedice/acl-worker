@@ -29,6 +29,14 @@
 //   3. El guion (generado por generarGuionPresentacion.js, en lotes).
 //   4. Cierre FIJO (invitación a compartir, mismo criterio que la pieza 1
 //      — se genera una sola vez, assets/cierre-fijo.mp3).
+//
+// PAUSAS (18 jul 2026) — un clip de silencio entre cada pieza de la
+// cortina, generado localmente con ffmpeg (filtro anullsrc) — no cuesta
+// caracteres de ElevenLabs, no es voz, es silencio puro. Se genera una
+// vez por corrida y se reutiliza en cada punto de unión. Sin pausas entre
+// los lotes del guion en sí (eso sería un corte técnico de la API, no una
+// pausa narrativa — insertar silencio ahí se sentiría más artificial, no
+// menos).
 
 'use strict';
 
@@ -38,6 +46,7 @@ const ffmpeg  = require('fluent-ffmpeg');
 
 const ELEVENLABS_API_URL = 'https://api.elevenlabs.io/v1/text-to-dialogue';
 const MAX_CHARS_POR_LOTE = 1800; // colchón de seguridad bajo el límite real (~2000)
+const DURACION_PAUSA_DEFECTO = 0.8; // segundos
 
 // Voces aprobadas desde junio 2026 (ver documento de estado).
 const VOZ_ID = {
@@ -128,6 +137,22 @@ async function generarAudioLote(lote, auditoria_id, etiqueta) {
   return buffer;
 }
 
+// ── Paso 3.5: generar un clip de silencio local (sin tocar ElevenLabs) ──────
+// Usa el filtro virtual "anullsrc" de ffmpeg — genera silencio puro, no
+// cuesta ningún carácter del plan porque no pasa por la API de voz.
+
+function generarSilencioMp3(duracionSegundos, rutaSalida) {
+  return new Promise((resolve, reject) => {
+    ffmpeg('anullsrc=r=44100:cl=stereo')
+      .inputFormat('lavfi')
+      .duration(duracionSegundos)
+      .audioCodec('libmp3lame')
+      .on('error', reject)
+      .on('end', resolve)
+      .save(rutaSalida);
+  });
+}
+
 // ── Paso 4: ensamblar todos los segmentos (+ cortina) en un mp3 final ───────
 
 function concatenarMp3(rutasEnOrden, rutaSalida) {
@@ -146,27 +171,36 @@ function concatenarMp3(rutasEnOrden, rutaSalida) {
 // opciones.fraseDinamica: texto corto con el nombre del documento (se sintetiza con la voz de Janet)
 // opciones.rutaCortinaFija / opciones.rutaCierreFijo: por defecto, las rutas de assets/ —
 //   pásalas explícitamente solo si quieres usar otro archivo. Si el archivo por defecto
-//   todavía no existe (piezas fijas no generadas todavía), se omite esa pieza con un
-//   aviso en consola, en vez de fallar todo el podcast por faltar la cortina.
+//   todavía no existe (piezas fijas no generadas todavía), se omite esa pieza (y su
+//   pausa asociada) con un aviso en consola, en vez de fallar todo el podcast.
+// opciones.duracionPausaSegundos: por defecto 0.8s entre cada pieza de la cortina.
 //
-// Orden final: [cortina fija] → [frase dinámica] → [guion, en lotes] → [cierre fijo]
+// Orden final: [cortina fija] [pausa] [frase dinámica] [pausa] [guion, en lotes] [pausa] [cierre fijo]
 
 async function generarPodcastMp3(guionTexto, rutaSalida, auditoria_id, opciones = {}) {
   const {
-    fraseDinamica   = null,
-    rutaCortinaFija = RUTA_CORTINA_FIJA_DEFECTO,
-    rutaCierreFijo  = RUTA_CIERRE_FIJO_DEFECTO,
+    fraseDinamica         = null,
+    rutaCortinaFija       = RUTA_CORTINA_FIJA_DEFECTO,
+    rutaCierreFijo        = RUTA_CIERRE_FIJO_DEFECTO,
+    duracionPausaSegundos = DURACION_PAUSA_DEFECTO,
   } = opciones;
   const dirTemp = path.dirname(rutaSalida);
   const rutasParaConcatenar = [];
 
-  if (fs.existsSync(rutaCortinaFija)) {
+  console.log(`   [generarPodcastMp3] [${auditoria_id}] Generando clip de pausa (${duracionPausaSegundos}s, local, sin costo de API)...`);
+  const rutaPausa = path.join(dirTemp, 'pausa.mp3');
+  await generarSilencioMp3(duracionPausaSegundos, rutaPausa);
+
+  const cortinaFijaExiste = fs.existsSync(rutaCortinaFija);
+  if (cortinaFijaExiste) {
     rutasParaConcatenar.push(rutaCortinaFija);
   } else {
     console.warn(`   [generarPodcastMp3] [${auditoria_id}] ⚠️ No se encontró la cortina fija en ${rutaCortinaFija} — se omite. Generarla con /generar-pieza-fija?pieza=intro`);
   }
 
   if (fraseDinamica) {
+    if (cortinaFijaExiste) rutasParaConcatenar.push(rutaPausa);
+
     console.log(`   [generarPodcastMp3] [${auditoria_id}] Generando frase dinámica de cortina...`);
     const bufferFrase = await generarAudioLote(
       [{ voice_id: VOZ_ID.JANET, text: fraseDinamica }],
@@ -176,6 +210,11 @@ async function generarPodcastMp3(guionTexto, rutaSalida, auditoria_id, opciones 
     const rutaFrase = path.join(dirTemp, 'cortina-dinamica.mp3');
     fs.writeFileSync(rutaFrase, bufferFrase);
     rutasParaConcatenar.push(rutaFrase);
+  }
+
+  // Pausa antes de entrar al cuerpo del guion, si hubo algo de cortina antes.
+  if (cortinaFijaExiste || fraseDinamica) {
+    rutasParaConcatenar.push(rutaPausa);
   }
 
   const parlamentos = parsearGuionADialogo(guionTexto);
@@ -190,6 +229,7 @@ async function generarPodcastMp3(guionTexto, rutaSalida, auditoria_id, opciones 
   }
 
   if (fs.existsSync(rutaCierreFijo)) {
+    rutasParaConcatenar.push(rutaPausa);
     rutasParaConcatenar.push(rutaCierreFijo);
   } else {
     console.warn(`   [generarPodcastMp3] [${auditoria_id}] ⚠️ No se encontró el cierre fijo en ${rutaCierreFijo} — se omite. Generarlo con /generar-pieza-fija?pieza=cierre`);
@@ -206,6 +246,7 @@ module.exports = {
   parsearGuionADialogo,
   agruparEnLotes,
   generarAudioLote,
+  generarSilencioMp3,
   concatenarMp3,
   generarPodcastMp3,
   VOZ_ID,
