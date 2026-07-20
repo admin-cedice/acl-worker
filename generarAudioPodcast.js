@@ -153,6 +153,57 @@ function generarSilencioMp3(duracionSegundos, rutaSalida) {
   });
 }
 
+// Acepta "70" (segundos) o "1:10" (mm:ss) o "1:02:30" (hh:mm:ss) y devuelve
+// siempre segundos totales — para que en la URL del endpoint se pueda
+// escribir el tiempo tal como se ve en el reproductor de Pixabay, sin
+// tener que calcular segundos a mano.
+function parsearTiempoASegundos(valor) {
+  if (valor === undefined || valor === null || valor === '') return 0;
+  const texto = String(valor).trim();
+  if (/^\d+(\.\d+)?$/.test(texto)) return parseFloat(texto);
+  const partes = texto.split(':').map(Number);
+  if (partes.some(isNaN)) return 0;
+  if (partes.length === 2) return partes[0] * 60 + partes[1];
+  if (partes.length === 3) return partes[0] * 3600 + partes[1] * 60 + partes[2];
+  return 0;
+}
+
+// ── Paso 3.6: mezclar una pieza de voz con música de fondo (opcional) ───────
+// Pensado para las 2 piezas FIJAS (cortina, cierre) — se mezcla una sola
+// vez, no en cada podcast. La música se recorta a la duración exacta de
+// la voz (nunca al revés), con fade-in/fade-out para que no entre ni
+// salga de golpe, y su volumen se reduce fuerte (12% por defecto) para
+// que la voz se siga escuchando clara por encima.
+
+function agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, opciones = {}) {
+  const { volumenMusica = 0.12, duracionFadeSegundos = 1, inicioSegundos = 0 } = opciones;
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(rutaVoz, (err, metadata) => {
+      if (err) return reject(err);
+      const duracionVoz = metadata.format.duration;
+      const inicioFadeOut = Math.max(0, duracionVoz - duracionFadeSegundos);
+      const finRecorte = inicioSegundos + duracionVoz;
+
+      ffmpeg()
+        .input(rutaVoz)
+        .input(rutaMusica)
+        .complexFilter([
+          // atrim recorta el segmento [inicioSegundos, finRecorte] de la pista
+          // original; asetpts resetea sus marcas de tiempo a partir de 0 —
+          // sin esto, el segmento recortado queda "fuera de sincronía" al
+          // mezclarlo con la voz (que sí empieza en 0), y el fade/mezcla
+          // salen mal calculados.
+          `[1:a]atrim=${inicioSegundos}:${finRecorte},asetpts=PTS-STARTPTS,volume=${volumenMusica},afade=t=in:st=0:d=${duracionFadeSegundos},afade=t=out:st=${inicioFadeOut}:d=${duracionFadeSegundos}[musica]`,
+          `[0:a][musica]amix=inputs=2:duration=first:dropout_transition=0[salida]`,
+        ], 'salida')
+        .audioCodec('libmp3lame')
+        .on('error', reject)
+        .on('end', () => resolve(rutaSalida))
+        .save(rutaSalida);
+    });
+  });
+}
+
 // ── Paso 4: ensamblar todos los segmentos (+ cortina) en un mp3 final ───────
 
 function concatenarMp3(rutasEnOrden, rutaSalida) {
@@ -247,6 +298,8 @@ module.exports = {
   agruparEnLotes,
   generarAudioLote,
   generarSilencioMp3,
+  agregarFondoMusical,
+  parsearTiempoASegundos,
   concatenarMp3,
   generarPodcastMp3,
   VOZ_ID,

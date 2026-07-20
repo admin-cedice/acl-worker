@@ -48,6 +48,8 @@ const { generarYRevisarGuion } = require('./generarGuionPresentacion');
 const {
   generarPodcastMp3,
   generarAudioLote,
+  agregarFondoMusical,
+  parsearTiempoASegundos,
   VOZ_ID,
   TEXTO_CORTINA_FIJA,
   TEXTO_CIERRE_FIJO,
@@ -893,6 +895,72 @@ app.get('/generar-pieza-fija', async (req, res) => {
 // En el navegador:
 //   https://acl-worker-production.up.railway.app/test-podcast-audio?secret=acl-worker-2026-secreto
 //   (sin auditoria_id: usa la auditoría completada más reciente)
+// ENDPOINT DE USO OCASIONAL — mezcla música de fondo con una pieza FIJA ya
+// generada (cortina o cierre). No toca ElevenLabs para nada — descarga la
+// pista de música desde Drive (por su fileId) y la mezcla localmente con
+// ffmpeg contra el mp3 de voz que ya está en assets/. Se puede correr las
+// veces que haga falta para probar distintas pistas o volúmenes, sin
+// gastar ni un carácter del plan de ElevenLabs.
+//
+// Requisito: subir la pista de música a Drive primero (cualquier carpeta),
+// obtener su fileId (clic derecho → Compartir → copiar el ID de la URL),
+// y confirmar que su licencia permite uso comercial antes de usarla.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/mezclar-musica-pieza-fija?secret=acl-worker-2026-secreto&pieza=intro&musica_drive_id=EL_ID_DE_DRIVE
+//   https://acl-worker-production.up.railway.app/mezclar-musica-pieza-fija?secret=acl-worker-2026-secreto&pieza=cierre&musica_drive_id=EL_ID_DE_DRIVE
+// Opcional: &inicio_musica=1:10 (o solo segundos, ej. 70) — para empezar
+// a media pista en vez de desde el principio. Sin este parámetro, empieza
+// desde el segundo 0.
+// Descarga el resultado y súbelo al repo reemplazando el archivo en
+// assets/ (mismo nombre: cortina-fija.mp3 o cierre-fijo.mp3).
+app.get('/mezclar-musica-pieza-fija', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).send('No autorizado');
+  }
+  const pieza = req.query.pieza; // 'intro' | 'cierre'
+  const musicaDriveId = req.query.musica_drive_id;
+  const inicioSegundos = parsearTiempoASegundos(req.query.inicio_musica);
+  const rutasVoz = { intro: RUTA_CORTINA_FIJA_DEFECTO, cierre: RUTA_CIERRE_FIJO_DEFECTO };
+  const rutaVoz = rutasVoz[pieza];
+
+  if (!rutaVoz) {
+    return res.status(400).send('Falta ?pieza=intro o ?pieza=cierre en la URL');
+  }
+  if (!musicaDriveId) {
+    return res.status(400).send('Falta ?musica_drive_id en la URL — sube la pista a Drive primero y copia su fileId');
+  }
+  if (!fs.existsSync(rutaVoz)) {
+    return res.status(404).send(`No existe todavía ${rutaVoz} — genera la pieza de voz primero con /generar-pieza-fija?pieza=${pieza}, súbela al repo como assets/, y despliega antes de mezclar música.`);
+  }
+
+  const dirTemp = path.join(DIRECTORIO_TEMP, `mezcla-musica-${pieza}-${Date.now()}`);
+  fs.mkdirSync(dirTemp, { recursive: true });
+
+  try {
+    console.log(`   [mezclar-musica-pieza-fija] Descargando música (Drive: ${musicaDriveId})...`);
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const rutaMusica = path.join(dirTemp, 'musica.mp3');
+    await descargarPDF(drive, musicaDriveId, rutaMusica); // sirve para cualquier archivo, no solo PDF
+
+    console.log(`   [mezclar-musica-pieza-fija] Mezclando con ${rutaVoz} (música desde el segundo ${inicioSegundos})...`);
+    const rutaSalida = path.join(dirTemp, `${pieza}-con-musica.mp3`);
+    await agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, { inicioSegundos });
+
+    const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    fs.createReadStream(rutaSalida).pipe(res).on('close', () => {
+      fs.rmSync(dirTemp, { recursive: true, force: true });
+    });
+  } catch (error) {
+    console.error('   [mezclar-musica-pieza-fija] ❌ Error:', error.message);
+    fs.rmSync(dirTemp, { recursive: true, force: true });
+    res.status(500).send('Error: ' + error.message);
+  }
+});
+
 app.get('/test-podcast-audio', async (req, res) => {
   if (req.query.secret !== WORKER_SECRET) {
     return res.status(401).type('text/plain').send('No autorizado');
