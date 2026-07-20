@@ -961,6 +961,127 @@ app.get('/mezclar-musica-pieza-fija', async (req, res) => {
   }
 });
 
+// ENDPOINT DE RESPALDO (20 jul 2026) — sube el mp3 de música directo al
+// worker, sin pasar por Google Drive en ningún momento. Se agregó después
+// de que /mezclar-musica-pieza-fija diera 404 en un archivo con permisos
+// aparentemente correctos ("cualquiera con el enlace", ID confirmado) —
+// probable política de la organización de Workspace restringiendo acceso
+// externo, más allá de lo que muestra el diálogo de "Compartir" de un
+// archivo individual. En vez de depurar esa política, este camino evita
+// el problema por completo: el archivo nunca toca Drive.
+//
+// GET sirve un formulario HTML simple (elegir archivo, elegir pieza,
+// opcional el punto de inicio) — pensado para usarse desde el navegador,
+// sin Postman ni curl. POST recibe el archivo en base64 (mismo patrón que
+// /fuentes/subir), lo mezcla con la pieza de voz correspondiente, y
+// devuelve el resultado como descarga directa.
+app.get('/subir-musica-fija', (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).send('No autorizado');
+  }
+  const secretoParaFormulario = String(req.query.secret).replace(/"/g, '');
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><title>Subir música — Liberalmente</title></head>
+<body style="font-family: sans-serif; max-width: 480px; margin: 40px auto; line-height: 1.5;">
+  <h2>Subir música de fondo</h2>
+  <p>Sube el mp3 directo — no pasa por Drive.</p>
+  <form id="f">
+    <p><label>Archivo mp3:<br><input type="file" id="archivo" accept="audio/mpeg" required></label></p>
+    <p><label>Pieza:<br>
+      <select id="pieza">
+        <option value="intro">Cortina (intro)</option>
+        <option value="cierre">Cierre</option>
+      </select>
+    </label></p>
+    <p><label>Empezar en (mm:ss, opcional):<br><input type="text" id="inicio" placeholder="1:10"></label></p>
+    <button type="submit">Subir y mezclar</button>
+  </form>
+  <pre id="resultado" style="white-space: pre-wrap;"></pre>
+  <script>
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const archivo = document.getElementById('archivo').files[0];
+      const pieza = document.getElementById('pieza').value;
+      const inicio = document.getElementById('inicio').value;
+      const resultado = document.getElementById('resultado');
+      resultado.textContent = 'Subiendo y mezclando, un momento...';
+
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const base64 = reader.result.split(',')[1];
+          const resp = await fetch('/subir-musica-fija?secret=${secretoParaFormulario}', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ musica_base64: base64, pieza, inicio_musica: inicio }),
+          });
+          if (resp.ok) {
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
+            document.body.appendChild(a);
+            a.click();
+            resultado.textContent = '✅ Listo — revisa la carpeta de descargas de tu navegador.';
+          } else {
+            resultado.textContent = '❌ Error: ' + await resp.text();
+          }
+        } catch (err) {
+          resultado.textContent = '❌ Error: ' + err.message;
+        }
+      };
+      reader.readAsDataURL(archivo);
+    });
+  </script>
+</body>
+</html>`);
+});
+
+app.post('/subir-musica-fija', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).send('No autorizado');
+  }
+  const { musica_base64, pieza, inicio_musica } = req.body || {};
+  const rutasVoz = { intro: RUTA_CORTINA_FIJA_DEFECTO, cierre: RUTA_CIERRE_FIJO_DEFECTO };
+  const rutaVoz = rutasVoz[pieza];
+
+  if (!rutaVoz) {
+    return res.status(400).send('Falta pieza=intro o pieza=cierre');
+  }
+  if (!musica_base64) {
+    return res.status(400).send('Falta el archivo de música');
+  }
+  if (!fs.existsSync(rutaVoz)) {
+    return res.status(404).send(`No existe todavía ${rutaVoz} — genera la pieza de voz primero con /generar-pieza-fija?pieza=${pieza}`);
+  }
+
+  const dirTemp = path.join(DIRECTORIO_TEMP, `subir-musica-${pieza}-${Date.now()}`);
+  fs.mkdirSync(dirTemp, { recursive: true });
+
+  try {
+    const rutaMusica = path.join(dirTemp, 'musica.mp3');
+    fs.writeFileSync(rutaMusica, Buffer.from(musica_base64, 'base64'));
+    console.log(`   [subir-musica-fija] Música recibida (${Math.round(fs.statSync(rutaMusica).size / 1024)} KB), mezclando con ${rutaVoz}...`);
+
+    const inicioSegundos = parsearTiempoASegundos(inicio_musica);
+    const rutaSalida = path.join(dirTemp, `${pieza}-con-musica.mp3`);
+    await agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, { inicioSegundos });
+
+    const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    fs.createReadStream(rutaSalida).pipe(res).on('close', () => {
+      fs.rmSync(dirTemp, { recursive: true, force: true });
+    });
+  } catch (error) {
+    console.error('   [subir-musica-fija] ❌ Error:', error.message);
+    fs.rmSync(dirTemp, { recursive: true, force: true });
+    res.status(500).send('Error: ' + error.message);
+  }
+});
+
 app.get('/test-podcast-audio', async (req, res) => {
   if (req.query.secret !== WORKER_SECRET) {
     return res.status(401).type('text/plain').send('No autorizado');
