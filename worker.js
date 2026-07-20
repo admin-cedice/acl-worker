@@ -45,6 +45,15 @@
 const { generarPodcastPrueba } = require('./testPodcast');
 const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA, normalizarDatosEstructurados } = require('./generarReportePDF');
 const { generarYRevisarGuion } = require('./generarGuionPresentacion');
+const {
+  generarPodcastMp3,
+  generarAudioLote,
+  VOZ_ID,
+  TEXTO_CORTINA_FIJA,
+  TEXTO_CIERRE_FIJO,
+  RUTA_CORTINA_FIJA_DEFECTO,
+  RUTA_CIERRE_FIJO_DEFECTO,
+} = require('./generarAudioPodcast');
 const express    = require('express');
 const { google } = require('googleapis');
 const { GoogleAuth } = require('google-auth-library');
@@ -831,6 +840,129 @@ ${resultado.guionFinal}
     clearInterval(heartbeat);
     console.error('   [TEST-GUION] ❌ Error:', error.message);
     res.end('\n\nError: ' + error.message);
+  }
+});
+
+// ENDPOINT DE UN SOLO USO — genera las piezas fijas de la cortina del
+// podcast (intro y cierre) y las devuelve como mp3 descargable. Se corre
+// UNA vez; el resultado se descarga y se sube manualmente al repo en
+// acl-worker/assets/cortina-fija.mp3 y acl-worker/assets/cierre-fijo.mp3.
+// No se vuelve a llamar en producción — generarPodcastMp3() lee esos
+// archivos ya guardados, no genera esta pieza en cada podcast (sería
+// gastar caracteres del plan en algo que nunca cambia).
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/generar-pieza-fija?secret=acl-worker-2026-secreto&pieza=intro
+//   https://acl-worker-production.up.railway.app/generar-pieza-fija?secret=acl-worker-2026-secreto&pieza=cierre
+// Cada una descarga un archivo — guárdalo con el nombre que indica el
+// comentario de arriba, dentro de una carpeta nueva `assets/` en el repo.
+app.get('/generar-pieza-fija', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).send('No autorizado');
+  }
+  const pieza = req.query.pieza; // 'intro' | 'cierre'
+  const textos = { intro: TEXTO_CORTINA_FIJA, cierre: TEXTO_CIERRE_FIJO };
+  const texto = textos[pieza];
+  if (!texto) {
+    return res.status(400).send('Falta ?pieza=intro o ?pieza=cierre en la URL');
+  }
+  try {
+    const buffer = await generarAudioLote(
+      [{ voice_id: VOZ_ID.JANET, text: texto }],
+      'pieza-fija',
+      pieza
+    );
+    const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    res.send(buffer);
+  } catch (error) {
+    console.error('   [generar-pieza-fija] ❌ Error:', error.message);
+    res.status(500).send('Error: ' + error.message);
+  }
+});
+
+// PRUEBA TEMPORAL — genera el guion (generador + revisor) y lo convierte
+// en un mp3 real con ElevenLabs, ensamblando las 4 piezas de la cortina.
+// Sube el resultado a una carpeta de Drive separada de pruebas (no la
+// carpeta real de la auditoría) — nada de esto toca producción todavía.
+// GET + texto plano, con latido de conexión (mismo patrón que
+// /test-guion) — esto tarda más todavía (guion + varios lotes de audio),
+// así que el latido importa más acá que en ningún otro endpoint.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/test-podcast-audio?secret=acl-worker-2026-secreto
+//   (sin auditoria_id: usa la auditoría completada más reciente)
+app.get('/test-podcast-audio', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  let fila;
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais
+         FROM auditorias
+         WHERE estado = 'completada' AND reporte_texto IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
+
+  if (!fila?.reporte_texto) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría completada con reporte_texto.');
+  }
+
+  res.type('text/plain; charset=utf-8');
+  res.write('Generando guion y audio — esto puede tardar varios minutos (guion + varios lotes de voz), no cierres esta pestaña...\n');
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  const dirTemp = path.join(DIRECTORIO_TEMP, `test-podcast-audio-${fila.id}-${Date.now()}`);
+  fs.mkdirSync(dirTemp, { recursive: true });
+
+  try {
+    console.log(`   [TEST-PODCAST-AUDIO] Generando guion para: ${fila.titulo_documento}`);
+    const datos = normalizarDatosEstructurados(fila.reporte_texto, fila.id);
+    const resultadoGuion = await generarYRevisarGuion(datos, { titulo: fila.titulo_documento, pais: fila.pais || '' });
+
+    console.log(`   [TEST-PODCAST-AUDIO] Generando audio con ElevenLabs...`);
+    const rutaMp3 = path.join(dirTemp, 'podcast.mp3');
+    const fraseDinamica = `Hoy nos ocupamos de: ${fila.titulo_documento}.`;
+    await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, fila.id, { fraseDinamica });
+
+    console.log(`   [TEST-PODCAST-AUDIO] Subiendo a Drive (carpeta de pruebas)...`);
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const carpetaId = await obtenerCarpetaAuditoria(drive, `pruebas-podcast-${fila.id}`);
+    const nombreArchivo = `podcast-prueba-${slugificar(fila.titulo_documento)}.mp3`;
+    const link = await subirArchivo(drive, rutaMp3, nombreArchivo, 'audio/mpeg', carpetaId);
+
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+VEREDICTO DEL REVISOR SOBRE EL GUION: ${resultadoGuion.veredicto}
+
+✅ Podcast generado y subido a Drive (carpeta de pruebas):
+${link}
+`);
+  } catch (error) {
+    clearInterval(heartbeat);
+    console.error('   [TEST-PODCAST-AUDIO] ❌ Error:', error.message);
+    res.end('\n\nError: ' + error.message);
+  } finally {
+    fs.rmSync(dirTemp, { recursive: true, force: true });
   }
 });
 

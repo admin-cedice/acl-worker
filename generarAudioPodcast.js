@@ -1,0 +1,216 @@
+// generarAudioPodcast.js — ACL Worker
+// Umbusk LLC · Auditoría Cívica Liberal
+//
+// MÓDULO NUEVO (18 jul 2026) — convierte el guion a dos voces (ya generado
+// y revisado por generarGuionPresentacion.js) en un mp3 real, usando la
+// API de ElevenLabs. NO conectado a procesarAuditoria() todavía — mismo
+// criterio que generarGuionPresentacion.js: se prueba aislado primero.
+//
+// Decisión técnica clave: se usa el endpoint /v1/text-to-dialogue (diseñado
+// específicamente para diálogos multi-voz), no el clásico
+// /v1/text-to-speech/{voice_id} de una sola voz llamado en bucle. Las
+// etiquetas de emoción ([seria], [curioso], [pausa]) van dentro del texto
+// de cada parlamento — eleven_v3 las interpreta directo, no son un
+// parámetro aparte.
+//
+// Límite real de la API: máximo ~2.000 caracteres de texto por request,
+// sumando todos los parlamentos de esa llamada. Los guiones reales miden
+// 4.500-6.500 caracteres, así que se parten en lotes — el corte siempre
+// cae entre un parlamento y el siguiente, nunca a mitad de una línea.
+//
+// CORTINA (18 jul 2026) — 4 piezas en el mp3 final, en orden:
+//   1. Cortina FIJA (texto aprobado, se genera UNA sola vez con
+//      /generar-pieza-fija?pieza=intro en worker.js, se guarda en
+//      assets/cortina-fija.mp3 y se reutiliza siempre — regenerarla en
+//      cada podcast desperdiciaría caracteres del plan en algo que nunca
+//      cambia).
+//   2. Frase DINÁMICA (nombra el documento, se genera en cada corrida,
+//      voz de Janet).
+//   3. El guion (generado por generarGuionPresentacion.js, en lotes).
+//   4. Cierre FIJO (invitación a compartir, mismo criterio que la pieza 1
+//      — se genera una sola vez, assets/cierre-fijo.mp3).
+
+'use strict';
+
+const fs      = require('fs');
+const path    = require('path');
+const ffmpeg  = require('fluent-ffmpeg');
+
+const ELEVENLABS_API_URL = 'https://api.elevenlabs.io/v1/text-to-dialogue';
+const MAX_CHARS_POR_LOTE = 1800; // colchón de seguridad bajo el límite real (~2000)
+
+// Voces aprobadas desde junio 2026 (ver documento de estado).
+const VOZ_ID = {
+  JANET:    '9cySrnzVAcRAUGO8JQtx', // Janet Morales — analista
+  RODERICK: 'haaEg4BqiAAwDT7ahTxl', // Roderick — ciudadano curioso
+};
+
+// Textos de las 2 piezas fijas de la cortina, aprobados el 18 jul 2026.
+const TEXTO_CORTINA_FIJA = '¡Esto es Liberalmente! Este audio es para ayudar a entender mejor los efectos reales de lo auditado con base en criterios de liberalismo popular.';
+const TEXTO_CIERRE_FIJO  = 'Si te gusta, compártelo junto con el reporte de auditoría en liberalmente.app.';
+
+// Rutas por defecto de las piezas fijas ya generadas — relativas a este
+// archivo, para que no dependan de dónde se ejecute el proceso.
+const RUTA_CORTINA_FIJA_DEFECTO = path.join(__dirname, 'assets', 'cortina-fija.mp3');
+const RUTA_CIERRE_FIJO_DEFECTO  = path.join(__dirname, 'assets', 'cierre-fijo.mp3');
+
+// ── Paso 1: parsear el guion (formato "JANET: [emoción] texto") ─────────────
+// Mismo formato de salida que ya produce generarGuionPresentacion.js — no
+// hace falta tocar ese módulo, este solo lo consume.
+
+function parsearGuionADialogo(guionTexto) {
+  const lineas = guionTexto.split('\n').map(l => l.trim()).filter(Boolean);
+  const parlamentos = [];
+
+  for (const linea of lineas) {
+    const match = linea.match(/^(JANET|RODERICK):\s*(.+)$/i);
+    if (!match) continue; // ignora líneas vacías o que no siguen el formato
+    const hablante = match[1].toUpperCase();
+    const texto = match[2].trim();
+    const voice_id = VOZ_ID[hablante];
+    if (!voice_id || !texto) continue;
+    parlamentos.push({ voice_id, text: texto });
+  }
+
+  if (parlamentos.length === 0) {
+    throw new Error('parsearGuionADialogo: no se reconoció ningún parlamento — ¿el guion sigue el formato "JANET:"/"RODERICK:"?');
+  }
+  return parlamentos;
+}
+
+// ── Paso 2: agrupar en lotes que no excedan el límite de caracteres ─────────
+
+function agruparEnLotes(parlamentos, maxChars = MAX_CHARS_POR_LOTE) {
+  const lotes = [];
+  let loteActual = [];
+  let charsLoteActual = 0;
+
+  for (const p of parlamentos) {
+    const largoParlamento = p.text.length;
+    if (charsLoteActual + largoParlamento > maxChars && loteActual.length > 0) {
+      lotes.push(loteActual);
+      loteActual = [];
+      charsLoteActual = 0;
+    }
+    loteActual.push(p);
+    charsLoteActual += largoParlamento;
+  }
+  if (loteActual.length > 0) lotes.push(loteActual);
+
+  return lotes;
+}
+
+// ── Paso 3: llamar a la API por cada lote ────────────────────────────────────
+
+async function generarAudioLote(lote, auditoria_id, etiqueta) {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  if (!apiKey) throw new Error('Falta la variable de entorno ELEVENLABS_API_KEY');
+
+  const response = await fetch(ELEVENLABS_API_URL, {
+    method: 'POST',
+    headers: {
+      'xi-api-key':   apiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      inputs:   lote,
+      model_id: 'eleven_v3',
+    }),
+  });
+
+  if (!response.ok) {
+    const detalle = await response.text();
+    throw new Error(`ElevenLabs /text-to-dialogue error ${response.status} (lote ${etiqueta}): ${detalle}`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  console.log(`   [generarAudioLote] [${auditoria_id}] Lote ${etiqueta}: ${lote.length} parlamentos, ${Math.round(buffer.length / 1024)} KB`);
+  return buffer;
+}
+
+// ── Paso 4: ensamblar todos los segmentos (+ cortina) en un mp3 final ───────
+
+function concatenarMp3(rutasEnOrden, rutaSalida) {
+  return new Promise((resolve, reject) => {
+    const comando = ffmpeg();
+    rutasEnOrden.forEach(ruta => comando.input(ruta));
+    comando
+      .on('error', reject)
+      .on('end', resolve)
+      .mergeToFile(rutaSalida, path.dirname(rutaSalida));
+  });
+}
+
+// ── Función principal exportada ──────────────────────────────────────────────
+// guionTexto: el guion ya revisado (resultado.guionFinal de generarYRevisarGuion)
+// opciones.fraseDinamica: texto corto con el nombre del documento (se sintetiza con la voz de Janet)
+// opciones.rutaCortinaFija / opciones.rutaCierreFijo: por defecto, las rutas de assets/ —
+//   pásalas explícitamente solo si quieres usar otro archivo. Si el archivo por defecto
+//   todavía no existe (piezas fijas no generadas todavía), se omite esa pieza con un
+//   aviso en consola, en vez de fallar todo el podcast por faltar la cortina.
+//
+// Orden final: [cortina fija] → [frase dinámica] → [guion, en lotes] → [cierre fijo]
+
+async function generarPodcastMp3(guionTexto, rutaSalida, auditoria_id, opciones = {}) {
+  const {
+    fraseDinamica   = null,
+    rutaCortinaFija = RUTA_CORTINA_FIJA_DEFECTO,
+    rutaCierreFijo  = RUTA_CIERRE_FIJO_DEFECTO,
+  } = opciones;
+  const dirTemp = path.dirname(rutaSalida);
+  const rutasParaConcatenar = [];
+
+  if (fs.existsSync(rutaCortinaFija)) {
+    rutasParaConcatenar.push(rutaCortinaFija);
+  } else {
+    console.warn(`   [generarPodcastMp3] [${auditoria_id}] ⚠️ No se encontró la cortina fija en ${rutaCortinaFija} — se omite. Generarla con /generar-pieza-fija?pieza=intro`);
+  }
+
+  if (fraseDinamica) {
+    console.log(`   [generarPodcastMp3] [${auditoria_id}] Generando frase dinámica de cortina...`);
+    const bufferFrase = await generarAudioLote(
+      [{ voice_id: VOZ_ID.JANET, text: fraseDinamica }],
+      auditoria_id,
+      'cortina-dinamica'
+    );
+    const rutaFrase = path.join(dirTemp, 'cortina-dinamica.mp3');
+    fs.writeFileSync(rutaFrase, bufferFrase);
+    rutasParaConcatenar.push(rutaFrase);
+  }
+
+  const parlamentos = parsearGuionADialogo(guionTexto);
+  const lotes = agruparEnLotes(parlamentos);
+  console.log(`   [generarPodcastMp3] [${auditoria_id}] ${parlamentos.length} parlamentos en ${lotes.length} lote(s)`);
+
+  for (let i = 0; i < lotes.length; i++) {
+    const buffer = await generarAudioLote(lotes[i], auditoria_id, i + 1);
+    const rutaLote = path.join(dirTemp, `lote-${i + 1}.mp3`);
+    fs.writeFileSync(rutaLote, buffer);
+    rutasParaConcatenar.push(rutaLote);
+  }
+
+  if (fs.existsSync(rutaCierreFijo)) {
+    rutasParaConcatenar.push(rutaCierreFijo);
+  } else {
+    console.warn(`   [generarPodcastMp3] [${auditoria_id}] ⚠️ No se encontró el cierre fijo en ${rutaCierreFijo} — se omite. Generarlo con /generar-pieza-fija?pieza=cierre`);
+  }
+
+  console.log(`   [generarPodcastMp3] [${auditoria_id}] Concatenando ${rutasParaConcatenar.length} segmento(s) con ffmpeg...`);
+  await concatenarMp3(rutasParaConcatenar, rutaSalida);
+  console.log(`   [generarPodcastMp3] [${auditoria_id}] ✅ Podcast generado: ${rutaSalida}`);
+
+  return rutaSalida;
+}
+
+module.exports = {
+  parsearGuionADialogo,
+  agruparEnLotes,
+  generarAudioLote,
+  concatenarMp3,
+  generarPodcastMp3,
+  VOZ_ID,
+  TEXTO_CORTINA_FIJA,
+  TEXTO_CIERRE_FIJO,
+  RUTA_CORTINA_FIJA_DEFECTO,
+  RUTA_CIERRE_FIJO_DEFECTO,
+};
