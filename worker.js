@@ -870,7 +870,7 @@ app.get('/generar-pieza-fija', async (req, res) => {
   }
   try {
     const buffer = await generarAudioLote(
-      [{ voice_id: VOZ_ID.JANET, text: texto }],
+      [{ voice_id: VOZ_ID.ANITA, text: texto }],
       'pieza-fija',
       pieza
     );

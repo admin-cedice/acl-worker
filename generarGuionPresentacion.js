@@ -2,7 +2,7 @@
 // Umbusk LLC · Auditoría Cívica Liberal
 //
 // MÓDULO NUEVO (17 jul 2026) — primer borrador, EXPERIMENTAL.
-// Genera el guion a dos voces (Janet + Roderick) para el Hemisferio
+// Genera el guion a dos voces (Anita + Erick) para el Hemisferio
 // Derecho (Presentación PDF + mp4 narrado), a partir del reporte
 // estructurado que ya produce el Hemisferio Izquierdo.
 //
@@ -27,7 +27,7 @@
 //      criterio, lee el guion completo como lo haría un editor humano.
 //      Corre en claude-opus-4-8, modelo distinto al generador a propósito.
 //
-// Formato de salida: texto plano con marcadores (JANET:/RODERICK:), NO
+// Formato de salida: texto plano con marcadores (ANITA:/ERICK:), NO
 // JSON — mismo criterio que generarResumenEjecutivo() en
 // generarReportePDF.js desde la lección del 7 jul (un salto de línea real
 // dentro de un string JSON rompe JSON.parse; texto con marcadores no tiene
@@ -142,8 +142,8 @@ RESULTADO GENERAL DE LA AUDITORÍA — estos son los ÚNICOS números reales que
 - Alineación general: ${puntaje !== null ? puntaje + '%' : 'no se calcula un porcentaje general (la fórmula requiere al menos un SÍ pleno, y este documento no tiene ninguno) — NO digas "cero por ciento", eso es un dato distinto y falso; di que no hay total general, o describe el desglose real de arriba'}
 
 LAS VOCES:
-- JANET: la analista. Seria, precisa, pero cálida — explica sin condescendencia.
-- RODERICK: el ciudadano curioso. Hace las preguntas que haría cualquier oyente — sorpresa, ironía, alivio, incredulidad genuina. No es ingenuo, es alguien que no ha leído la ley y quiere entender.
+- ANITA: la analista. Seria, precisa, pero cálida — explica sin condescendencia.
+- ERICK: el ciudadano curioso. Hace las preguntas que haría cualquier oyente — sorpresa, ironía, alivio, incredulidad genuina. No es ingenuo, es alguien que no ha leído la ley y quiere entender.
 
 MATERIAL YA SELECCIONADO PARA EL GUION (no elijas otros hallazgos, no agregues criterios que no estén aquí):
 
@@ -159,7 +159,7 @@ REGLAS DE ESCRITURA:
 
 2. METÁFORAS — ECONOMÍA, NO DECORACIÓN: usa como máximo 2-3 metáforas distintas en TODO el guion, nunca una por escena. Antes de usar una metáfora en una escena, pregúntate: ¿esto se entiende solo, en lenguaje llano, o de verdad hace falta una imagen para aterrizarlo? Si se entiende solo (por ejemplo, "el precio lo fija una oficina, no el mercado"), no le pongas metáfora encima. Resérvalas para lo estructural o abstracto (poder discrecional, efecto comadreja, ese tipo de cosas). Si reusas una metáfora en más de una escena, que sea una extensión natural de la misma imagen, no una repetición forzada — y verifica que la comparación sea lógicamente correcta: no le atribuyas a la metáfora algo que no le corresponde (ej. no compares un privilegio otorgado por el poder con algo que alguien elige voluntariamente, ni le agregues un matiz temporal o de otro tipo que no esté en el hecho real que describe).
 
-3. TONO CONVERSACIONAL: diálogo real, con interjecciones, pausas, alguna interrupción — no un monólogo de Janet cortado artificialmente en dos. Roderick pregunta, reacciona, a veces bromea con algo de ironía. Nada de humor cruel ni sarcasmo hacia las personas — el blanco es el poder mal ejercido, nunca un grupo de personas.
+3. TONO CONVERSACIONAL: diálogo real, con interjecciones, pausas, alguna interrupción — no un monólogo de Anita cortado artificialmente en dos. Erick pregunta, reacciona, a veces bromea con algo de ironía. Nada de humor cruel ni sarcasmo hacia las personas — el blanco es el poder mal ejercido, nunca un grupo de personas.
 
 4. FILTRO DOCTRINAL: la línea que separa lo aceptable de lo problemático es liberal-democrático vs. populista/autoritario/totalitario — nunca izquierda vs. derecha. No conviertas esto en un panfleto partidista.
 
@@ -167,8 +167,8 @@ REGLAS DE ESCRITURA:
 
 FORMATO DE RESPUESTA — texto plano, sin JSON, sin markdown, empieza directo con la primera línea de diálogo:
 
-JANET: [emoción entre corchetes, ej. seria/curiosa/pausa] línea de diálogo
-RODERICK: [emoción] línea de diálogo
+ANITA: [emoción entre corchetes, ej. seria/curiosa/pausa] línea de diálogo
+ERICK: [emoción] línea de diálogo
 ...
 
 No escribas nada antes de la primera línea ni después de la última.`;
@@ -180,7 +180,7 @@ function construirPromptRevisor(guion, escenas) {
   const escenasTexto = escenas.nucleo.map(formatearEscena).join('\n\n');
   const balanceTexto = formatearBalance(escenas.balance);
 
-  return `Eres un editor experimentado de contenido conversacional para audiencias generales. A continuación tienes un guion de podcast a dos voces (Janet y Roderick) que explica los hallazgos de una auditoría cívica liberal sobre una ley o política pública, y el material real en el que se basó.
+  return `Eres un editor experimentado de contenido conversacional para audiencias generales. A continuación tienes un guion de podcast a dos voces (Anita y Erick) que explica los hallazgos de una auditoría cívica liberal sobre una ley o política pública, y el material real en el que se basó.
 
 MATERIAL EN EL QUE SE BASÓ EL GUION:
 

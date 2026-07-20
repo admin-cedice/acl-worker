@@ -25,7 +25,7 @@
 //      cada podcast desperdiciaría caracteres del plan en algo que nunca
 //      cambia).
 //   2. Frase DINÁMICA (nombra el documento, se genera en cada corrida,
-//      voz de Janet).
+//      voz de Anita).
 //   3. El guion (generado por generarGuionPresentacion.js, en lotes).
 //   4. Cierre FIJO (invitación a compartir, mismo criterio que la pieza 1
 //      — se genera una sola vez, assets/cierre-fijo.mp3).
@@ -48,10 +48,13 @@ const ELEVENLABS_API_URL = 'https://api.elevenlabs.io/v1/text-to-dialogue';
 const MAX_CHARS_POR_LOTE = 1800; // colchón de seguridad bajo el límite real (~2000)
 const DURACION_PAUSA_DEFECTO = 0.8; // segundos
 
-// Voces aprobadas desde junio 2026 (ver documento de estado).
+// Voces vigentes desde el 20 jul 2026 — reemplazan a Janet Morales /
+// Roderick (las de junio-julio dejaron de estar disponibles al migrar de
+// cuenta de ElevenLabs). Mismo reparto de roles: Anita toma el papel de
+// analista, Erick el de ciudadano curioso.
 const VOZ_ID = {
-  JANET:    '9cySrnzVAcRAUGO8JQtx', // Janet Morales — analista
-  RODERICK: 'haaEg4BqiAAwDT7ahTxl', // Roderick — ciudadano curioso
+  ANITA: 'a7NxsR5B1mpwgpVa10g3', // Anita — analista
+  ERICK: 'TYqnEp5FYmaKfdSGcRoE', // Erick — ciudadano curioso
 };
 
 // Textos de las 2 piezas fijas de la cortina, aprobados el 18 jul 2026.
@@ -63,7 +66,7 @@ const TEXTO_CIERRE_FIJO  = 'Si te gusta, compártelo junto con el reporte de aud
 const RUTA_CORTINA_FIJA_DEFECTO = path.join(__dirname, 'assets', 'cortina-fija.mp3');
 const RUTA_CIERRE_FIJO_DEFECTO  = path.join(__dirname, 'assets', 'cierre-fijo.mp3');
 
-// ── Paso 1: parsear el guion (formato "JANET: [emoción] texto") ─────────────
+// ── Paso 1: parsear el guion (formato "ANITA: [emoción] texto") ─────────────
 // Mismo formato de salida que ya produce generarGuionPresentacion.js — no
 // hace falta tocar ese módulo, este solo lo consume.
 
@@ -72,7 +75,7 @@ function parsearGuionADialogo(guionTexto) {
   const parlamentos = [];
 
   for (const linea of lineas) {
-    const match = linea.match(/^(JANET|RODERICK):\s*(.+)$/i);
+    const match = linea.match(/^(ANITA|ERICK):\s*(.+)$/i);
     if (!match) continue; // ignora líneas vacías o que no siguen el formato
     const hablante = match[1].toUpperCase();
     const texto = match[2].trim();
@@ -82,7 +85,7 @@ function parsearGuionADialogo(guionTexto) {
   }
 
   if (parlamentos.length === 0) {
-    throw new Error('parsearGuionADialogo: no se reconoció ningún parlamento — ¿el guion sigue el formato "JANET:"/"RODERICK:"?');
+    throw new Error('parsearGuionADialogo: no se reconoció ningún parlamento — ¿el guion sigue el formato "ANITA:"/"ERICK:"?');
   }
   return parlamentos;
 }
@@ -219,7 +222,7 @@ function concatenarMp3(rutasEnOrden, rutaSalida) {
 
 // ── Función principal exportada ──────────────────────────────────────────────
 // guionTexto: el guion ya revisado (resultado.guionFinal de generarYRevisarGuion)
-// opciones.fraseDinamica: texto corto con el nombre del documento (se sintetiza con la voz de Janet)
+// opciones.fraseDinamica: texto corto con el nombre del documento (se sintetiza con la voz de Anita)
 // opciones.rutaCortinaFija / opciones.rutaCierreFijo: por defecto, las rutas de assets/ —
 //   pásalas explícitamente solo si quieres usar otro archivo. Si el archivo por defecto
 //   todavía no existe (piezas fijas no generadas todavía), se omite esa pieza (y su
@@ -254,7 +257,7 @@ async function generarPodcastMp3(guionTexto, rutaSalida, auditoria_id, opciones 
 
     console.log(`   [generarPodcastMp3] [${auditoria_id}] Generando frase dinámica de cortina...`);
     const bufferFrase = await generarAudioLote(
-      [{ voice_id: VOZ_ID.JANET, text: fraseDinamica }],
+      [{ voice_id: VOZ_ID.ANITA, text: fraseDinamica }],
       auditoria_id,
       'cortina-dinamica'
     );
