@@ -670,6 +670,371 @@ function normalizarComponentes(articulosCrudo) {
     .filter((valor, i, arr) => arr.indexOf(valor) === i); // sin duplicados
 }
 
+// ── Grafo componentes → criterios (nuevo Mapa Mental, 20 jul 2026) ─────────
+// Reutiliza normalizarComponentes() de arriba. A diferencia de
+// generarMapaMental() (abajo, ahora superada), esta función NO necesita un
+// llamado nuevo a Claude — usa directamente el mismo "datos" que ya produce
+// normalizarDatosEstructurados() para el Reporte, así que puede correr justo
+// después del PASO 6 del pipeline sin gastar nada adicional en la API.
+//
+// Colores: SÍ = limpio (verde). SÍ con matiz = tachado leve en magenta
+// claro (decisión del 17 jul — reemplaza el dorado del diseño viejo). NO =
+// tachado completo en rojo. Ver decisiones del 20 jul en el comentario de
+// normalizarComponentes() para qué cuenta como "componente".
+const COLOR_GRAFO = {
+  SI:       { fill: '#E8F5E9', stroke: '#2E7D32', texto: '#1B5E20', edge: '#2E7D32' },
+  SI_MATIZ: { fill: '#FCE4EC', stroke: '#AD1457', texto: '#880E4F', edge: '#AD1457' },
+  NO:       { fill: '#FFEBEE', stroke: '#C41230', texto: '#8B0000', edge: '#C41230' },
+  NA:       { fill: '#F5F5F5', stroke: '#8A8478', texto: '#4A4A4A', edge: '#8A8478' },
+};
+const ETIQUETA_RESULTADO_GRAFO = { SI: 'SÍ', SI_MATIZ: 'SÍ con matiz', NO: 'NO', NA: 'N/A' };
+
+function ordenComponente(label) {
+  const m = /^Art\.\s+(\d+)(?:\s+\(Disposiciones (Transitorias|Finales)\))?$/.exec(label);
+  if (!m) return [9999, 9];
+  const numero = parseInt(m[1], 10);
+  const tipo = m[2] ? (m[2] === 'Transitorias' ? 1 : 2) : 0;
+  return [numero, tipo];
+}
+
+function generarSVGGrafoComponentes(datos, titulo) {
+  // Las 7 categorías (I-VII) cubren rangos ascendentes de criterio
+  // (CRITERIO_A_CATEGORIA), así que aplanarlas en orden da directamente
+  // la secuencia C-01..C-28.
+  const criterios = datos.categorias.flatMap(cat => cat.criterios);
+
+  const componentesPorCriterio = criterios.map(c => normalizarComponentes(c.articulos));
+  const setComponentes = new Set();
+  componentesPorCriterio.forEach(lista => lista.forEach(comp => setComponentes.add(comp)));
+  const componentes = [...setComponentes].sort((a, b) => {
+    const [na, ta] = ordenComponente(a);
+    const [nb, tb] = ordenComponente(b);
+    return na - nb || ta - tb;
+  });
+
+  const ANCHO = 1400;
+  const MARGEN = 60;
+  const COMP_H = 34;
+  const CRIT_H = 56, CRIT_GAP = 14;
+  const COL_IZQ_X = MARGEN;
+  const CRIT_W = 190;
+  const COL_DER_X = ANCHO - MARGEN - CRIT_W;
+  const TITULO_H = 90;
+
+  function anchoComponente(texto) {
+    return Math.max(56, texto.length * 7.2 + 24);
+  }
+
+  const posCriterio = {};
+  let yCrit = TITULO_H;
+  criterios.forEach(c => {
+    posCriterio[c.id] = { x: COL_DER_X, y: yCrit, w: CRIT_W, h: CRIT_H };
+    yCrit += CRIT_H + CRIT_GAP;
+  });
+
+  // Los componentes se distribuyen a lo largo de TODO el alto que ocupan
+  // los criterios (no apretados arriba con su propio espaciado fijo) —
+  // si no, con menos componentes que criterios (y cajas más chicas), la
+  // columna izquierda queda corta y deja un vacío grande abajo.
+  const posComponente = {};
+  const espacioDisponible = (yCrit - CRIT_GAP) - TITULO_H;
+  const espacioComponente = componentes.length > 0 ? espacioDisponible / componentes.length : 0;
+  componentes.forEach((comp, i) => {
+    posComponente[comp] = { x: COL_IZQ_X, y: TITULO_H + i * espacioComponente, w: anchoComponente(comp), h: COMP_H };
+  });
+
+  const ALTO_CONTENIDO = yCrit;
+  const LEYENDA_H = 70;
+  const ALTO = ALTO_CONTENIDO + LEYENDA_H + MARGEN;
+
+  const edges = [];
+  criterios.forEach((c, i) => {
+    componentesPorCriterio[i].forEach(comp => {
+      edges.push({ comp, critId: c.id, resultado: c.resultado });
+    });
+  });
+
+  const lineasSVG = edges.map(e => {
+    const p1 = posComponente[e.comp];
+    const p2 = posCriterio[e.critId];
+    if (!p1 || !p2) return '';
+    const x1 = p1.x + p1.w, y1 = p1.y + p1.h / 2;
+    const x2 = p2.x, y2 = p2.y + p2.h / 2;
+    const col = (COLOR_GRAFO[e.resultado] || COLOR_GRAFO.NA).edge;
+    const mx = (x1 + x2) / 2;
+    return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" fill="none" stroke="${col}" stroke-width="1" stroke-opacity="0.28"/>`;
+  }).join('\n  ');
+
+  const nodosComponente = componentes.map(comp => {
+    const p = posComponente[comp];
+    return `<g>
+    <rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="6" fill="#FAFAF8" stroke="#8A8478" stroke-width="1"/>
+    <text x="${p.x + p.w / 2}" y="${p.y + p.h / 2}" text-anchor="middle" dominant-baseline="central" font-size="13" font-family="Arial,sans-serif" fill="#4A4A4A">${esc(comp)}</text>
+  </g>`;
+  }).join('\n  ');
+
+  const nodosCriterio = criterios.map(c => {
+    const p = posCriterio[c.id];
+    const col = COLOR_GRAFO[c.resultado] || COLOR_GRAFO.NA;
+    let tachado = '';
+    if (c.resultado === 'NO') {
+      tachado = `<line x1="${p.x + 8}" y1="${p.y + p.h - 8}" x2="${p.x + p.w - 8}" y2="${p.y + 8}" stroke="${col.stroke}" stroke-width="2.5"/>`;
+    } else if (c.resultado === 'SI_MATIZ') {
+      tachado = `<line x1="${p.x + 8}" y1="${p.y + p.h - 8}" x2="${p.x + p.w - 8}" y2="${p.y + 8}" stroke="${col.stroke}" stroke-width="1.5" stroke-opacity="0.55"/>`;
+    }
+    return `<g>
+    <rect x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" rx="6" fill="${col.fill}" stroke="${col.stroke}" stroke-width="1.5"/>
+    <text x="${p.x + p.w / 2}" y="${p.y + 20}" text-anchor="middle" font-size="14" font-weight="bold" font-family="Arial,sans-serif" fill="${col.texto}">${esc(c.id)}</text>
+    <text x="${p.x + p.w / 2}" y="${p.y + 40}" text-anchor="middle" font-size="11" font-family="Arial,sans-serif" fill="${col.texto}">${esc(ETIQUETA_RESULTADO_GRAFO[c.resultado] || c.resultado)}</text>
+    ${tachado}
+  </g>`;
+  }).join('\n  ');
+
+  const leyendaY = ALTO_CONTENIDO + 30;
+  const leyenda = `
+  <g font-family="Arial,sans-serif" font-size="13" fill="#4A4A4A">
+    <rect x="${MARGEN}" y="${leyendaY}" width="18" height="18" rx="3" fill="${COLOR_GRAFO.SI.fill}" stroke="${COLOR_GRAFO.SI.stroke}" stroke-width="1.5"/>
+    <text x="${MARGEN + 26}" y="${leyendaY + 13}">SÍ — sin tachar</text>
+    <rect x="${MARGEN + 190}" y="${leyendaY}" width="18" height="18" rx="3" fill="${COLOR_GRAFO.SI_MATIZ.fill}" stroke="${COLOR_GRAFO.SI_MATIZ.stroke}" stroke-width="1.5"/>
+    <line x1="${MARGEN + 190 + 3}" y1="${leyendaY + 15}" x2="${MARGEN + 190 + 15}" y2="${leyendaY + 3}" stroke="${COLOR_GRAFO.SI_MATIZ.stroke}" stroke-width="1.5" stroke-opacity="0.55"/>
+    <text x="${MARGEN + 190 + 26}" y="${leyendaY + 13}">SÍ con matiz — tachado leve</text>
+    <rect x="${MARGEN + 430}" y="${leyendaY}" width="18" height="18" rx="3" fill="${COLOR_GRAFO.NO.fill}" stroke="${COLOR_GRAFO.NO.stroke}" stroke-width="1.5"/>
+    <line x1="${MARGEN + 430 + 3}" y1="${leyendaY + 15}" x2="${MARGEN + 430 + 15}" y2="${leyendaY + 3}" stroke="${COLOR_GRAFO.NO.stroke}" stroke-width="2.5"/>
+    <text x="${MARGEN + 430 + 26}" y="${leyendaY + 13}">NO — tachado rojo</text>
+  </g>`;
+
+  const tituloCorto = titulo && titulo.length > 90 ? titulo.slice(0, 88) + '…' : (titulo || '');
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${ANCHO}" height="${ALTO}" viewBox="0 0 ${ANCHO} ${ALTO}">
+  <rect width="${ANCHO}" height="${ALTO}" fill="white"/>
+  <text x="${MARGEN}" y="34" font-size="20" font-weight="bold" font-family="Georgia,serif" fill="#1A1A1A">${esc(tituloCorto)}</text>
+  <text x="${MARGEN}" y="56" font-size="13" font-family="Arial,sans-serif" fill="#8A8478">Grafo componentes → criterios · Auditoría Cívica Liberal · liberalmente.app</text>
+  ${lineasSVG}
+  ${nodosComponente}
+  ${nodosCriterio}
+  ${leyenda}
+</svg>`;
+}
+
+// SUPERADA (20 jul 2026, misma sesión) — Moisés prefirió reorganizar el
+// grafo en 3 áreas horizontales (En Contra / Neutral / A Favor, formato
+// landscape) en vez de este diseño de dos columnas verticales. Ver
+// generarGrafoPorHorizonte() más abajo, que la reemplaza. Se deja el
+// código intacto por si hace falta comparar, no se borra.
+async function generarGrafoComponentes(datos, titulo, rutaSalida, auditoria_id) {
+  console.log(`   [${auditoria_id}] Generando grafo componentes→criterios...`);
+  const svg = generarSVGGrafoComponentes(datos, titulo);
+  await sharp(Buffer.from(svg)).png({ quality: 95 }).toFile(rutaSalida);
+  console.log(`   [${auditoria_id}] Grafo generado: ${rutaSalida}`);
+}
+
+// ── Grafo por horizonte — 3 áreas landscape (20 jul 2026) ───────────────────
+// Reemplaza generarGrafoComponentes() (dos columnas) por pedido explícito
+// de Moisés: reorganiza el mismo grafo en 3 áreas de izquierda a derecha
+// — En Contra / Neutral / A Favor (H1/H2/H3 de la convención de Tres
+// Horizontes, nunca nombrados así al lector) — cada una con sus propios
+// nodos de artículo (abajo, pegados a la línea base) y de criterio
+// (arriba), con las líneas de impacto en el espacio intermedio. El ancho
+// de cada área es proporcional a su peso (criterios + componentes) — el
+// mismo principio que ya rige la barra H1/H2/H3 de la lámina de síntesis.
+//
+// Un componente que respalda criterios en más de un horizonte aparece
+// como nodo aparte en cada área donde corresponde (no se fusiona entre
+// áreas) — dentro de una misma área, sí es un solo nodo aunque respalde
+// varios criterios ahí.
+//
+// Etiquetas cortas ("A-63", "A-64F", "A-64T"): usan el número real del
+// artículo (autoexplicativo) y solo agregan una letra cuando hace falta
+// desambiguar dos artículos que comparten número por vivir en secciones
+// distintas (F=Disposiciones Finales, T=Disposiciones Transitorias) — ver
+// la nota sobre "Artículo 64" en normalizarComponentes() más arriba.
+//
+// Los criterios NA quedan fuera del grafo — no aplican al documento, no
+// representan impacto en ningún sentido, no encajan en ninguna de las 3
+// áreas.
+function etiquetaCortaComponente(componente) {
+  const m = /^Art\.\s+(\d+)(?:\s+\(Disposiciones (Transitorias|Finales)\))?$/.exec(componente);
+  if (!m) return componente.slice(0, 6);
+  const numero = m[1].padStart(2, '0');
+  const suf = m[2] ? (m[2] === 'Transitorias' ? 'T' : 'F') : '';
+  return `A-${numero}${suf}`;
+}
+
+const AREA_POR_RESULTADO = { NO: 'en_contra', SI_MATIZ: 'neutral', SI: 'a_favor' };
+const AREAS_HORIZONTE = [
+  { key: 'en_contra', nombre: 'EN CONTRA', color: '#C41230', fill: '#FFF5F6' },
+  { key: 'neutral',   nombre: 'NEUTRAL',   color: '#AD1457', fill: '#FDF3F7' },
+  { key: 'a_favor',   nombre: 'A FAVOR',   color: '#2E7D32', fill: '#F4FAF4' },
+];
+
+function generarSVGGrafoPorHorizonte(datos, titulo) {
+  const criterios = datos.categorias.flatMap(cat => cat.criterios).filter(c => c.resultado !== 'NA');
+
+  const porArea = { en_contra: [], neutral: [], a_favor: [] };
+  criterios.forEach(c => {
+    const area = AREA_POR_RESULTADO[c.resultado];
+    if (area) porArea[area].push(c);
+  });
+
+  const datosPorArea = AREAS_HORIZONTE.map(({ key }) => {
+    const critsArea = porArea[key];
+    const componentesPorCrit = critsArea.map(c => normalizarComponentes(c.articulos));
+    const setComp = new Set();
+    componentesPorCrit.forEach(lista => lista.forEach(x => setComp.add(x)));
+    const componentes = [...setComp].sort((a, b) => {
+      const [na, ta] = ordenComponente(a), [nb, tb] = ordenComponente(b);
+      return na - nb || ta - tb;
+    });
+    return { criterios: critsArea, componentesPorCrit, componentes };
+  });
+
+  const ANCHO = 1700;
+  const MARGEN = 50;
+  const TITULO_H = 70;
+  const NODE = 42, NODE_GAP = 9;
+  const GAP_MIN = 100;
+  const BASE_LABEL_H = 60;
+  const DIVISOR_GAP = 24;
+
+  const anchoTotal = ANCHO - 2 * MARGEN - 2 * DIVISOR_GAP;
+  const pesos = datosPorArea.map(d => d.criterios.length + d.componentes.length);
+  const pesoTotal = pesos.reduce((a, b) => a + b, 0) || 1;
+  const PISO = 0.20;
+  const pesosAjustados = pesos.map(p => Math.max(PISO, p / pesoTotal));
+  const sumaAjustada = pesosAjustados.reduce((a, b) => a + b, 0);
+  const anchosArea = pesosAjustados.map(p => (p / sumaAjustada) * anchoTotal);
+
+  const xArea = [];
+  let xAcum = MARGEN;
+  anchosArea.forEach(w => { xArea.push(xAcum); xAcum += w + DIVISOR_GAP; });
+
+  function filasNecesarias(cantidad, anchoArea) {
+    const porFila = Math.max(1, Math.floor((anchoArea + NODE_GAP) / (NODE + NODE_GAP)));
+    return { porFila, filas: Math.ceil(cantidad / porFila) || 0 };
+  }
+
+  const gridCriterios = datosPorArea.map((d, i) => filasNecesarias(d.criterios.length, anchosArea[i]));
+  const gridComponentes = datosPorArea.map((d, i) => filasNecesarias(d.componentes.length, anchosArea[i]));
+
+  const altoCriteriosMax = Math.max(...gridCriterios.map(g => g.filas)) * (NODE + NODE_GAP);
+  const altoComponentesMax = Math.max(...gridComponentes.map(g => g.filas)) * (NODE + NODE_GAP);
+
+  const yTopeCriterios = TITULO_H;
+  const yBase = TITULO_H + altoCriteriosMax + GAP_MIN + altoComponentesMax;
+  const ALTO = yBase + BASE_LABEL_H + MARGEN;
+
+  const posCriterio = {};
+  const posComponente = {};
+  datosPorArea.forEach((d, i) => {
+    const { porFila: porFilaC } = gridCriterios[i];
+    d.criterios.forEach((c, idx) => {
+      const fila = Math.floor(idx / porFilaC), col = idx % porFilaC;
+      posCriterio[c.id] = {
+        x: xArea[i] + col * (NODE + NODE_GAP),
+        y: yTopeCriterios + fila * (NODE + NODE_GAP),
+      };
+    });
+    const { porFila: porFilaA } = gridComponentes[i];
+    const filasA = gridComponentes[i].filas;
+    d.componentes.forEach((comp, idx) => {
+      const fila = Math.floor(idx / porFilaA), col = idx % porFilaA;
+      const filaDesdeAbajo = filasA - 1 - fila;
+      posComponente[`${i}:${comp}`] = {
+        x: xArea[i] + col * (NODE + NODE_GAP),
+        y: yBase - NODE - filaDesdeAbajo * (NODE + NODE_GAP),
+        area: i,
+      };
+    });
+  });
+
+  const fondosArea = AREAS_HORIZONTE.map((a, i) => {
+    const w = anchosArea[i];
+    return `<rect x="${xArea[i] - 10}" y="${TITULO_H - 10}" width="${w + 20}" height="${yBase - TITULO_H + 20}" fill="${a.fill}"/>`;
+  }).join('\n  ');
+
+  const lineas = [];
+  datosPorArea.forEach((d, i) => {
+    d.criterios.forEach((c, idxCrit) => {
+      const comps = d.componentesPorCrit[idxCrit];
+      const pC = posCriterio[c.id];
+      comps.forEach(comp => {
+        const pA = posComponente[`${i}:${comp}`];
+        if (!pA || !pC) return;
+        const x1 = pA.x + NODE / 2, y1 = pA.y;
+        const x2 = pC.x + NODE / 2, y2 = pC.y + NODE;
+        const my = (y1 + y2) / 2;
+        lineas.push(`<path d="M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}" fill="none" stroke="${AREAS_HORIZONTE[i].color}" stroke-width="1" stroke-opacity="0.25"/>`);
+      });
+    });
+  });
+
+  const nodosComponentes = [];
+  datosPorArea.forEach((d, i) => {
+    d.componentes.forEach(comp => {
+      const p = posComponente[`${i}:${comp}`];
+      nodosComponentes.push(`<g>
+    <rect x="${p.x}" y="${p.y}" width="${NODE}" height="${NODE}" rx="6" fill="#FAFAF8" stroke="#8A8478" stroke-width="1"/>
+    <text x="${p.x + NODE / 2}" y="${p.y + NODE / 2}" text-anchor="middle" dominant-baseline="central" font-size="11" font-family="Arial,sans-serif" fill="#4A4A4A">${esc(etiquetaCortaComponente(comp))}</text>
+  </g>`);
+    });
+  });
+
+  const nodosCriterios = [];
+  datosPorArea.forEach((d, i) => {
+    const a = AREAS_HORIZONTE[i];
+    d.criterios.forEach(c => {
+      const p = posCriterio[c.id];
+      nodosCriterios.push(`<g>
+    <rect x="${p.x}" y="${p.y}" width="${NODE}" height="${NODE}" rx="6" fill="white" stroke="${a.color}" stroke-width="1.5"/>
+    <text x="${p.x + NODE / 2}" y="${p.y + NODE / 2}" text-anchor="middle" dominant-baseline="central" font-size="11" font-weight="bold" font-family="Arial,sans-serif" fill="${a.color}">${esc(c.id)}</text>
+  </g>`);
+    });
+  });
+
+  const divisores = [1, 2].map(i => {
+    const x = xArea[i] - DIVISOR_GAP / 2;
+    return `<line x1="${x}" y1="${TITULO_H - 10}" x2="${x}" y2="${yBase + 14}" stroke="#D4CFC4" stroke-width="1"/>`;
+  }).join('\n  ');
+
+  const baseYLine = yBase + 14;
+  const lineaBase = `<line x1="${MARGEN}" y1="${baseYLine}" x2="${ANCHO - MARGEN}" y2="${baseYLine}" stroke="#1A1A1A" stroke-width="1.5"/>`;
+
+  const etiquetasArea = AREAS_HORIZONTE.map((a, i) => {
+    const cx = xArea[i] + anchosArea[i] / 2;
+    return `<text x="${cx}" y="${baseYLine + 34}" text-anchor="middle" font-size="26" font-weight="bold" font-family="Georgia,serif" fill="${a.color}">${a.nombre}</text>`;
+  }).join('\n  ');
+
+  const tituloCorto = titulo && titulo.length > 100 ? titulo.slice(0, 98) + '…' : (titulo || '');
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${ANCHO}" height="${ALTO}" viewBox="0 0 ${ANCHO} ${ALTO}">
+  <rect width="${ANCHO}" height="${ALTO}" fill="white"/>
+  <text x="${MARGEN}" y="30" font-size="19" font-weight="bold" font-family="Georgia,serif" fill="#1A1A1A">${esc(tituloCorto)}</text>
+  <text x="${MARGEN}" y="50" font-size="12" font-family="Arial,sans-serif" fill="#8A8478">Grafo componentes → criterios por horizonte · Auditoría Cívica Liberal · liberalmente.app</text>
+  <text x="${ANCHO - MARGEN}" y="50" text-anchor="end" font-size="11" font-family="Arial,sans-serif" fill="#8A8478">F = Disposiciones Finales · T = Disposiciones Transitorias</text>
+  ${fondosArea}
+  ${lineas.join('\n  ')}
+  ${nodosComponentes.join('\n  ')}
+  ${nodosCriterios.join('\n  ')}
+  ${divisores}
+  ${lineaBase}
+  ${etiquetasArea}
+</svg>`;
+}
+
+async function generarGrafoPorHorizonte(datos, titulo, rutaSalida, auditoria_id) {
+  console.log(`   [${auditoria_id}] Generando grafo por horizonte...`);
+  const svg = generarSVGGrafoPorHorizonte(datos, titulo);
+  await sharp(Buffer.from(svg)).png({ quality: 95 }).toFile(rutaSalida);
+  console.log(`   [${auditoria_id}] Grafo por horizonte generado: ${rutaSalida}`);
+}
+
+// SUPERADA (20 jul 2026) — el diseño de hub-and-spoke radial de abajo
+// (centro con % + categorías alrededor) queda reemplazado por
+// generarGrafoComponentes() de arriba, por decisión explícita de Moisés:
+// ni la idea original de usar el mapa mental nativo de NotebookLM, ni este
+// diseño radial del 17 jul, siguen vigentes. Se deja el código intacto
+// (no se borra) hasta confirmar que el reemplazo queda funcionando en el
+// pipeline real — no reactivar esta versión mientras tanto.
 async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
   console.log(`   [${auditoria_id}] Generando mapa mental SVG...`);
   const ANCHO = 2400, ALTO = 2400;
@@ -1006,6 +1371,179 @@ ${lineas.join('\n')}
   } catch (error) {
     clearInterval(heartbeat);
     console.error('   [TEST-SCHEMA-ARTICULOS] ❌ Error:', error.message);
+    res.end('\n\nError: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// PRUEBA TEMPORAL — genera el grafo componentes→criterios (nuevo Mapa
+// Mental) sobre un documento real, de punta a punta: descarga, analiza con
+// el schema nuevo (mismo llamado real a Claude que /test-schema-articulos)
+// y dibuja el grafo con generarGrafoComponentes(). Sube el PNG a una
+// carpeta de Drive separada de pruebas (no la carpeta real de la
+// auditoría) — no escribe nada en la base de datos, no toca la auditoría
+// real, no envía ningún correo. Mismo patrón de latido + subida a Drive
+// que /test-podcast-audio (una imagen no se puede devolver directo junto
+// con el latido de texto). Eliminar después de validar.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/test-grafo?secret=acl-worker-2026-secreto
+//   (sin auditoria_id: usa la auditoría completada más reciente)
+app.get('/test-grafo', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  let fila;
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, pdf_drive_id, titulo_documento FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      const result = await db.query(
+        `SELECT id, pdf_drive_id, titulo_documento
+         FROM auditorias
+         WHERE estado = 'completada' AND pdf_drive_id IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
+
+  if (!fila?.pdf_drive_id) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría completada con pdf_drive_id.');
+  }
+
+  res.type('text/plain; charset=utf-8');
+  res.write(`Descargando "${fila.titulo_documento}", analizando y dibujando el grafo — esto puede tardar 1 a 3 minutos, no cierres esta pestaña...\n`);
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  const dir = path.join(DIRECTORIO_TEMP, `test-grafo-${fila.id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const rutaPDF = path.join(dir, 'original.pdf');
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    await descargarPDF(drive, fila.pdf_drive_id, rutaPDF);
+    const textoPDF = await extraerTextoPDF(rutaPDF);
+
+    const config = await obtenerConfigDoctrinal();
+    const manualActivo = await obtenerManualActivo();
+
+    console.log(`   [TEST-GRAFO] Analizando: ${fila.titulo_documento}`);
+    const reporte = await analizarConClaude(textoPDF, config, manualActivo);
+    const datos = normalizarDatosEstructurados(reporte, fila.id);
+
+    const rutaPNG = path.join(dir, 'grafo.png');
+    await generarGrafoComponentes(datos, fila.titulo_documento, rutaPNG, fila.id);
+
+    console.log(`   [TEST-GRAFO] Subiendo a Drive (carpeta de pruebas)...`);
+    const carpetaId = await obtenerCarpetaAuditoria(drive, `pruebas-grafo-${fila.id}`);
+    const link = await subirArchivo(drive, rutaPNG, `grafo-${slugificar(fila.titulo_documento)}.png`, 'image/png', carpetaId);
+
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+
+✅ Grafo generado y subido a Drive (carpeta de pruebas):
+${link}
+`);
+  } catch (error) {
+    clearInterval(heartbeat);
+    console.error('   [TEST-GRAFO] ❌ Error:', error.message);
+    res.end('\n\nError: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// PRUEBA TEMPORAL — igual que /test-grafo, pero dibuja la versión nueva de
+// 3 áreas por horizonte (generarGrafoPorHorizonte()) en vez de la de dos
+// columnas. Mismo patrón: sube el PNG a una carpeta de pruebas en Drive,
+// no toca la auditoría real, no escribe en la base de datos, no envía
+// correo. Eliminar después de validar.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/test-grafo-horizonte?secret=acl-worker-2026-secreto
+app.get('/test-grafo-horizonte', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  let fila;
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, pdf_drive_id, titulo_documento FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      const result = await db.query(
+        `SELECT id, pdf_drive_id, titulo_documento
+         FROM auditorias
+         WHERE estado = 'completada' AND pdf_drive_id IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
+
+  if (!fila?.pdf_drive_id) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría completada con pdf_drive_id.');
+  }
+
+  res.type('text/plain; charset=utf-8');
+  res.write(`Descargando "${fila.titulo_documento}", analizando y dibujando el grafo por horizonte — esto puede tardar 1 a 3 minutos, no cierres esta pestaña...\n`);
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  const dir = path.join(DIRECTORIO_TEMP, `test-grafo-horizonte-${fila.id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const rutaPDF = path.join(dir, 'original.pdf');
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    await descargarPDF(drive, fila.pdf_drive_id, rutaPDF);
+    const textoPDF = await extraerTextoPDF(rutaPDF);
+
+    const config = await obtenerConfigDoctrinal();
+    const manualActivo = await obtenerManualActivo();
+
+    console.log(`   [TEST-GRAFO-HORIZONTE] Analizando: ${fila.titulo_documento}`);
+    const reporte = await analizarConClaude(textoPDF, config, manualActivo);
+    const datos = normalizarDatosEstructurados(reporte, fila.id);
+
+    const rutaPNG = path.join(dir, 'grafo-horizonte.png');
+    await generarGrafoPorHorizonte(datos, fila.titulo_documento, rutaPNG, fila.id);
+
+    console.log(`   [TEST-GRAFO-HORIZONTE] Subiendo a Drive (carpeta de pruebas)...`);
+    const carpetaId = await obtenerCarpetaAuditoria(drive, `pruebas-grafo-${fila.id}`);
+    const link = await subirArchivo(drive, rutaPNG, `grafo-horizonte-${slugificar(fila.titulo_documento)}.png`, 'image/png', carpetaId);
+
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+
+✅ Grafo por horizonte generado y subido a Drive (carpeta de pruebas):
+${link}
+`);
+  } catch (error) {
+    clearInterval(heartbeat);
+    console.error('   [TEST-GRAFO-HORIZONTE] ❌ Error:', error.message);
     res.end('\n\nError: ' + error.message);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
