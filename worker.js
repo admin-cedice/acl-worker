@@ -921,7 +921,7 @@ app.get('/test-schema-articulos', async (req, res) => {
     // Resumen legible: por cada criterio, qué artículos citó Claude
     const lineas = datos.categorias.flatMap(cat =>
       cat.criterios.map(c =>
-        `${c.id} [${c.resultado}] — artículos citados: ${c.articulos && c.articulos.length ? c.articulos.join(', ') : '(ninguno)'}`
+        `${c.id} [${c.resultado}] — artículos citados: ${c.articulos && c.articulos.trim() ? c.articulos : '(ninguno)'}`
       )
     );
 
