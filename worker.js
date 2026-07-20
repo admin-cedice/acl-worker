@@ -2150,7 +2150,7 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 24000,
+    max_tokens: 32000,
     system: systemFinal,
     messages: [{
       role: 'user',
@@ -2165,7 +2165,7 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
   });
 
   if (response.stop_reason === 'max_tokens') {
-    throw new Error('analizarConClaude: respuesta cortada por max_tokens (24000) — el análisis quedó incompleto. Subir max_tokens.');
+    throw new Error('analizarConClaude: respuesta cortada por max_tokens (32000) — el análisis quedó incompleto. Subir max_tokens (el modelo admite hasta 128000).');
   }
   if (response.stop_reason === 'refusal') {
     throw new Error('analizarConClaude: Claude rehusó generar el análisis para este documento (stop_reason: refusal).');
