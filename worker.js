@@ -607,6 +607,69 @@ async function generarPresentacion(reporteTexto, titulo, rutaSalida, auditoria_i
   return estructura;
 }
 
+// ── Normalizar componentes citados (grafo componentes→criterios) ───────────
+// Primera pieza del grafo componentes→criterios para el Mapa Mental nuevo
+// (20 jul 2026). Toma el campo "articulos" (string, separado por ";") que
+// devuelve cada criterio desde SCHEMA_ANALISIS_AUDITORIA y lo convierte en
+// una lista de nodos de componente reales.
+//
+// Tres decisiones doctrinales de Moisés (20 jul 2026, confirmadas con datos
+// reales del Proyecto de Ley de Arrendamientos Inmobiliarios) — no reabrir
+// sin que él lo traiga de nuevo:
+//   1. La Exposición de Motivos NO es un componente (no establece reglas de
+//      juego, es el preámbulo explicativo) — se descarta.
+//   2. Las citas a leyes externas (ej. artículos de la Constitución) NO son
+//      componentes DE ESTE instrumento — se descartan.
+//   3. Los criterios que solo citaban la Exposición de Motivos quedan SIN
+//      ningún componente — se dejan como nodos aislados en el grafo, sin
+//      flecha entrante. Es información real (nada específico los
+//      respalda), no un caso a "arreglar".
+//
+// Enfoque: en vez de intentar detectar cada posible referencia externa
+// (lista abierta, imposible de enumerar), solo se reconoce como componente
+// lo que calza con el patrón esperado de un artículo interno. Todo lo que
+// no calce se descarta por defecto — más seguro que asumir que es válido.
+//
+// IMPORTANTE — confirmado con un caso real: cuando el artículo trae una
+// anotación de sección ("Disposiciones Finales" / "Disposiciones
+// Transitorias"), esa anotación se conserva como parte del identificador
+// del nodo. "Artículo 64 (Disposiciones Finales)" y "Artículo 64
+// (Disposiciones Transitorias)" son DOS artículos distintos que comparten
+// número porque cada sección reinicia su propia numeración — fusionarlos
+// en un solo nodo "Art. 64" sería un error de contenido, no solo de forma.
+const PATRON_ARTICULO  = /^art[íi]culo\s+(\d+)\s*[°ºo]?\s*(\(\s*disposici[oó]n(?:es)?\s+(finales?|transitorias?)[^)]*\))?\s*$/i;
+const PATRON_PARAGRAFO = /^par[áa]grafo\s+\S+\s+del\s+art[íi]culo\s+(\d+)\s*[°ºo]?\s*$/i;
+
+function normalizarComponentes(articulosCrudo) {
+  if (!articulosCrudo || !articulosCrudo.trim()) return [];
+  return articulosCrudo
+    .split(';')
+    .map(pieza => pieza.trim())
+    .filter(Boolean)
+    .map(pieza => {
+      const matchArticulo = PATRON_ARTICULO.exec(pieza);
+      if (matchArticulo) {
+        const numero = matchArticulo[1];
+        const tipoSeccion = matchArticulo[3];
+        const seccion = tipoSeccion
+          ? (/^finales?/i.test(tipoSeccion) ? ' (Disposiciones Finales)' : ' (Disposiciones Transitorias)')
+          : '';
+        return `Art. ${numero}${seccion}`;
+      }
+      const matchParagrafo = PATRON_PARAGRAFO.exec(pieza);
+      if (matchParagrafo) {
+        // Un parágrafo no es un componente aparte — se fusiona con su
+        // artículo padre (mismo nodo).
+        return `Art. ${matchParagrafo[1]}`;
+      }
+      // No calza con el patrón de artículo interno — se descarta
+      // (Exposición de Motivos, citas a leyes externas, etc.)
+      return null;
+    })
+    .filter(Boolean)
+    .filter((valor, i, arr) => arr.indexOf(valor) === i); // sin duplicados
+}
+
 async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
   console.log(`   [${auditoria_id}] Generando mapa mental SVG...`);
   const ANCHO = 2400, ALTO = 2400;
@@ -918,11 +981,16 @@ app.get('/test-schema-articulos', async (req, res) => {
     const reporte = await analizarConClaude(textoPDF, config, manualActivo);
     const datos = normalizarDatosEstructurados(reporte, fila.id);
 
-    // Resumen legible: por cada criterio, qué artículos citó Claude
+    // Resumen legible: por cada criterio, qué artículos citó Claude en
+    // crudo, y en qué componentes normalizados se traduce (ver
+    // normalizarComponentes() — las 3 decisiones doctrinales del 20 jul).
     const lineas = datos.categorias.flatMap(cat =>
-      cat.criterios.map(c =>
-        `${c.id} [${c.resultado}] — artículos citados: ${c.articulos && c.articulos.trim() ? c.articulos : '(ninguno)'}`
-      )
+      cat.criterios.map(c => {
+        const crudo = c.articulos && c.articulos.trim() ? c.articulos : '(ninguno)';
+        const componentes = normalizarComponentes(c.articulos);
+        const componentesTexto = componentes.length ? componentes.join(', ') : '(ninguno — nodo aislado)';
+        return `${c.id} [${c.resultado}]\n      crudo: ${crudo}\n      componentes: ${componentesTexto}`;
+      })
     );
 
     clearInterval(heartbeat);
