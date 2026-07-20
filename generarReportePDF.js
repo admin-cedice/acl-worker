@@ -164,8 +164,13 @@ function schemaCriterios() {
           type: 'string',
           description: 'De 3 a 5 oraciones en prosa razonada explicando el resultado, citando artículos o elementos concretos del documento cuando aplique.',
         },
+        articulos: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Números o identificadores de los artículos, secciones o disposiciones del documento en los que se basa este resultado (ej. ["Artículo 12", "Artículo 45", "Disposición Transitoria Segunda"]). Usa exactamente cómo el documento los llama. Arreglo vacío solo si el criterio evalúa el documento como un todo y no hay artículos específicos que citar.',
+        },
       },
-      required: ['id', 'pregunta', 'resultado', 'analisis'],
+      required: ['id', 'pregunta', 'resultado', 'analisis', 'articulos'],
       additionalProperties: false,
     },
   };

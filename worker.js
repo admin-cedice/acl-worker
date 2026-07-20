@@ -845,6 +845,105 @@ ${resultado.guionFinal}
   }
 });
 
+// PRUEBA TEMPORAL — llama a analizarConClaude() con el schema actualizado
+// (nuevo campo "articulos" por criterio, agregado hoy en
+// generarReportePDF.js) sobre un documento real, para ver qué devuelve
+// Claude en ese campo antes de confiar en él para construir el grafo
+// componentes→criterios de la Presentación/Mapa Mental. A diferencia de
+// /test-reporte y /test-guion (que solo LEEN un reporte_texto ya generado
+// en una corrida anterior), este endpoint SÍ vuelve a llamar a Claude —
+// es la única forma de probar un campo nuevo del schema con datos reales.
+// No escribe nada en la base de datos, no sube nada a Drive, no envía
+// ningún correo. Mismo patrón de latido de conexión que /test-guion,
+// porque el análisis de los 28 criterios también tarda varios minutos.
+// Eliminar después de validar.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/test-schema-articulos?secret=acl-worker-2026-secreto
+//   (sin auditoria_id: usa la auditoría completada más reciente)
+//
+//   https://acl-worker-production.up.railway.app/test-schema-articulos?secret=acl-worker-2026-secreto&auditoria_id=ID_AQUI
+//   (una auditoría específica — debe tener pdf_drive_id guardado)
+app.get('/test-schema-articulos', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  let fila;
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, pdf_drive_id, titulo_documento FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      // Sin auditoria_id en la URL: toma la más reciente ya completada,
+      // mismo patrón de conveniencia que /test-guion y /test-podcast-audio.
+      const result = await db.query(
+        `SELECT id, pdf_drive_id, titulo_documento
+         FROM auditorias
+         WHERE estado = 'completada' AND pdf_drive_id IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
+
+  if (!fila?.pdf_drive_id) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría completada con pdf_drive_id.');
+  }
+
+  res.type('text/plain; charset=utf-8');
+  res.write(`Descargando "${fila.titulo_documento}" y analizando con el schema nuevo — esto puede tardar 1 a 3 minutos, no cierres esta pestaña...\n`);
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  const dir = path.join(DIRECTORIO_TEMP, `test-schema-articulos-${fila.id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const rutaPDF = path.join(dir, 'original.pdf');
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    await descargarPDF(drive, fila.pdf_drive_id, rutaPDF);
+    const textoPDF = await extraerTextoPDF(rutaPDF);
+
+    const config = await obtenerConfigDoctrinal();
+    const manualActivo = await obtenerManualActivo();
+
+    console.log(`   [TEST-SCHEMA-ARTICULOS] Analizando: ${fila.titulo_documento}`);
+    const reporte = await analizarConClaude(textoPDF, config, manualActivo);
+    const datos = normalizarDatosEstructurados(reporte, fila.id);
+
+    // Resumen legible: por cada criterio, qué artículos citó Claude
+    const lineas = datos.categorias.flatMap(cat =>
+      cat.criterios.map(c =>
+        `${c.id} [${c.resultado}] — artículos citados: ${c.articulos && c.articulos.length ? c.articulos.join(', ') : '(ninguno)'}`
+      )
+    );
+
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+
+${lineas.join('\n')}
+
+(Esta prueba NO escribió nada en la base de datos ni tocó Drive/email — solo llamó a Claude para ver el campo nuevo.)
+`);
+
+  } catch (error) {
+    clearInterval(heartbeat);
+    console.error('   [TEST-SCHEMA-ARTICULOS] ❌ Error:', error.message);
+    res.end('\n\nError: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ENDPOINT DE UN SOLO USO — genera las piezas fijas de la cortina del
 // podcast (intro y cierre) y las devuelve como mp3 descargable. Se corre
 // UNA vez; el resultado se descarga y se sube manualmente al repo en
