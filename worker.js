@@ -643,6 +643,21 @@ async function generarPresentacion(reporteTexto, titulo, rutaSalida, auditoria_i
 const PATRON_ARTICULO  = /^art[íi]culo\s+(\d+)\s*[°ºo]?\s*(\(\s*disposici[oó]n(?:es)?\s+(finales?|transitorias?)[^)]*\))?\s*$/i;
 const PATRON_PARAGRAFO = /^par[áa]grafo\s+\S+\s+del\s+art[íi]culo\s+(\d+)\s*[°ºo]?\s*$/i;
 
+// FIX (20 jul 2026): faltaba esta función — se usa en generarSVGGrafoComponentes()
+// y en generarSVGGrafoPorHorizonte() (más abajo) para limpiar texto antes de
+// insertarlo en SVG/HTML, pero se quedó en los archivos de prueba sueltos de
+// esa sesión y nunca se copió a worker.js. No se detectó hasta ahora porque
+// /test-grafo y /test-grafo-horizonte nunca se habían corrido de verdad
+// contra el worker desplegado — solo se habían visto renders hechos aparte.
+function esc(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function normalizarComponentes(articulosCrudo) {
   if (!articulosCrudo || !articulosCrudo.trim()) return [];
   return articulosCrudo
