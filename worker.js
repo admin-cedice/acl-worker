@@ -1175,6 +1175,92 @@ app.post('/test-reporte', async (req, res) => {
   }
 });
 
+// VERSIÓN GET del endpoint de arriba — mismo trabajo (regenera el PDF del
+// reporte de una auditoría con el diseño/fórmula más reciente y lo sube a
+// su misma carpeta de Drive), pero pegable directo en el navegador, como
+// los demás endpoints de prueba (GET + secret por query). La versión POST
+// de arriba se queda igual, por si algo más ya la usa.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/test-reporte?secret=acl-worker-2026-secreto&auditoria_id=ID_AQUI
+//   (sin auditoria_id: usa la auditoría completada más reciente)
+app.get('/test-reporte', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  let fila;
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais, drive_carpeta_id FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais, drive_carpeta_id
+         FROM auditorias
+         WHERE estado = 'completada' AND reporte_texto IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
+
+  if (!fila?.reporte_texto) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría con reporte_texto para ese id (o no se encontró ninguna completada, si no diste auditoria_id).');
+  }
+
+  res.type('text/plain; charset=utf-8');
+  res.write(`Regenerando el reporte de "${fila.titulo_documento}" con el diseño/fórmula más reciente — no cierres esta pestaña...\n`);
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  const dir = path.join(DIRECTORIO_TEMP, `test-reporte-get-${fila.id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const rutaPDF = path.join(dir, 'reporte-nuevo.pdf');
+
+    console.log(`   [TEST-REPORTE-GET] Generando reporte para: ${fila.titulo_documento}`);
+    const datosReporte = await generarReportePDF(
+      fila.reporte_texto,
+      {
+        titulo:         fila.titulo_documento,
+        pais:           fila.pais || '',
+        marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026',
+        generadoEl:     new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
+      },
+      rutaPDF,
+      fila.id
+    );
+
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const carpetaId = fila.drive_carpeta_id || await obtenerCarpetaAuditoria(drive, fila.id);
+    const linkNuevo = await subirArchivo(drive, rutaPDF, 'reporte-nuevo-diseno.pdf', 'application/pdf', carpetaId);
+
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+PUNTAJE RECALCULADO: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'}
+
+✅ PDF nuevo subido a la misma carpeta de Drive de esta auditoría:
+${linkNuevo}
+`);
+  } catch (error) {
+    clearInterval(heartbeat);
+    console.error('   [TEST-REPORTE-GET] ❌ Error:', error.message);
+    res.end('\n\nError: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // PRUEBA TEMPORAL — endpoint para probar generarGuionPresentacion.js
 // (generador + revisor del guion de la Presentación) sin tocar Drive ni
 // escribir nada en la base de datos más allá de LEER el reporte_texto que
