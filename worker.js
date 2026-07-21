@@ -45,6 +45,7 @@
 const { generarPodcastPrueba } = require('./testPodcast');
 const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA, normalizarDatosEstructurados } = require('./generarReportePDF');
 const { generarYRevisarGuion } = require('./generarGuionPresentacion');
+const { componentesUnicos, generarTitulosArticulos, calcularDatosGrafo } = require('./generarDatosGrafo');
 const {
   generarPodcastMp3,
   generarAudioLote,
@@ -863,7 +864,7 @@ function etiquetaCortaComponente(componente) {
 const AREA_POR_RESULTADO = { NO: 'en_contra', SI_MATIZ: 'neutral', SI: 'a_favor' };
 const AREAS_HORIZONTE = [
   { key: 'en_contra', nombre: 'EN CONTRA', color: '#C41230', fill: '#FFF5F6' },
-  { key: 'neutral',   nombre: 'NEUTRAL',   color: '#AD1457', fill: '#FDF3F7' },
+  { key: 'neutral',   nombre: 'NEUTRAL',   color: '#B8860B', fill: '#F8F3E6' },
   { key: 'a_favor',   nombre: 'A FAVOR',   color: '#2E7D32', fill: '#F4FAF4' },
 ];
 
@@ -1270,6 +1271,93 @@ ${resultado.guionFinal}
     clearInterval(heartbeat);
     console.error('   [TEST-GUION] ❌ Error:', error.message);
     res.end('\n\nError: ' + error.message);
+  }
+});
+
+// PRUEBA TEMPORAL — valida generarTitulosArticulos() (generarDatosGrafo.js)
+// con un documento real: descarga, analiza con el schema ya conocido, saca
+// los componentes únicos y les pide título. NO escribe nada en la base de
+// datos. Importante: este llamado a Claude es nuevo y no se pudo probar en
+// desarrollo (sin acceso a la API desde ahí) — correr esto es la primera
+// vez que se ve una respuesta real. Eliminar después de validar.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/test-titulos-articulos?secret=acl-worker-2026-secreto
+app.get('/test-titulos-articulos', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  let fila;
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, pdf_drive_id, titulo_documento FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      const result = await db.query(
+        `SELECT id, pdf_drive_id, titulo_documento
+         FROM auditorias
+         WHERE estado = 'completada' AND pdf_drive_id IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
+
+  if (!fila?.pdf_drive_id) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría completada con pdf_drive_id.');
+  }
+
+  res.type('text/plain; charset=utf-8');
+  res.write(`Descargando "${fila.titulo_documento}", analizando y generando títulos de artículo — esto puede tardar 2 a 4 minutos (dos llamados a Claude), no cierres esta pestaña...\n`);
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  const dir = path.join(DIRECTORIO_TEMP, `test-titulos-${fila.id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const rutaPDF = path.join(dir, 'original.pdf');
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    await descargarPDF(drive, fila.pdf_drive_id, rutaPDF);
+    const textoPDF = await extraerTextoPDF(rutaPDF);
+
+    const config = await obtenerConfigDoctrinal();
+    const manualActivo = await obtenerManualActivo();
+
+    console.log(`   [TEST-TITULOS] Analizando: ${fila.titulo_documento}`);
+    const reporte = await analizarConClaude(textoPDF, config, manualActivo);
+    const datos = normalizarDatosEstructurados(reporte, fila.id);
+
+    const articulosCitados = componentesUnicos(datos);
+    console.log(`   [TEST-TITULOS] ${articulosCitados.length} artículos únicos citados — pidiendo títulos...`);
+    const titulos = await generarTitulosArticulos(textoPDF, articulosCitados, fila.id);
+
+    const lineas = articulosCitados.map(a => `${a} — ${titulos[a] || '(SIN TÍTULO — revisar)'}`);
+
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+ARTÍCULOS CITADOS: ${articulosCitados.length}
+
+${lineas.join('\n')}
+
+(Esta prueba NO escribió nada en la base de datos.)
+`);
+
+  } catch (error) {
+    clearInterval(heartbeat);
+    console.error('   [TEST-TITULOS] ❌ Error:', error.message);
+    res.end('\n\nError: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -2534,6 +2622,23 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
       auditoria_id
     );
     console.log(`✅ [${auditoria_id}] PDF del reporte generado — alineación: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'}`);
+
+    console.log(`🕸️  [${auditoria_id}] PASO 6.5: Generando datos del grafo (títulos de artículo)...`);
+    try {
+      const articulosCitados = componentesUnicos(datosReporte);
+      let titulosArticulos = {};
+      if (articulosCitados.length > 0) {
+        titulosArticulos = await generarTitulosArticulos(textoPDF, articulosCitados, auditoria_id);
+      }
+      const grafoDatos = calcularDatosGrafo(datosReporte, titulosArticulos);
+      await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatos), auditoria_id]);
+      console.log(`✅ [${auditoria_id}] Datos del grafo guardados (${grafoDatos.nodos.length} nodos, ${grafoDatos.enlaces.length} enlaces)`);
+    } catch (errorGrafo) {
+      // No bloqueante a propósito: si esto falla, la auditoría sigue su
+      // curso normal (Reporte, Drive, email) — el grafo simplemente queda
+      // sin datos (grafo_datos = NULL) hasta que se reintente a mano.
+      console.error(`⚠️  [${auditoria_id}] No se pudieron generar los datos del grafo (no bloqueante):`, errorGrafo.message);
+    }
 
     // ── PASOS TEMPORALMENTE DESACTIVADOS (3 jul 2026) ──────────────────────
     // NotebookLM (audio), PPTX y mapa mental quedan en pausa mientras se
