@@ -202,3 +202,32 @@ module.exports = {
   generarTitulosArticulos,
   calcularDatosGrafo,
 };
+
+const HORIZONTE_POR_RESULTADO = {
+  'NO': 'en_contra',
+  'SI_MATIZ': 'neutral',
+  'SI': 'a_favor',
+};
+
+function calcularResumenHorizontes(enlaces) {
+  const grupos = { en_contra: [], neutral: [], a_favor: [] };
+
+  enlaces.forEach(enlace => {
+    const horizonte = HORIZONTE_POR_RESULTADO[enlace.resultado];
+    if (!horizonte) return; // NA queda fuera
+    grupos[horizonte].push(enlace);
+  });
+
+  const total = grupos.en_contra.length + grupos.neutral.length + grupos.a_favor.length;
+  const conPorcentaje = lista => ({
+    cantidad: lista.length,
+    porcentaje: total > 0 ? Math.round((lista.length / total) * 100) : 0,
+  });
+
+  return {
+    total,
+    en_contra: conPorcentaje(grupos.en_contra),
+    neutral: conPorcentaje(grupos.neutral),
+    a_favor: conPorcentaje(grupos.a_favor),
+  };
+}
