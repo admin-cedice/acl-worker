@@ -46,6 +46,7 @@ const { generarPodcastPrueba } = require('./testPodcast');
 const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA, normalizarDatosEstructurados } = require('./generarReportePDF');
 const { generarYRevisarGuion } = require('./generarGuionPresentacion');
 const { componentesUnicos, generarTitulosArticulos, calcularDatosGrafo } = require('./generarDatosGrafo');
+const { generarPresentacionPDF, registrarRutaHTMLTemporalPresentacion } = require('./generarPresentacionPDF');
 const {
   generarPodcastMp3,
   generarAudioLote,
@@ -81,6 +82,7 @@ app.use((req, res, next) => {
 });
 // Ruta temporal para servir HTMLs a CloudConvert
 registrarRutaHTMLTemporal(app);
+registrarRutaHTMLTemporalPresentacion(app);
 // ── Clientes globales ────────────────────────────────────────────────────────
 
 const anthropic     = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -1255,6 +1257,102 @@ ${linkNuevo}
   } catch (error) {
     clearInterval(heartbeat);
     console.error('   [TEST-REPORTE-GET] ❌ Error:', error.message);
+    res.end('\n\nError: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// PRUEBA TEMPORAL — genera la Presentación v1 (Portada + 3 secciones por
+// horizonte + Mapa Mental de cierre) para un documento real, de punta a
+// punta: lee el reporte_texto ya guardado (no vuelve a llamar a Claude —
+// pregunta y análisis ya están ahí desde la migración a salida
+// estructurada), dibuja el Mapa Mental con generarGrafoPorHorizonte() y
+// arma el PDF con generarPresentacionPDF(). Sube el resultado a la
+// carpeta de pruebas en Drive — no escribe nada en la base de datos, no
+// toca la auditoría real. Eliminar después de validar.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/test-presentacion?secret=acl-worker-2026-secreto
+//   (sin auditoria_id: usa la auditoría completada más reciente)
+app.get('/test-presentacion', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  let fila;
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais
+         FROM auditorias
+         WHERE estado = 'completada' AND reporte_texto IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
+
+  if (!fila?.reporte_texto) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría con reporte_texto.');
+  }
+
+  res.type('text/plain; charset=utf-8');
+  res.write(`Generando la Presentación de "${fila.titulo_documento}" — esto puede tardar 1 a 2 minutos (dibujar el Mapa Mental + convertir el PDF), no cierres esta pestaña...\n`);
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  const dir = path.join(DIRECTORIO_TEMP, `test-presentacion-${fila.id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const datos = normalizarDatosEstructurados(fila.reporte_texto, fila.id);
+
+    console.log(`   [TEST-PRESENTACION] Dibujando Mapa Mental para: ${fila.titulo_documento}`);
+    const rutaMapaPNG = path.join(dir, 'mapa.png');
+    await generarGrafoPorHorizonte(datos, fila.titulo_documento, rutaMapaPNG, fila.id);
+
+    console.log(`   [TEST-PRESENTACION] Generando PDF de la presentación...`);
+    const rutaPDF = path.join(dir, 'presentacion.pdf');
+    await generarPresentacionPDF(
+      datos,
+      {
+        titulo: fila.titulo_documento,
+        pais: fila.pais || '',
+        generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
+      },
+      rutaMapaPNG,
+      rutaPDF,
+      fila.id
+    );
+
+    console.log(`   [TEST-PRESENTACION] Subiendo a Drive (carpeta de pruebas)...`);
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const carpetaId = await obtenerCarpetaAuditoria(drive, `pruebas-presentacion-${fila.id}`);
+    const link = await subirArchivo(drive, rutaPDF, `presentacion-${slugificar(fila.titulo_documento)}.pdf`, 'application/pdf', carpetaId);
+
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+
+✅ Presentación generada y subida a Drive (carpeta de pruebas):
+${link}
+
+(Esta prueba NO escribió nada en la base de datos ni tocó la auditoría real.)
+`);
+  } catch (error) {
+    clearInterval(heartbeat);
+    console.error('   [TEST-PRESENTACION] ❌ Error:', error.message);
     res.end('\n\nError: ' + error.message);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
