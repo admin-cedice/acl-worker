@@ -828,9 +828,17 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A') {
   console.log(`   ║ Alertas    : ${(resultado.alertas || []).length}`);
   console.log(`   ╚══════════════════════════════════════════════════\n`);
 
+  // PONDERACIÓN DEL PUNTAJE (20 jul 2026) — decisión de Moisés: un SÍ con
+  // matiz ya no vale cero en el numerador. Antes solo restaba terreno (contaba
+  // en "aplicables" pero no sumaba nada), lo cual castigaba con dureza a un
+  // documento que avanza parcialmente en un criterio. Ahora cada SÍ con matiz
+  // aporta medio punto de un SÍ pleno — el divisor (aplicables) no cambia,
+  // solo el numerador. La condición para mostrar puntaje en absoluto (que
+  // haya al menos un SÍ pleno) tampoco cambia — eso es una decisión aparte,
+  // no se tocó.
   const aplicables = siPlenos + siMatiz + noCount;
   const puntaje = (aplicables > 0 && siPlenos > 0)
-    ? Math.round((siPlenos / aplicables) * 100)
+    ? Math.round(((siPlenos + siMatiz * 0.5) / aplicables) * 100)
     : null;
 
   return {
