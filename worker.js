@@ -1254,6 +1254,74 @@ app.get('/regenerar-grafo', async (req, res) => {
   }
 });
 
+// ENDPOINT DE RECUPERACIÓN — regenera solo la Presentación de una
+// auditoría ya completada, sin repetir el análisis de los 28 criterios.
+// Sube el PDF nuevo a la MISMA carpeta de Drive de la auditoría (no una
+// carpeta de pruebas) y actualiza link_presentacion, así el botón de la
+// biblioteca ya apunta al más reciente. Nota: esto SUBE un archivo
+// nuevo — no borra el anterior de Drive, si lo corres varias veces
+// quedan varias copias ahí (solo la más reciente queda enlazada).
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/regenerar-presentacion?secret=acl-worker-2026-secreto&auditoria_id=ID_AQUI
+app.get('/regenerar-presentacion', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+  const auditoria_id = req.query.auditoria_id;
+  if (!auditoria_id) {
+    return res.status(400).type('text/plain').send('Falta ?auditoria_id en la URL');
+  }
+
+  const dir = path.join(DIRECTORIO_TEMP, `regenerar-presentacion-${auditoria_id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const result = await db.query(
+      `SELECT reporte_texto, titulo_documento, pais, drive_carpeta_id FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (!result.rows[0]?.reporte_texto) {
+      return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría.');
+    }
+    const { reporte_texto, titulo_documento, pais, drive_carpeta_id } = result.rows[0];
+    if (!drive_carpeta_id) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene drive_carpeta_id guardado.');
+    }
+
+    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id);
+    const rutaPDF = path.join(dir, 'presentacion.pdf');
+
+    console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
+    await generarPresentacionPDF(
+      datosReporte,
+      {
+        titulo: titulo_documento,
+        pais: pais || '',
+        generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
+      },
+      rutaPDF,
+      auditoria_id
+    );
+
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const identificadorLimpio = limpiarIdentificador(titulo_documento);
+    const link = await subirArchivo(drive, rutaPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', drive_carpeta_id);
+
+    await db.query(`UPDATE auditorias SET link_presentacion = $1 WHERE id = $2`, [link, auditoria_id]);
+
+    console.log(`   [REGENERAR-PRESENTACION] ✅ [${auditoria_id}] link_presentacion actualizado`);
+    res.type('text/plain').send(`✅ Listo — "${titulo_documento}": Presentación regenerada y subida.\n${link}\n\n(link_presentacion actualizado — el botón de la biblioteca ya apunta acá.)`);
+
+  } catch (error) {
+    console.error(`   [REGENERAR-PRESENTACION] ❌ [${auditoria_id}] Error:`, error.message);
+    res.status(500).type('text/plain').send('Error: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // VERSIÓN GET del endpoint de arriba — mismo trabajo (regenera el PDF del
 // reporte de una auditoría con el diseño/fórmula más reciente y lo sube a
 // su misma carpeta de Drive), pero pegable directo en el navegador, como
