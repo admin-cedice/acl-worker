@@ -1,36 +1,31 @@
 // generarPresentacionPDF.js — ACL Worker
 // Umbusk LLC · Auditoría Cívica Liberal
 //
-// Presentación v2.3 (22 jul 2026) — ajustes de diseño sobre v2.2, tras ver
-// el primer PDF real con ideas de Activismo ya conectadas:
-//   1. Encabezado de portada rediseñado como "masthead" (logo, tagline,
-//      créditos, etiqueta de tipo de documento + fecha, título, país) —
-//      aproximado al estilo del Reporte a partir de la jerarquía de texto
-//      que dio Moisés; NO SE VIO el código real del Reporte, así que si
-//      no calza en tipografía/espaciado, hay que ajustarlo con ese
-//      archivo delante.
-//   2. Se quita el gráfico de barras de la portada. En su lugar: un
-//      título grande centrado con la recomendación general en modo
-//      "intensidad total" (RECHAZAR/APOYAR 100%, o la variante híbrida) y,
-//      debajo, el lema de la marca ("Defiende la libertad. Audita el
-//      poder."), con el mismo estilo tipográfico de la landing (negro
-//      bold + rojo itálica).
-//   3. Cada idea de activismo ahora trae un ícono de canal (redes
-//      sociales / carta / foro / monitoreo / medios) a la izquierda del
-//      texto — campo `categoria` nuevo en generarActivismo.js. Se
-//      prefirió esto sobre que Claude elija entre las 35 ilustraciones:
-//      en el caso total no hay un criterio específico detrás de cada
-//      idea, así que no hay base clara para esa selección (si acaso,
-//      tiene más sentido para el caso híbrido, que sí ata cada idea a un
-//      criterio puntual — pendiente).
-//   4. Se quita el encabezado de la lámina de ideas (ya no repite
-//      "Activismo · Auditoría Cívica Liberal" ni el veredicto — eso
-//      ahora vive en la portada).
-//   5. Nueva lámina de contacto: encabezado "ACTIVISTA: ..." pedido por
-//      Moisés, con una ilustración placeholder (ícono genérico de
-//      escudo/protección) a la izquierda — la ilustración final es tarea
-//      de diseño aparte, no algo que este código pueda producir con la
-//      calidad de las 35 piezas ya aprobadas.
+// Presentación v2.4 (22 jul 2026) — pensada de verdad como diapositivas
+// para pantalla, no como documento impreso reducido:
+//   1. Cada idea de Activismo (caso total) pasa a ser SU PROPIA lámina —
+//      no una lista de 3-5 ideas apretadas en una página. Cada una trae
+//      una ilustración grande a un lado, según su `categoria`
+//      (redes_sociales/carta/foro/monitoreo/medios) — 5 ilustraciones
+//      GENÉRICAS reutilizables por categoría, no una distinta por idea
+//      individual. HOY SOLO EXISTE LA DE 'redes_sociales' (la que subió
+//      Moisés, 22 jul) — se espera en
+//      public/presentacion/activismo-redes-sociales.png del repo
+//      auditoria-civica-liberal. Las otras 4 (activismo-carta.png,
+//      activismo-foro.png, activismo-monitoreo.png, activismo-medios.png)
+//      todavía no existen — mientras tanto esas láminas muestran un
+//      rectángulo de color liso en vez de imagen rota (ver
+//      .idea-ilustracion, background-image con fallback de color, no
+//      <img> — así no se ve un ícono de "imagen rota" si el archivo
+//      todavía no está).
+//   2. Tipografía subida en todo el documento — pensada para proyectarse
+//      o leerse en pantalla, no para imprimirse de cerca. El único bloque
+//      que NO se agrandó a propósito es el masthead de portada (logo/
+//      créditos/etiqueta), porque ese sí debía replicar exactamente al
+//      Reporte, por pedido explícito de Moisés.
+//   3. Como consecuencia esperada y aceptada: el caso híbrido y el caso
+//      total ya no intentan caber en una sola página — el documento
+//      fluye en tantas láminas como haga falta.
 //
 // SIN CAMBIOS: mecanismo HTML→PDF (CloudConvert), mapa temporal de
 // HTMLs, firma pública de generarPresentacionPDF(). La lámina de
@@ -54,6 +49,16 @@ function esc(str) {
 // ── Asunción sin confirmar del todo — solo usada por la lámina de
 // hallazgos, hoy sin llamarse ──────────────────────────────────────────
 const RUTA_BASE_IMAGENES = 'https://liberalmente.app/presentacion';
+
+// Una ilustración genérica por categoría de canal — NO una por idea.
+// Solo 'redes_sociales' existe hoy (ver nota de cabecera).
+const ILUSTRACION_POR_CATEGORIA = {
+  redes_sociales: 'activismo-redes-sociales.png',
+  carta:          'activismo-carta.png',
+  foro:           'activismo-foro.png',
+  monitoreo:      'activismo-monitoreo.png',
+  medios:         'activismo-medios.png',
+};
 
 const HORIZONTES = [
   { key: 'en_contra', nombre: 'EN CONTRA', color: '#C41230', colorTexto: '#791F1F', fondo: '#FFF5F6' },
@@ -98,26 +103,11 @@ function textoPlaceholderCriterio(tipo) {
 
 // Título grande de la portada — "intensidad total" del veredicto. El
 // "100%" en los casos rechazo_total/promocion_total es literal (la acción
-// recomendada es total/completa), NO el % de impacto liberal del
-// documento — eso ya no se muestra por separado en la portada.
+// recomendada es total/completa), NO el % de impacto liberal del documento.
 function generarTituloRecomendacionGeneral(veredicto) {
   if (veredicto.modo === 'rechazo_total') return 'Recomendación General: RECHAZAR 100% A ESTE INSTRUMENTO.';
   if (veredicto.modo === 'promocion_total') return 'Recomendación General: APOYAR 100% A ESTE INSTRUMENTO.';
   return 'Recomendación General: EJECUTAR ACCIONES DE RECHAZO, MEJORA O APOYO, A NIVEL DE ARTÍCULOS ESPECÍFICOS.';
-}
-
-// ── Íconos de canal por categoría de idea (generarActivismo.js) ─────────
-const ICONOS_CATEGORIA = {
-  redes_sociales: '<line x1="9" y1="3" x2="7" y2="21"/><line x1="17" y1="3" x2="15" y2="21"/><line x1="4" y1="9" x2="20" y2="9"/><line x1="3" y1="15" x2="19" y2="15"/>',
-  carta:          '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
-  foro:           '<path d="M4 4h16v11H8l-4 4V4z"/>',
-  monitoreo:      '<circle cx="10" cy="10" r="6"/><line x1="15" y1="15" x2="20" y2="20"/>',
-  medios:         '<circle cx="12" cy="12" r="9"/><polygon points="10,8 16,12 10,16" fill="currentColor" stroke="none"/>',
-};
-
-function iconoCategoriaSVG(categoria, color) {
-  const contenido = ICONOS_CATEGORIA[categoria] || ICONOS_CATEGORIA.redes_sociales;
-  return `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="${color}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${contenido}</svg>`;
 }
 
 const CSS = `
@@ -126,7 +116,7 @@ const CSS = `
   html { background: #F7F5F0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   body {
     font-family: Arial, Helvetica, sans-serif; color: #1A1A1A; background: #F7F5F0;
-    font-size: 13px; line-height: 1.6;
+    font-size: 15px; line-height: 1.6;
     -webkit-print-color-adjust: exact; print-color-adjust: exact;
   }
 
@@ -134,9 +124,8 @@ const CSS = `
   .portada-pres { break-after: page; height: 178mm; display: flex; flex-direction: column; }
   .portada-cinta { height: 5px; background: #C41230; flex: 0 0 auto; }
 
-  /* Réplica exacta de .portada-header/.portada-body de generarReportePDF.js
-     (misma estructura, mismos valores) — logo a la izquierda, créditos a
-     la derecha, luego etiqueta/título/subtítulo debajo. */
+  /* Réplica del masthead del Reporte — a propósito NO se agranda, es el
+     único bloque que debía calzar en tamaño con el documento impreso. */
   .portada-header {
     flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
     padding: 28px 52px 24px; border-bottom: 1px solid #D4CFC4;
@@ -157,10 +146,11 @@ const CSS = `
   }
   .portada-subtitulo { font-size: 13px; color: #4A4A4A; font-style: italic; font-family: Georgia, 'Times New Roman', serif; }
 
-  .portada-hero { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 28px; text-align: center; padding: 0 14mm; }
-  .recomendacion-general { font-family: Georgia, 'Times New Roman', serif; font-size: 25px; font-weight: 700; line-height: 1.35; max-width: 640px; }
-  .motto-linea1 { font-family: Georgia, 'Times New Roman', serif; font-size: 19px; font-weight: 700; color: #1A1A1A; }
-  .motto-linea2 { font-family: Georgia, 'Times New Roman', serif; font-size: 19px; font-style: italic; color: #C41230; }
+  /* Hero de portada — este sí a escala de diapositiva. */
+  .portada-hero { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 34px; text-align: center; padding: 0 16mm; }
+  .recomendacion-general { font-family: Georgia, 'Times New Roman', serif; font-size: 34px; font-weight: 700; line-height: 1.35; max-width: 720px; }
+  .motto-linea1 { font-family: Georgia, 'Times New Roman', serif; font-size: 25px; font-weight: 700; color: #1A1A1A; }
+  .motto-linea2 { font-family: Georgia, 'Times New Roman', serif; font-size: 25px; font-style: italic; color: #C41230; }
 
   /* ── Hallazgos (SUPERADA — sin llamarse) ────────────────────────────── */
   .lamina-hallazgo { break-before: page; height: 178mm; display: flex; flex-direction: column; }
@@ -183,43 +173,46 @@ const CSS = `
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
 
-  /* ── Activismo ───────────────────────────────────────────────────── */
-  .lamina-activismo-total { break-before: page; min-height: 178mm; display: flex; flex-direction: column; justify-content: center; }
-  .activismo-ideas { display: flex; flex-direction: column; gap: 16px; max-width: 760px; margin: 0 auto; text-align: left; width: 100%; }
-  .activismo-idea { display: flex; gap: 14px; border-left: 3px solid; padding-left: 14px; page-break-inside: avoid; }
-  .activismo-idea-icono { flex: 0 0 auto; padding-top: 2px; }
-  .activismo-idea-texto { flex: 1 1 auto; }
-  .activismo-idea-titulo { font-size: 14px; font-weight: 700; margin-bottom: 3px; }
-  .activismo-idea-descripcion { font-size: 12px; color: #4A4A4A; line-height: 1.55; }
+  /* ── Activismo — caso total: una idea por lámina ────────────────────── */
+  .lamina-idea-activismo { break-before: page; height: 178mm; display: flex; align-items: center; gap: 36px; padding: 0 12mm; }
+  .idea-ilustracion {
+    flex: 0 0 42%; height: 140mm; border-radius: 8px;
+    background-color: #EFEBE0; background-size: contain; background-position: center; background-repeat: no-repeat;
+  }
+  .idea-contenido { flex: 1 1 auto; }
+  .idea-numero { font-size: 13px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #8A8478; margin-bottom: 14px; }
+  .idea-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 28px; font-weight: 700; line-height: 1.3; margin-bottom: 18px; max-width: 480px; }
+  .idea-descripcion { font-size: 17px; color: #4A4A4A; line-height: 1.6; max-width: 480px; }
 
+  /* ── Activismo — caso híbrido (placeholder, sigue en borrador) ──────── */
   .lamina-activismo-horizonte { break-before: page; min-height: 178mm; }
-  .activismo-header { display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 10px; margin-bottom: 18px; }
-  .activismo-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 24px; font-weight: 700; }
+  .activismo-header { display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 12px; margin-bottom: 22px; }
+  .activismo-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 28px; font-weight: 700; }
 
-  .activismo-item { display: flex; gap: 14px; padding: 12px 0; border-bottom: 1px solid #E5E1D8; page-break-inside: avoid; }
-  .activismo-item-etiquetas { flex: 0 0 150px; }
-  .activismo-item-id { font-size: 12px; font-weight: 700; }
-  .activismo-item-articulos { font-size: 10.5px; color: #8A8478; margin-top: 3px; }
+  .activismo-item { display: flex; gap: 18px; padding: 16px 0; border-bottom: 1px solid #E5E1D8; page-break-inside: avoid; }
+  .activismo-item-etiquetas { flex: 0 0 170px; }
+  .activismo-item-id { font-size: 15px; font-weight: 700; }
+  .activismo-item-articulos { font-size: 12.5px; color: #8A8478; margin-top: 4px; }
   .activismo-item-recomendacion {
-    flex: 1; font-size: 11.5px; color: #4A4A4A; font-style: italic;
-    border: 1px dashed #C7C2B6; border-radius: 3px; padding: 8px 10px; background: #FBFAF7;
+    flex: 1; font-size: 14px; color: #4A4A4A; font-style: italic;
+    border: 1px dashed #C7C2B6; border-radius: 3px; padding: 10px 12px; background: #FBFAF7;
   }
 
   /* ── Lámina de contacto ──────────────────────────────────────────── */
   .lamina-contacto { break-before: page; min-height: 178mm; display: flex; align-items: center; }
-  .contacto-cuerpo { display: flex; gap: 32px; align-items: flex-start; width: 100%; }
-  .contacto-ilustracion { flex: 0 0 140px; width: 140px; height: 140px; }
+  .contacto-cuerpo { display: flex; gap: 36px; align-items: flex-start; width: 100%; }
+  .contacto-ilustracion { flex: 0 0 160px; width: 160px; height: 160px; }
   .contacto-lista { flex: 1 1 auto; }
-  .contacto-eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: #8A8478; margin-bottom: 6px; }
-  .contacto-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 18px; font-weight: 700; color: #1A1A1A; max-width: 560px; line-height: 1.35; margin-bottom: 14px; }
+  .contacto-eyebrow { font-size: 12px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: #8A8478; margin-bottom: 8px; }
+  .contacto-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 24px; font-weight: 700; color: #1A1A1A; max-width: 600px; line-height: 1.35; margin-bottom: 16px; }
   .contacto-aviso-dummy {
     background: #FFF3CD; border: 1px solid #E0B34D; color: #7A5C00;
-    font-size: 11px; font-weight: 700; padding: 8px 12px; border-radius: 4px; margin-bottom: 16px;
+    font-size: 12px; font-weight: 700; padding: 9px 13px; border-radius: 4px; margin-bottom: 18px;
   }
-  .contacto-item { padding: 12px 0; border-bottom: 1px solid #E5E1D8; }
-  .contacto-nombre { font-size: 13px; font-weight: 700; }
-  .contacto-datos { font-size: 11.5px; color: #4A4A4A; margin-top: 2px; }
-  .contacto-descripcion { font-size: 11px; color: #8A8478; margin-top: 4px; }
+  .contacto-item { padding: 14px 0; border-bottom: 1px solid #E5E1D8; }
+  .contacto-nombre { font-size: 17px; font-weight: 700; }
+  .contacto-datos { font-size: 15px; color: #4A4A4A; margin-top: 3px; }
+  .contacto-descripcion { font-size: 13px; color: #8A8478; margin-top: 5px; }
 `;
 
 // ── Portada ────────────────────────────────────────────────────────────
@@ -294,30 +287,31 @@ function generarLaminasHallazgosHTML(secciones, articulosPorCriterio) {
     }).join('\n');
 }
 
-// ── Activismo ──────────────────────────────────────────────────────────
-const TIPO_ACTIVISMO_POR_HORIZONTE = { en_contra: 'rechazo', neutral: 'mejora', a_favor: 'promocion' };
-const NOMBRE_ACTIVISMO_POR_HORIZONTE = { en_contra: 'RECHAZO', neutral: 'MEJORA', a_favor: 'PROMOCIÓN' };
-
-// Caso total — ideas reales de generarIdeasActivismoTotal(), con ícono de
-// canal. Sin encabezado propio (se retiró; el veredicto ya vive en la portada).
-function generarLaminaVeredictoTotalHTML(veredicto, ideas) {
-  const color = veredicto.modo === 'rechazo_total' ? '#C41230' : '#2E7D32';
-  const ideasHTML = (ideas || []).map(idea => `
-    <div class="activismo-idea" style="border-color:${color}">
-      <div class="activismo-idea-icono">${iconoCategoriaSVG(idea.categoria, color)}</div>
-      <div class="activismo-idea-texto">
-        <div class="activismo-idea-titulo">${esc(idea.titulo)}</div>
-        <div class="activismo-idea-descripcion">${esc(idea.descripcion)}</div>
-      </div>
-    </div>`).join('');
-
+// ── Activismo — caso total: una lámina por idea ──────────────────────────
+function generarLaminaIdeaHTML(idea, numero, total, color) {
+  const archivo = ILUSTRACION_POR_CATEGORIA[idea.categoria] || ILUSTRACION_POR_CATEGORIA.redes_sociales;
+  const src = `${RUTA_BASE_IMAGENES}/${archivo}`;
   return `
-<div class="lamina-activismo-total">
-  <div class="activismo-ideas">${ideasHTML}</div>
+<div class="lamina-idea-activismo">
+  <div class="idea-ilustracion" style="background-image:url('${src}')"></div>
+  <div class="idea-contenido" style="border-left:5px solid ${color}; padding-left:26px;">
+    <div class="idea-numero">Idea ${numero} de ${total}</div>
+    <div class="idea-titulo">${esc(idea.titulo)}</div>
+    <div class="idea-descripcion">${esc(idea.descripcion)}</div>
+  </div>
 </div>`;
 }
 
-// Caso híbrido — sigue con texto de marcador de posición.
+function generarLaminasVeredictoTotalHTML(veredicto, ideas) {
+  const color = veredicto.modo === 'rechazo_total' ? '#C41230' : '#2E7D32';
+  const lista = ideas || [];
+  return lista.map((idea, i) => generarLaminaIdeaHTML(idea, i + 1, lista.length, color)).join('\n');
+}
+
+// ── Activismo — caso híbrido (placeholder, sigue en borrador) ───────────
+const TIPO_ACTIVISMO_POR_HORIZONTE = { en_contra: 'rechazo', neutral: 'mejora', a_favor: 'promocion' };
+const NOMBRE_ACTIVISMO_POR_HORIZONTE = { en_contra: 'RECHAZO', neutral: 'MEJORA', a_favor: 'PROMOCIÓN' };
+
 function generarLaminaActivismoHorizonteHTML(h, criterios, articulosPorCriterio) {
   const tipo = TIPO_ACTIVISMO_POR_HORIZONTE[h.key];
   const items = criterios.map(c => {
@@ -343,7 +337,7 @@ function generarLaminaActivismoHorizonteHTML(h, criterios, articulosPorCriterio)
 
 function generarSeccionActivismoHTML(veredicto, secciones, articulosPorCriterio, ideasActivismoTotal) {
   if (veredicto.modo !== 'hibrido') {
-    return generarLaminaVeredictoTotalHTML(veredicto, ideasActivismoTotal);
+    return generarLaminasVeredictoTotalHTML(veredicto, ideasActivismoTotal);
   }
   return HORIZONTES
     .filter(h => secciones[h.key].length > 0)
@@ -520,7 +514,7 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 
 // ── Función principal exportada ───────────────────────────────────────────
 async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.3`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.4`);
 
   const { enlaces } = calcularDatosGrafo(datos);
   const resumenHorizontes = calcularResumenHorizontes(enlaces);
