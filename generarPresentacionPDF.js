@@ -1,40 +1,38 @@
 // generarPresentacionPDF.js — ACL Worker
 // Umbusk LLC · Auditoría Cívica Liberal
 //
-// Presentación v2 (21 jul 2026) — reemplaza por completo la v1 del 20 jul.
-// Cambios de fondo, decididos con Moisés el 21 jul:
-//   1. La portada ya no es solo texto: es una infografía de barras con el
-//      % de impactos artículo-criterio en cada horizonte (en contra /
-//      neutral / a favor). Reemplaza también, en todos lados, al gráfico
-//      SVG viejo de 3 áreas (generarSVGGrafoPorHorizonte() en worker.js,
-//      que queda sin usarse — no se borra, solo se deja de invocar).
-//   2. Las secciones de hallazgos ya no son tarjetas de texto (pregunta +
-//      análisis): son láminas ilustradas, 9 criterios por página, usando
-//      las 35 piezas gráficas aprobadas (public/presentacion/C-XX.png del
-//      repo auditoria-civica-liberal). Convención doctrinal del 10 jul,
-//      "señal de tránsito" (NO REABRIR): NO = círculo rojo tachado sobre
-//      toda la imagen; SÍ con matiz = marcador dorado pequeño en la
-//      esquina, SIN tachado completo; SÍ = imagen limpia, sin marcador.
-//   3. La lámina de cierre (que antes embebía el PNG del gráfico viejo)
-//      se reemplaza por la sección de Activismo (calcularVeredictoActivismo()
-//      en generarActivismo.js, nuevo). generarPresentacionPDF() YA NO
-//      recibe rutaImagenMapa — ver la nota en worker.js sobre actualizar
-//      la llamada en /test-presentacion.
+// Presentación v2.1 (21 jul 2026) — ajustes sobre v2 tras la primera
+// prueba real (auditoría "Proyecto de Ley de Arrendamientos Inmobiliarios"),
+// decididos con Moisés:
+//   1. Portada rediseñada: logo "Liberalmente" (texto, "Liberal" en negrita
+//      + "mente" en peso normal, Georgia — igual que la landing, sin
+//      necesidad de un archivo de imagen) arriba a la izquierda, título
+//      subido para quedar cerca del logo, y el gráfico de barras pasa a
+//      ser la pieza central ("hero"): más grande, centrado, con el
+//      veredicto (calcularVeredictoActivismo(), calculado UNA sola vez y
+//      reutilizado también en la sección de Activismo) como texto de
+//      recomendación debajo — bold + porcentaje / itálica + color del
+//      horizonte, ecos del propio estilo de la landing (titular negro +
+//      subtitular en cursiva roja).
+//   2. Cualquier horizonte sin criterios (hallazgos o Activismo híbrido)
+//      se omite por completo — antes mostraba un mensaje de "vacío".
+//   3. La grilla de hallazgos ya NO usa una altura de imagen fija en mm
+//      (eso fue lo que obligó a recortar a mano): ahora la página se
+//      reparte sola en 3 filas iguales vía flexbox/grid, así 9 caben
+//      siempre sin importar cuánto texto tengan las tarjetas. Se agrega
+//      un texto complementario por criterio (c.pregunta, recortado a 2
+//      líneas con line-clamp) — no existía un campo más corto en el
+//      schema; si se quiere algo más curado habría que agregarlo.
+//   4. El subtítulo de la lámina de veredicto total (y ahora también el
+//      texto de la portada) dice solo "{porcentaje}% de impacto liberal."
+//      — se usa "impacto" en vez de "alineación" en todo el documento,
+//      por consistencia con el término que usa Moisés.
 //
-// PENDIENTE A PROPÓSITO: el contenido real de las recomendaciones de
-// Activismo (rechazo/mejora/promoción) todavía no está definido — Moisés
-// lo señaló explícitamente el 21 jul. Esta versión genera el PDF completo
-// y navegable con texto de marcador de posición donde iría cada
-// recomendación (fácil de ubicar: buscar "PENDIENTE" en el PDF), para que
-// el resto del diseño (portada, hallazgos, estructura de Activismo) se
-// pueda probar de punta a punta hoy, sin esperar a que ese contenido esté
-// listo. Cuando se defina, solo hay que reemplazar las funciones
-// textoPlaceholder*() de abajo por los llamados reales a Claude.
-//
-// SIN CAMBIOS respecto a v1: el mecanismo de conversión HTML→PDF
-// (convertirHTMLaPDF, vía CloudConvert) y el mapa temporal de HTMLs
-// (registrarRutaHTMLTemporalPresentacion) — mismo patrón que generarReportePDF.js,
-// no se tocó nada de esa parte.
+// SIN CAMBIOS respecto a v2: el mecanismo de conversión HTML→PDF
+// (convertirHTMLaPDF, vía CloudConvert), el mapa temporal de HTMLs
+// (registrarRutaHTMLTemporalPresentacion), y la firma de
+// generarPresentacionPDF() (datos, metadatos, rutaSalida, auditoria_id —
+// sin rutaImagenMapa, decisión del 21 jul).
 
 'use strict';
 
@@ -52,10 +50,6 @@ function esc(str) {
 }
 
 // ── Asunción a confirmar con Moisés ──────────────────────────────────────
-// Las imágenes viven en public/presentacion/C-XX.png dentro del repo
-// auditoria-civica-liberal (Next.js), que sirve en liberalmente.app — se
-// asume que Next.js las expone en esta ruta pública estándar. Si no es
-// así, este es el único lugar que hay que corregir.
 const RUTA_BASE_IMAGENES = 'https://liberalmente.app/presentacion';
 
 const HORIZONTES = [
@@ -78,8 +72,7 @@ function calcularSeccionesHorizonte(datos) {
 }
 
 // Etiquetas cortas de artículo (A-12, A-64F...) por criterio, derivadas de
-// los mismos enlaces que ya calcula calcularDatosGrafo() — evita volver a
-// normalizar componentes por separado en este archivo.
+// los mismos enlaces que ya calcula calcularDatosGrafo().
 function calcularArticulosPorCriterio(enlaces) {
   const mapa = {};
   enlaces.forEach(e => {
@@ -96,7 +89,7 @@ function partirEnBloques(lista, tam) {
 }
 
 // ── Texto de marcador de posición — reemplazar cuando el contenido real
-// de Activismo esté definido (ver nota al inicio del archivo) ───────────
+// de Activismo esté definido ──────────────────────────────────────────
 function textoPlaceholderCriterio(tipo) {
   const etiquetas = { rechazo: 'rechazo', mejora: 'mejora', promocion: 'promoción' };
   return `[PENDIENTE — recomendación de ${etiquetas[tipo]} para este criterio, generada con Claude]`;
@@ -105,6 +98,16 @@ function textoPlaceholderTotal(modo) {
   return modo === 'rechazo_total'
     ? '[PENDIENTE — recomendaciones de rechazo al instrumento completo, basadas en métodos de Gene Sharp, generadas con Claude]'
     : '[PENDIENTE — recomendaciones de promoción del instrumento completo, generadas con Claude]';
+}
+
+// Texto de acción de la portada — mismo veredicto que gobierna Activismo,
+// una sola fuente de verdad (calcularVeredictoActivismo()).
+function generarTextoAccionPortada(veredicto) {
+  if (veredicto.modo === 'rechazo_total') return 'Recomendación: Rechazar totalmente este instrumento normativo.';
+  if (veredicto.modo === 'promocion_total') return 'Recomendación: Promover activamente este instrumento normativo.';
+  // PENDIENTE DE CONFIRMAR — Moisés no dio el texto exacto para el caso
+  // híbrido (20%-80%), esto es un borrador hasta que lo ajuste.
+  return 'Recomendación: acción mixta — ver el detalle en las láminas de Activismo.';
 }
 
 const CSS = `
@@ -118,47 +121,56 @@ const CSS = `
   }
 
   /* ── Portada ─────────────────────────────────────────────────────── */
-  .portada-pres { break-after: page; min-height: 180mm; display: flex; flex-direction: column; }
-  .portada-cinta { height: 5px; background: #C41230; flex-shrink: 0; }
-  .portada-cuerpo { flex: 1; display: flex; flex-direction: column; justify-content: center; padding: 0 6mm; }
-  .portada-etiqueta { font-size: 11px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: #C41230; margin-bottom: 14px; }
-  .portada-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 34px; font-weight: 700; max-width: 720px; line-height: 1.2; margin-bottom: 10px; color: #1A1A1A; }
-  .portada-sub { font-size: 14px; color: #4A4A4A; max-width: 620px; line-height: 1.6; margin-bottom: 30px; }
+  .portada-pres { break-after: page; height: 178mm; display: flex; flex-direction: column; }
+  .portada-cinta { height: 5px; background: #C41230; flex: 0 0 auto; }
 
-  .portada-barras { display: flex; align-items: flex-end; gap: 44px; height: 150px; margin-bottom: 8px; }
-  .barra-col { display: flex; flex-direction: column; align-items: center; gap: 6px; }
-  .barra-valor { font-size: 18px; font-weight: 700; }
-  .barra-rect { width: 58px; border-radius: 4px 4px 0 0; }
-  .barra-etiqueta { font-size: 11px; font-weight: 600; color: #1A1A1A; }
-  .portada-linea { height: 1px; background: #D4CFC4; margin: 0 2px 10px; }
-  .portada-pie { font-size: 10.5px; color: #8A8478; }
+  .portada-header { flex: 0 0 auto; padding: 8mm 6mm 0; }
+  .logo-liberalmente { font-family: Georgia, 'Times New Roman', serif; font-size: 17px; color: #1A1A1A; margin-bottom: 6px; }
+  .logo-bold { font-weight: 700; }
+  .portada-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 23px; font-weight: 700; max-width: 720px; line-height: 1.25; color: #1A1A1A; }
+
+  .portada-hero { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; }
+  .portada-barras { display: flex; align-items: flex-end; gap: 60px; height: 210px; }
+  .barra-col { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .barra-valor { font-size: 22px; font-weight: 700; }
+  .barra-rect { width: 76px; border-radius: 5px 5px 0 0; }
+  .barra-etiqueta { font-size: 12px; font-weight: 600; color: #1A1A1A; }
+
+  .portada-recomendacion { text-align: center; }
+  .recomendacion-pct { font-family: Georgia, 'Times New Roman', serif; font-size: 19px; font-weight: 700; color: #1A1A1A; margin-bottom: 4px; }
+  .recomendacion-texto { font-family: Georgia, 'Times New Roman', serif; font-size: 15px; font-style: italic; }
+
+  .portada-pie { flex: 0 0 auto; padding: 0 6mm 6mm; font-size: 10.5px; color: #8A8478; text-align: center; }
 
   /* ── Hallazgos ───────────────────────────────────────────────────── */
-  .lamina-hallazgo { break-before: page; min-height: 180mm; }
-  .hallazgo-header { display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 10px; margin-bottom: 18px; }
-  .hallazgo-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 24px; font-weight: 700; }
-  .hallazgo-vacio { font-size: 13px; color: #8A8478; font-style: italic; padding: 20px 0; }
+  .lamina-hallazgo { break-before: page; height: 178mm; display: flex; flex-direction: column; }
+  .hallazgo-header { flex: 0 0 auto; display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 10px; margin-bottom: 14px; }
+  .hallazgo-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 22px; font-weight: 700; }
 
-  .hallazgo-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  .hallazgo-card { background: #FFFFFF; border: 1px solid #D4CFC4; border-radius: 4px; padding: 10px; page-break-inside: avoid; }
-  .hallazgo-img-wrap { position: relative; width: 100%; height: 40mm; border-radius: 3px; background: #FAFAF8; overflow: hidden; }
+  .hallazgo-grid { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 1fr); gap: 10px; }
+  .hallazgo-card { display: flex; flex-direction: column; overflow: hidden; min-height: 0; background: #FFFFFF; border: 1px solid #D4CFC4; border-radius: 4px; padding: 8px; }
+  .hallazgo-img-wrap { flex: 1 1 auto; min-height: 0; position: relative; border-radius: 3px; background: #FAFAF8; overflow: hidden; }
   .hallazgo-img { width: 100%; height: 100%; object-fit: contain; }
   .marca-rechazo { position: absolute; inset: 6%; pointer-events: none; }
   .marca-matiz {
-    position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; border-radius: 50%;
-    background: #B8860B; color: #FFFFFF; font-size: 13px; font-weight: 700;
+    position: absolute; top: 4px; right: 4px; width: 18px; height: 18px; border-radius: 50%;
+    background: #B8860B; color: #FFFFFF; font-size: 12px; font-weight: 700;
     display: flex; align-items: center; justify-content: center;
   }
-  .hallazgo-id { font-size: 11px; font-weight: 700; margin-top: 8px; }
-  .hallazgo-articulos { font-size: 10px; color: #8A8478; margin-top: 2px; }
+  .hallazgo-id { flex: 0 0 auto; font-size: 11px; font-weight: 700; margin-top: 6px; }
+  .hallazgo-articulos { flex: 0 0 auto; font-size: 9.5px; color: #8A8478; margin-top: 1px; }
+  .hallazgo-caption {
+    flex: 0 0 auto; font-size: 9.5px; color: #4A4A4A; margin-top: 2px; line-height: 1.3;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
 
   /* ── Activismo ───────────────────────────────────────────────────── */
-  .lamina-activismo-total { break-before: page; min-height: 180mm; display: flex; flex-direction: column; justify-content: center; }
+  .lamina-activismo-total { break-before: page; min-height: 178mm; display: flex; flex-direction: column; justify-content: center; }
   .activismo-eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: #8A8478; margin-bottom: 10px; }
   .activismo-veredicto { font-family: Georgia, 'Times New Roman', serif; font-size: 32px; font-weight: 700; margin-bottom: 8px; }
   .activismo-alineacion { font-size: 13px; color: #4A4A4A; margin-bottom: 24px; }
 
-  .lamina-activismo-horizonte { break-before: page; min-height: 180mm; }
+  .lamina-activismo-horizonte { break-before: page; min-height: 178mm; }
   .activismo-header { display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 10px; margin-bottom: 18px; }
   .activismo-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 24px; font-weight: 700; }
 
@@ -173,29 +185,38 @@ const CSS = `
 `;
 
 // ── Portada ────────────────────────────────────────────────────────────
-function generarPortadaHTML(titulo, pais, generadoEl, resumenHorizontes) {
+function generarPortadaHTML(titulo, pais, generadoEl, resumenHorizontes, veredicto) {
   const barrasHTML = HORIZONTES.map(h => {
-    const datosHorizonte = resumenHorizontes[h.key];
-    const alturaPx = Math.round((datosHorizonte.porcentaje / 100) * 150);
+    const d = resumenHorizontes[h.key];
+    const alturaPx = Math.round((d.porcentaje / 100) * 210);
+    const etiqueta = h.key === 'en_contra' ? 'En contra' : h.key === 'neutral' ? 'Neutral' : 'A favor';
     return `
     <div class="barra-col">
-      <span class="barra-valor" style="color:${h.colorTexto}">${datosHorizonte.porcentaje}%</span>
+      <span class="barra-valor" style="color:${h.colorTexto}">${d.porcentaje}%</span>
       <div class="barra-rect" style="height:${alturaPx}px; background:${h.color};"></div>
-      <span class="barra-etiqueta">${h.nombre === 'EN CONTRA' ? 'En contra' : h.nombre === 'NEUTRAL' ? 'Neutral' : 'A favor'}</span>
+      <span class="barra-etiqueta">${etiqueta}</span>
     </div>`;
   }).join('');
+
+  const colorRecomendacion = veredicto.modo === 'rechazo_total' ? '#C41230'
+    : veredicto.modo === 'promocion_total' ? '#2E7D32'
+    : '#B8860B';
 
   return `
 <div class="portada-pres">
   <div class="portada-cinta"></div>
-  <div class="portada-cuerpo">
-    <div class="portada-etiqueta">Presentación · Auditoría Cívica Liberal</div>
+  <div class="portada-header">
+    <div class="logo-liberalmente"><span class="logo-bold">Liberal</span>mente</div>
     <h1 class="portada-titulo">${esc(titulo)}</h1>
-    <p class="portada-sub">Cómo este instrumento normativo impacta tu libertad ciudadana y qué puedes hacer al respecto.</p>
-    <div class="portada-barras">${barrasHTML}</div>
-    <div class="portada-linea"></div>
-    <div class="portada-pie">Impactos de los artículos analizados sobre la libertad ciudadana · ${esc([pais, generadoEl].filter(Boolean).join(' · '))}</div>
   </div>
+  <div class="portada-hero">
+    <div class="portada-barras">${barrasHTML}</div>
+    <div class="portada-recomendacion">
+      <div class="recomendacion-pct">${veredicto.alineacionPorcentaje}% de impacto liberal.</div>
+      <div class="recomendacion-texto" style="color:${colorRecomendacion}">${esc(generarTextoAccionPortada(veredicto))}</div>
+    </div>
+  </div>
+  <div class="portada-pie">${esc([pais, generadoEl].filter(Boolean).join(' · '))}</div>
 </div>`;
 }
 
@@ -219,23 +240,16 @@ function generarTarjetaCriterioHTML(c, articulos) {
       </div>
       <div class="hallazgo-id">${esc(c.id)}</div>
       <div class="hallazgo-articulos">${esc(articulosTexto)}</div>
+      <div class="hallazgo-caption">${esc(c.pregunta || '')}</div>
     </div>`;
 }
 
 function generarLaminasHallazgosHTML(secciones, articulosPorCriterio) {
-  return HORIZONTES.map(h => {
-    const criterios = secciones[h.key];
-    if (criterios.length === 0) {
-      return `
-<div class="lamina-hallazgo">
-  <div class="hallazgo-header" style="border-color:${h.color}">
-    <span class="hallazgo-titulo" style="color:${h.color}">${h.nombre}</span>
-  </div>
-  <p class="hallazgo-vacio">Ningún criterio de este documento cae en este horizonte.</p>
-</div>`;
-    }
-    const bloques = partirEnBloques(criterios, 9);
-    return bloques.map((bloque, i) => `
+  return HORIZONTES
+    .filter(h => secciones[h.key].length > 0)
+    .map(h => {
+      const bloques = partirEnBloques(secciones[h.key], 9);
+      return bloques.map((bloque, i) => `
 <div class="lamina-hallazgo">
   <div class="hallazgo-header" style="border-color:${h.color}">
     <span class="hallazgo-titulo" style="color:${h.color}">${h.nombre}${i > 0 ? ' — cont.' : ''}</span>
@@ -244,7 +258,7 @@ function generarLaminasHallazgosHTML(secciones, articulosPorCriterio) {
     ${bloque.map(c => generarTarjetaCriterioHTML(c, articulosPorCriterio[c.id])).join('\n    ')}
   </div>
 </div>`).join('\n');
-  }).join('\n');
+    }).join('\n');
 }
 
 // ── Activismo ──────────────────────────────────────────────────────────
@@ -259,7 +273,7 @@ function generarLaminaVeredictoTotalHTML(veredicto) {
 <div class="lamina-activismo-total">
   <div class="activismo-eyebrow">Activismo · Auditoría Cívica Liberal</div>
   <h2 class="activismo-veredicto" style="color:${color}">${esc(titulo)}</h2>
-  <p class="activismo-alineacion">${veredicto.alineacionPorcentaje}% de alineación liberal — fuera de la banda de acción mixta (20%–80%).</p>
+  <p class="activismo-alineacion">${veredicto.alineacionPorcentaje}% de impacto liberal.</p>
   <div class="activismo-item-recomendacion" style="max-width:640px;">${esc(textoPlaceholderTotal(veredicto.modo))}</div>
 </div>`;
 }
@@ -287,14 +301,14 @@ function generarLaminaActivismoHorizonteHTML(h, criterios, articulosPorCriterio)
 </div>`;
 }
 
-function generarSeccionActivismoHTML(resumenHorizontes, secciones, articulosPorCriterio) {
-  const veredicto = calcularVeredictoActivismo(resumenHorizontes);
-
+function generarSeccionActivismoHTML(veredicto, secciones, articulosPorCriterio) {
   if (veredicto.modo !== 'hibrido') {
     return generarLaminaVeredictoTotalHTML(veredicto);
   }
-
-  return HORIZONTES.map(h => generarLaminaActivismoHorizonteHTML(h, secciones[h.key], articulosPorCriterio)).join('\n');
+  return HORIZONTES
+    .filter(h => secciones[h.key].length > 0)
+    .map(h => generarLaminaActivismoHorizonteHTML(h, secciones[h.key], articulosPorCriterio))
+    .join('\n');
 }
 
 // ── HTML completo ──────────────────────────────────────────────────────
@@ -303,12 +317,13 @@ function generarHTML(datos, metadatos) {
 
   const { enlaces } = calcularDatosGrafo(datos);
   const resumenHorizontes = calcularResumenHorizontes(enlaces);
+  const veredicto = calcularVeredictoActivismo(resumenHorizontes);
   const secciones = calcularSeccionesHorizonte(datos);
   const articulosPorCriterio = calcularArticulosPorCriterio(enlaces);
 
-  const portadaHTML   = generarPortadaHTML(titulo, pais, generadoEl, resumenHorizontes);
+  const portadaHTML   = generarPortadaHTML(titulo, pais, generadoEl, resumenHorizontes, veredicto);
   const hallazgosHTML = generarLaminasHallazgosHTML(secciones, articulosPorCriterio);
-  const activismoHTML = generarSeccionActivismoHTML(resumenHorizontes, secciones, articulosPorCriterio);
+  const activismoHTML = generarSeccionActivismoHTML(veredicto, secciones, articulosPorCriterio);
 
   return `<!DOCTYPE html>
 <html lang="es">
@@ -338,7 +353,7 @@ function registrarRutaHTMLTemporalPresentacion(app) {
   });
 }
 
-// ── Conversión HTML → PDF vía CloudConvert (sin cambios respecto a v1) ──
+// ── Conversión HTML → PDF vía CloudConvert (sin cambios respecto a v2) ──
 async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
   const CLOUDCONVERT_API_KEY = process.env.CLOUDCONVERT_API_KEY;
   if (!CLOUDCONVERT_API_KEY) throw new Error('Falta la variable de entorno CLOUDCONVERT_API_KEY');
@@ -441,10 +456,8 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 }
 
 // ── Función principal exportada ───────────────────────────────────────────
-// CAMBIO DE FIRMA respecto a v1: ya no recibe rutaImagenMapa (ver nota al
-// inicio del archivo) — actualizar la llamada en worker.js (/test-presentacion).
 async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.1`);
 
   const html     = generarHTML(datos, metadatos);
   const rutaHTML = rutaSalida.replace('.pdf', '.html');
