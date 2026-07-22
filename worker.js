@@ -1193,6 +1193,67 @@ app.post('/test-reporte', async (req, res) => {
   }
 });
 
+// ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
+// completada cuyo Paso 6.5 falló (ej. error 529 "Overloaded" de Claude,
+// transitorio, no bloqueante por diseño). No repite el análisis de los 28
+// criterios — solo re-descarga el PDF original (para titular los
+// artículos citados) y usa el reporte_texto que ya está guardado. Segura
+// de reintentar las veces que haga falta.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/regenerar-grafo?secret=acl-worker-2026-secreto&auditoria_id=ID_AQUI
+app.get('/regenerar-grafo', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+  const auditoria_id = req.query.auditoria_id;
+  if (!auditoria_id) {
+    return res.status(400).type('text/plain').send('Falta ?auditoria_id en la URL');
+  }
+
+  const dir = path.join(DIRECTORIO_TEMP, `regenerar-grafo-${auditoria_id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const result = await db.query(
+      `SELECT reporte_texto, pdf_drive_id, titulo_documento FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (!result.rows[0]?.reporte_texto) {
+      return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría.');
+    }
+    const { reporte_texto, pdf_drive_id, titulo_documento } = result.rows[0];
+    if (!pdf_drive_id) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene pdf_drive_id guardado — no se puede re-titular artículos.');
+    }
+
+    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id);
+
+    const rutaPDF = path.join(dir, 'original.pdf');
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    await descargarPDF(drive, pdf_drive_id, rutaPDF);
+    const textoPDF = await extraerTextoPDF(rutaPDF);
+
+    const articulosCitados = componentesUnicos(datosReporte);
+    let titulosArticulos = {};
+    if (articulosCitados.length > 0) {
+      titulosArticulos = await generarTitulosArticulos(textoPDF, articulosCitados, auditoria_id);
+    }
+    const grafoDatos = calcularDatosGrafo(datosReporte, titulosArticulos);
+    await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatos), auditoria_id]);
+
+    console.log(`   [REGENERAR-GRAFO] ✅ [${auditoria_id}] grafo_datos actualizado`);
+    res.type('text/plain').send(`✅ Listo — "${titulo_documento}": grafo_datos actualizado (${grafoDatos.nodos.length} nodos, ${grafoDatos.enlaces.length} enlaces). Refresca la página del Mapa Mental.`);
+
+  } catch (error) {
+    console.error(`   [REGENERAR-GRAFO] ❌ [${auditoria_id}] Error:`, error.message);
+    res.status(500).type('text/plain').send('Error: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // VERSIÓN GET del endpoint de arriba — mismo trabajo (regenera el PDF del
 // reporte de una auditoría con el diseño/fórmula más reciente y lo sube a
 // su misma carpeta de Drive), pero pegable directo en el navegador, como
