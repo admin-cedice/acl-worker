@@ -72,9 +72,7 @@ const SCHEMA_IDEAS_ACTIVISMO_TOTAL = {
   properties: {
     ideas: {
       type: 'array',
-      minItems: 3,
-      maxItems: 5,
-      description: 'De 3 a 5 ideas concretas de activismo cívico no violento.',
+      description: 'Un array con entre 3 y 5 ideas concretas de activismo cívico no violento — ni menos de 3 ni más de 5.',
       items: {
         type: 'object',
         properties: {
