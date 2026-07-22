@@ -2914,6 +2914,43 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
       console.error(`⚠️  [${auditoria_id}] No se pudieron generar los datos del grafo (no bloqueante):`, errorGrafo.message);
     }
 
+    console.log(`📁 [${auditoria_id}] Preparando carpeta de Drive...`);
+	    const carpetaId           = await obtenerCarpetaAuditoria(drive, auditoria_id);
+	    const identificadorLimpio = limpiarIdentificador(metadatos.identificador || metadatos.titulo);
+
+	    console.log(`🎙️  [${auditoria_id}] PASO 6.6: Generando guion y audio del podcast...`);
+	    let linkPodcast = null;
+	    try {
+	      const resultadoGuion = await generarYRevisarGuion(datosReporte, { titulo: metadatos.titulo, pais: metadatos.pais || '' });
+	      const rutaMp3 = path.join(dir, 'podcast.mp3');
+	      const fraseDinamica = `Hoy nos ocupamos de: ${metadatos.titulo}.`;
+	      await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica });
+	      linkPodcast = await subirArchivo(drive, rutaMp3, `Podcast_${identificadorLimpio}.mp3`, 'audio/mpeg', carpetaId);
+	      console.log(`✅ [${auditoria_id}] Podcast generado y subido — veredicto del revisor: ${resultadoGuion.veredicto}`);
+	    } catch (errorPodcast) {
+	      console.error(`⚠️  [${auditoria_id}] No se pudo generar el podcast (no bloqueante):`, errorPodcast.message);
+	    }
+
+	    console.log(`📊 [${auditoria_id}] PASO 6.7: Generando Presentación...`);
+	    let linkPresentacion = null;
+	    try {
+	      const rutaPresentacionPDF = path.join(dir, 'presentacion.pdf');
+	      await generarPresentacionPDF(
+	        datosReporte,
+	        {
+	          titulo: metadatos.titulo,
+	          pais: metadatos.pais || '',
+	          generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
+	        },
+	        rutaPresentacionPDF,
+	        auditoria_id
+	      );
+	      linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
+	      console.log(`✅ [${auditoria_id}] Presentación generada y subida`);
+	    } catch (errorPresentacion) {
+	      console.error(`⚠️  [${auditoria_id}] No se pudo generar la Presentación (no bloqueante):`, errorPresentacion.message);
+    }
+
     // ── PASOS TEMPORALMENTE DESACTIVADOS (3 jul 2026) ──────────────────────
     // NotebookLM (audio), PPTX y mapa mental quedan en pausa mientras se
     // define el nuevo camino para el audio (Google Vertex AI+TTS o
@@ -2921,29 +2958,31 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     // dispararNotebookLM(), generarPresentacion() y generarMapaMental()
     // siguen definidas más abajo — reactivar aquí cuando corresponda.
 
-    console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo archivos a Drive...`);
-    const carpetaId           = await obtenerCarpetaAuditoria(drive, auditoria_id);
-    const identificadorLimpio = limpiarIdentificador(metadatos.identificador || metadatos.titulo);
-    const linkOriginal        = await subirArchivo(drive, rutaPDF, `${identificadorLimpio}_original.pdf`, 'application/pdf', carpetaId);
-    const linkReporte         = await subirArchivo(drive, rutaReportePDF, `Auditoria_de_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
+    console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo original y reporte a Drive...`);
+	    const linkOriginal = await subirArchivo(drive, rutaPDF, `${identificadorLimpio}_original.pdf`, 'application/pdf', carpetaId);
+	    const linkReporte  = await subirArchivo(drive, rutaReportePDF, `Auditoria_de_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 
-    await db.query(
-      `UPDATE auditorias
-       SET estado = 'completada',
-           link_original = $1, link_reporte = $2,
-           drive_carpeta_id = $3, completada_en = NOW(),
-           puntaje = $5
-       WHERE id = $4`,
-      [linkOriginal, linkReporte, carpetaId, auditoria_id, datosReporte.puntaje]
-    );
+	    await db.query(
+	      `UPDATE auditorias
+	       SET estado = 'completada',
+	           link_original = $1,
+	           link_reporte = $2,
+	           link_podcast = $3,
+	           link_presentacion = $4,
+	           drive_carpeta_id = $5,
+	           completada_en = NOW(),
+	           puntaje = $6
+	       WHERE id = $7`,
+	      [linkOriginal, linkReporte, linkPodcast, linkPresentacion, carpetaId, datosReporte.puntaje, auditoria_id]
+	    );
     console.log(`✅ [${auditoria_id}] Archivos subidos a Drive`);
 
     console.log(`📧 [${auditoria_id}] PASO 8: Enviando email al ciudadano...`);
-    await enviarEmailFinal(ciudadano_email, metadatos.titulo, auditoria_id, {
-      original: linkOriginal,
-      reporte:  linkReporte,
-      // podcast, presentacion y mapa se omiten — enviarEmailFinal ya los
-      // renderiza condicionalmente, así que no aparecen en el correo.
+	    await enviarEmailFinal(ciudadano_email, metadatos.titulo, auditoria_id, {
+	      original: linkOriginal,
+	      reporte: linkReporte,
+	      podcast: linkPodcast,
+	      presentacion: linkPresentacion,
     });
     console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
 
