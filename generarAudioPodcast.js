@@ -48,13 +48,15 @@ const ELEVENLABS_API_URL = 'https://api.elevenlabs.io/v1/text-to-dialogue';
 const MAX_CHARS_POR_LOTE = 1800; // colchón de seguridad bajo el límite real (~2000)
 const DURACION_PAUSA_DEFECTO = 0.8; // segundos
 
-// Voces vigentes desde el 20 jul 2026 — reemplazan a Janet Morales /
-// Roderick (las de junio-julio dejaron de estar disponibles al migrar de
-// cuenta de ElevenLabs). Mismo reparto de roles: Anita toma el papel de
-// analista, Erick el de ciudadano curioso.
+// Voces vigentes desde el 22 jul 2026 — reemplazan a las anteriores
+// (activas desde el 20 jul). Los PERSONAJES siguen siendo los mismos
+// (Anita = analista, Erick = ciudadano curioso; el guion sigue etiquetando
+// sus líneas como "ANITA:"/"ERICK:" — ver parsearGuionADialogo() abajo,
+// sin cambios) — lo único que cambia es qué voz de ElevenLabs interpreta
+// cada rol: Katy interpreta a Anita, Frank interpreta a Erick.
 const VOZ_ID = {
-  ANITA: 'a7NxsR5B1mpwgpVa10g3', // Anita — analista
-  ERICK: 'TYqnEp5FYmaKfdSGcRoE', // Erick — ciudadano curioso
+  ANITA: 'EYBbN7OENxAX5QX56IiW', // Anita — analista (voz: Katy)
+  ERICK: '7UB6WMKyZDj19XRGC8Sb', // Erick — ciudadano curioso (voz: Frank)
 };
 
 // Textos de las 2 piezas fijas de la cortina, aprobados el 18 jul 2026.
