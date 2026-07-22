@@ -201,6 +201,7 @@ module.exports = {
   componentesUnicos,
   generarTitulosArticulos,
   calcularDatosGrafo,
+  calcularResumenHorizontes,
 };
 
 const HORIZONTE_POR_RESULTADO = {
