@@ -1331,22 +1331,17 @@ app.get('/test-presentacion', async (req, res) => {
   try {
     const datos = normalizarDatosEstructurados(fila.reporte_texto, fila.id);
 
-    console.log(`   [TEST-PRESENTACION] Dibujando Mapa Mental para: ${fila.titulo_documento}`);
-    const rutaMapaPNG = path.join(dir, 'mapa.png');
-    await generarGrafoPorHorizonte(datos, fila.titulo_documento, rutaMapaPNG, fila.id);
-
-    console.log(`   [TEST-PRESENTACION] Generando PDF de la presentación...`);
-    const rutaPDF = path.join(dir, 'presentacion.pdf');
-    await generarPresentacionPDF(
-      datos,
-      {
-        titulo: fila.titulo_documento,
-        pais: fila.pais || '',
-        generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
-      },
-      rutaMapaPNG,
-      rutaPDF,
-      fila.id
+	    console.log(`   [TEST-PRESENTACION] Generando PDF de la presentación...`);
+	    const rutaPDF = path.join(dir, 'presentacion.pdf');
+	    await generarPresentacionPDF(
+	      datos,
+	      {
+	        titulo: fila.titulo_documento,
+	        pais: fila.pais || '',
+	        generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
+	      },
+	      rutaPDF,
+	      fila.id
     );
 
     console.log(`   [TEST-PRESENTACION] Subiendo a Drive (carpeta de pruebas)...`);
