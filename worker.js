@@ -45,7 +45,8 @@
 const { generarPodcastPrueba } = require('./testPodcast');
 const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA, normalizarDatosEstructurados } = require('./generarReportePDF');
 const { generarYRevisarGuion } = require('./generarGuionPresentacion');
-const { componentesUnicos, generarTitulosArticulos, calcularDatosGrafo } = require('./generarDatosGrafo');
+const { componentesUnicos, generarTitulosArticulos, calcularDatosGrafo, calcularResumenHorizontes } = require('./generarDatosGrafo');
+const { calcularVeredictoActivismo, generarIdeasActivismoTotal } = require('./generarActivismo');
 const { generarPresentacionPDF, registrarRutaHTMLTemporalPresentacion } = require('./generarPresentacionPDF');
 const {
   generarPodcastMp3,
@@ -1201,6 +1202,85 @@ app.post('/test-reporte', async (req, res) => {
 // En el navegador:
 //   https://acl-worker-production.up.railway.app/test-reporte?secret=acl-worker-2026-secreto&auditoria_id=ID_AQUI
 //   (sin auditoria_id: usa la auditoría completada más reciente)
+app.get('/test-activismo', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  let fila;
+  try {
+    const auditoria_id = req.query.auditoria_id;
+    if (auditoria_id) {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais FROM auditorias WHERE id = $1`,
+        [auditoria_id]
+      );
+      fila = result.rows[0];
+    } else {
+      const result = await db.query(
+        `SELECT id, reporte_texto, titulo_documento, pais
+         FROM auditorias
+         WHERE estado = 'completada' AND reporte_texto IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      fila = result.rows[0];
+    }
+  } catch (error) {
+    return res.status(500).type('text/plain').send('Error consultando la base de datos: ' + error.message);
+  }
+
+  if (!fila?.reporte_texto) {
+    return res.status(404).type('text/plain').send('No se encontró ninguna auditoría con reporte_texto.');
+  }
+
+  res.type('text/plain; charset=utf-8');
+  res.write(`Calculando veredicto y generando ideas de activismo para "${fila.titulo_documento}"...\n`);
+  const heartbeat = setInterval(() => res.write(' '), 12000);
+
+  try {
+    const datos = normalizarDatosEstructurados(fila.reporte_texto, fila.id);
+    const { enlaces } = calcularDatosGrafo(datos);
+    const resumenHorizontes = calcularResumenHorizontes(enlaces);
+    const veredicto = calcularVeredictoActivismo(resumenHorizontes);
+
+    if (veredicto.modo === 'hibrido') {
+      clearInterval(heartbeat);
+      return res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+VEREDICTO: HÍBRIDO (${veredicto.alineacionPorcentaje}% de impacto liberal — banda 20%-80%)
+
+Este caso todavía no genera ideas — la versión artículo por artículo se construye en una siguiente sesión. Prueba con una auditoría que dé menos de 20% o más de 80% de impacto liberal.
+`);
+    }
+
+    console.log(`   [TEST-ACTIVISMO] Generando ideas (${veredicto.modo}) para: ${fila.titulo_documento}`);
+    const ideas = await generarIdeasActivismoTotal(
+      datos,
+      { titulo: fila.titulo_documento, pais: fila.pais || '' },
+      veredicto,
+      fila.id
+    );
+    const ideasTexto = ideas.map((idea, i) => `${i + 1}. ${idea.titulo}\n   ${idea.descripcion}`).join('\n\n');
+
+    clearInterval(heartbeat);
+    res.end(`
+
+AUDITORÍA: ${fila.titulo_documento}
+VEREDICTO: ${veredicto.modo.toUpperCase()} (${veredicto.alineacionPorcentaje}% de impacto liberal)
+
+IDEAS DE ACTIVISMO:
+
+${ideasTexto}
+
+(Esta prueba NO escribió nada en la base de datos.)
+`);
+  } catch (error) {
+    clearInterval(heartbeat);
+    console.error('   [TEST-ACTIVISMO] ❌ Error:', error.message);
+    res.end('\n\nError: ' + error.message);
+  }
+});
 app.get('/test-reporte', async (req, res) => {
   if (req.query.secret !== WORKER_SECRET) {
     return res.status(401).type('text/plain').send('No autorizado');
