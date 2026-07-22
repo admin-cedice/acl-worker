@@ -50,14 +50,26 @@ function esc(str) {
 // hallazgos, hoy sin llamarse ──────────────────────────────────────────
 const RUTA_BASE_IMAGENES = 'https://liberalmente.app/presentacion';
 
-// Una ilustración genérica por categoría de canal — NO una por idea.
-// Solo 'redes_sociales' existe hoy (ver nota de cabecera).
+// Una ilustración genérica por categoría de la taxonomía de 14 (Moisés,
+// vía ChatGPT, 22 jul 2026) — NO una por idea. Solo 'redes_sociales'
+// existe hoy; el resto muestra el color liso de respaldo (ver
+// .idea-ilustracion) hasta que se produzcan y suban con estos nombres
+// exactos a public/presentacion/ del repo auditoria-civica-liberal.
 const ILUSTRACION_POR_CATEGORIA = {
-  redes_sociales: 'activismo-redes-sociales.png',
-  carta:          'activismo-carta.png',
-  foro:           'activismo-foro.png',
-  monitoreo:      'activismo-monitoreo.png',
-  medios:         'activismo-medios.png',
+  redes_sociales:            'activismo-redes-sociales.png',
+  contacto_representantes:   'activismo-contacto-representantes.png',
+  deliberacion_publica:      'activismo-deliberacion-publica.png',
+  prensa_medios:             'activismo-prensa-medios.png',
+  movilizacion_ciudadana:    'activismo-movilizacion-ciudadana.png',
+  peticiones_adhesiones:     'activismo-peticiones-adhesiones.png',
+  evidencia_argumentos:      'activismo-evidencia-argumentos.png',
+  comunitario_territorial:   'activismo-comunitario-territorial.png',
+  electoral:                 'activismo-electoral.png',
+  accion_juridica:           'activismo-accion-juridica.png',
+  economico:                 'activismo-economico.png',
+  educacion_multiplicadores: 'activismo-educacion-multiplicadores.png',
+  creativo_cultural:         'activismo-creativo-cultural.png',
+  coaliciones:               'activismo-coaliciones.png',
 };
 
 const HORIZONTES = [
