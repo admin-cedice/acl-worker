@@ -1,6 +1,24 @@
-// worker.js — ACL Worker v3.5
+// worker.js — ACL Worker v3.6
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.6 (27 jul 2026): estado de fallo técnico renombrado de 'error' a
+// 'fallida' en todo el archivo, para que coincida con el esquema
+// documentado (pendiente|admitida|completada|fallida|rechazada — ya sin
+// 'parcialmente_completada', ver más abajo). Se eliminaron /regenerar-audio
+// y /completar-audio (junto con completarConAudio()) — eran el flujo de
+// NotebookLM Enterprise manual (crear notebook → editor genera audio a
+// mano → sube el wav), superado desde que el podcast se genera solo con
+// Claude + ElevenLabs dentro de procesarAuditoria() (PASO 6.6, 22 jul
+// 2026). En su lugar se agregó /regenerar-podcast, mismo patrón que
+// /regenerar-grafo y /regenerar-presentacion: reintenta solo esa pieza
+// sobre una auditoría ya completada, sin tocar el campo estado — así el
+// pipeline solo puede terminar en 'completada' o 'fallida', nunca en un
+// estado intermedio esperando una acción manual. Las funciones de
+// NotebookLM (dispararNotebookLM, nlm*, slugificar, convertirWavAMp3)
+// quedan intactas y sin usar, mismo criterio que ya se aplicaba a
+// generarPresentacion()/generarMapaMental() (versiones viejas) — no se
+// borran, por si hace falta reactivar o comparar.
 //
 // v3.5 (26 jul 2026): limpieza de seguridad — se eliminaron todos los
 // endpoints de "PRUEBA TEMPORAL" / "ENDPOINT TEMPORAL" que ya habían
@@ -217,6 +235,8 @@ async function obtenerTokenGoogle() {
 }
 
 // ── NotebookLM Enterprise API ────────────────────────────────────────────────
+// Sin usar en producción desde el 27 jul 2026 (ver changelog v3.6 arriba) —
+// se deja intacta, no se borra, por si hace falta reactivar o comparar.
 
 const NLM_BASE    = 'https://global-discoveryengine.googleapis.com/v1alpha';
 const NLM_PROJECT = process.env.GOOGLE_CLOUD_PROJECT_NUMBER || '721904248474';
@@ -288,6 +308,7 @@ async function nlmEliminarNotebook(notebookId) {
 }
 
 // ── Fase API de NotebookLM (solo dispara — no espera ni descarga) ─────────────
+// Sin usar en producción desde el 27 jul 2026 — se deja intacta.
 
 async function dispararNotebookLM(reporteTexto, titulo, auditoria_id) {
   console.log(`   [${auditoria_id}] Creando notebook en NotebookLM...`);
@@ -303,6 +324,8 @@ async function dispararNotebookLM(reporteTexto, titulo, auditoria_id) {
 
 // ── Utilidades de audio ──────────────────────────────────────────────────────
 
+// slugificar() y convertirWavAMp3() quedan sin usar desde el 27 jul 2026
+// (eran del flujo manual de NotebookLM) — se dejan intactas, no se borran.
 function slugificar(texto) {
   return texto
     .toLowerCase()
@@ -1136,7 +1159,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.5', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.6', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1262,6 +1285,71 @@ app.get('/regenerar-presentacion', async (req, res) => {
 
   } catch (error) {
     console.error(`   [REGENERAR-PRESENTACION] ❌ [${auditoria_id}] Error:`, error.message);
+    res.status(500).type('text/plain').send('Error: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ENDPOINT DE RECUPERACIÓN — regenera solo el Podcast de una auditoría ya
+// completada, sin repetir el análisis de los 28 criterios. Sube el mp3
+// nuevo a la MISMA carpeta de Drive de la auditoría y actualiza
+// link_podcast. Reemplaza a /regenerar-audio + /completar-audio (27 jul
+// 2026): esa pareja de endpoints creaba un notebook en NotebookLM
+// Enterprise y dejaba la auditoría en 'parcialmente_completada' esperando
+// que un editor generara y subiera el audio a mano — flujo superado desde
+// que el podcast se genera solo con Claude + ElevenLabs (PASO 6.6 de
+// procesarAuditoria). Mismo criterio que /regenerar-grafo y
+// /regenerar-presentacion: nunca deja la auditoría en un estado
+// intermedio, solo actualiza link_podcast cuando termina.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/regenerar-podcast?secret=TU_SECRETO_NUEVO&auditoria_id=ID_AQUI
+app.get('/regenerar-podcast', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+  const auditoria_id = req.query.auditoria_id;
+  if (!auditoria_id) {
+    return res.status(400).type('text/plain').send('Falta ?auditoria_id en la URL');
+  }
+
+  const dir = path.join(DIRECTORIO_TEMP, `regenerar-podcast-${auditoria_id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const result = await db.query(
+      `SELECT reporte_texto, titulo_documento, pais, drive_carpeta_id FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (!result.rows[0]?.reporte_texto) {
+      return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría.');
+    }
+    const { reporte_texto, titulo_documento, pais, drive_carpeta_id } = result.rows[0];
+    if (!drive_carpeta_id) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene drive_carpeta_id guardado.');
+    }
+
+    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id);
+
+    console.log(`   [REGENERAR-PODCAST] Generando guion y audio para: ${titulo_documento}`);
+    const resultadoGuion = await generarYRevisarGuion(datosReporte, { titulo: titulo_documento, pais: pais || '' });
+    const rutaMp3 = path.join(dir, 'podcast.mp3');
+    const fraseDinamica = `Hoy nos ocupamos de: ${titulo_documento}.`;
+    await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica });
+
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const identificadorLimpio = limpiarIdentificador(titulo_documento);
+    const link = await subirArchivo(drive, rutaMp3, `Podcast_${identificadorLimpio}.mp3`, 'audio/mpeg', drive_carpeta_id);
+
+    await db.query(`UPDATE auditorias SET link_podcast = $1 WHERE id = $2`, [link, auditoria_id]);
+
+    console.log(`   [REGENERAR-PODCAST] ✅ [${auditoria_id}] link_podcast actualizado`);
+    res.type('text/plain').send(`✅ Listo — "${titulo_documento}": Podcast regenerado y subido (veredicto del revisor: ${resultadoGuion.veredicto}).\n${link}\n\n(link_podcast actualizado — el botón de la biblioteca ya apunta acá.)`);
+
+  } catch (error) {
+    console.error(`   [REGENERAR-PODCAST] ❌ [${auditoria_id}] Error:`, error.message);
     res.status(500).type('text/plain').send('Error: ' + error.message);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1506,40 +1594,6 @@ app.post('/procesar', async (req, res) => {
   procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id).catch(err => {
     console.error(`❌ [${auditoria_id}] Error no capturado:`, err.message);
   });
-});
-
-// Regenera el Audio Overview de una auditoría ya procesada
-// Útil cuando el audio anterior estaba en el idioma incorrecto o falló
-app.post('/regenerar-audio', async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
-  const { auditoria_id } = req.body;
-  if (!auditoria_id) {
-    return res.status(400).json({ error: 'Falta auditoria_id' });
-  }
-  try {
-    const result = await db.query(
-      `SELECT reporte_texto, titulo_documento FROM auditorias WHERE id = $1`,
-      [auditoria_id]
-    );
-    if (!result.rows[0]?.reporte_texto) {
-      return res.status(404).json({ error: 'No se encontró el reporte en BD' });
-    }
-    const { reporte_texto, titulo_documento } = result.rows[0];
-    console.log(`   [${auditoria_id}] Regenerando Audio Overview...`);
-    const notebookId = await dispararNotebookLM(reporte_texto, titulo_documento, auditoria_id);
-    await db.query(
-      `UPDATE auditorias SET notebook_id = $1, estado = 'parcialmente_completada' WHERE id = $2`,
-      [notebookId, auditoria_id]
-    );
-    const notebookUrl = `https://notebooklm.cloud.google.com/global/notebook/${notebookId}?project=${NLM_PROJECT}`;
-    console.log(`   [${auditoria_id}] Notebook regenerado: ${notebookId}`);
-    res.json({ ok: true, notebookId, notebookUrl });
-  } catch (error) {
-    console.error(`❌ [${auditoria_id}] Error regenerando audio:`, error.message);
-    res.status(500).json({ error: error.message });
-  }
 });
 
 // Revierte un rechazo automático del filtro de admisibilidad — el admin
@@ -2044,21 +2098,6 @@ app.post('/manual/activar', async (req, res) => {
   }
 });
 
-// Recibe el archivo .wav binario, convierte a .mp3 y completa la auditoría
-app.post('/completar-audio', express.raw({ type: '*/*', limit: '200mb' }), async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
-  const auditoria_id = req.headers['x-auditoria-id'];
-  if (!auditoria_id || !req.body?.length) {
-    return res.status(400).json({ error: 'Faltan auditoria_id o archivo de audio' });
-  }
-  res.json({ mensaje: 'Audio recibido, procesando', auditoria_id });
-  completarConAudio(auditoria_id, req.body).catch(err => {
-    console.error(`❌ [${auditoria_id}] Error al completar con audio:`, err.message);
-  });
-});
-
 // ── Función principal ────────────────────────────────────────────────────────
 
 async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, saltarFiltro = false) {
@@ -2241,7 +2280,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 
   } catch (error) {
     console.error(`❌ [${auditoria_id}] Error:`, error.message);
-    await actualizarEstado(auditoria_id, 'error').catch(() => {});
+    await actualizarEstado(auditoria_id, 'fallida').catch(() => {});
     await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`, [error.message, auditoria_id]).catch(() => {});
 
     const filaActual = await db.query(`SELECT titulo_documento FROM auditorias WHERE id = $1`, [auditoria_id]).catch(() => null);
@@ -2258,76 +2297,6 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(`🧹 [${auditoria_id}] Archivos temporales eliminados`);
-  }
-}
-
-// ── Completar auditoría con audio ────────────────────────────────────────────
-
-async function completarConAudio(auditoria_id, audioBuffer) {
-  console.log(`\n🎙️  [${auditoria_id}] Completando auditoría con audio...`);
-  const dir = path.join(DIRECTORIO_TEMP, `audio-${auditoria_id}`);
-  fs.mkdirSync(dir, { recursive: true });
-  try {
-    const result = await db.query(
-      `SELECT a.titulo_documento, a.notebook_id, a.drive_carpeta_id,
-              c.email AS ciudadano_email,
-              a.link_original, a.link_reporte, a.link_presentacion, a.link_mapa
-       FROM auditorias a
-       JOIN ciudadanos c ON c.id = a.ciudadano_id
-       WHERE a.id = $1`,
-      [auditoria_id]
-    );
-    if (!result.rows[0]) throw new Error('Auditoría no encontrada');
-    const { titulo_documento, notebook_id, drive_carpeta_id,
-            ciudadano_email, link_original, link_reporte,
-            link_presentacion, link_mapa } = result.rows[0];
-
-    // Guardar .wav recibido
-    const rutaWav = path.join(dir, 'audio.wav');
-    fs.writeFileSync(rutaWav, audioBuffer);
-    console.log(`   [${auditoria_id}] .wav guardado (${audioBuffer.length} bytes)`);
-
-    // Convertir a .mp3 con nombre descriptivo
-    const nombreMp3 = `podcast-${slugificar(titulo_documento || auditoria_id)}.mp3`;
-    const rutaMp3   = path.join(dir, nombreMp3);
-    console.log(`   [${auditoria_id}] Convirtiendo a MP3: ${nombreMp3}...`);
-    await convertirWavAMp3(rutaWav, rutaMp3);
-    console.log(`   [${auditoria_id}] Conversión completada`);
-
-    // Subir .mp3 a Drive
-    const driveAuth  = autenticarDrive();
-    const drive      = google.drive({ version: 'v3', auth: driveAuth });
-    const linkPodcast = await subirArchivo(drive, rutaMp3, nombreMp3, 'audio/mpeg', drive_carpeta_id);
-    console.log(`   [${auditoria_id}] Audio subido a Drive`);
-
-    // Actualizar BD
-    await db.query(
-      `UPDATE auditorias SET estado = 'completada', link_podcast = $1, completada_en = NOW() WHERE id = $2`,
-      [linkPodcast, auditoria_id]
-    );
-
-    // Eliminar notebook de NotebookLM
-    if (notebook_id) {
-      await nlmEliminarNotebook(notebook_id).catch(() => {});
-      console.log(`   [${auditoria_id}] Notebook eliminado`);
-    }
-
-    // Email final con los 5 links
-    await enviarEmailFinal(ciudadano_email, titulo_documento, auditoria_id, {
-      original:     link_original,
-      reporte:      link_reporte,
-      podcast:      linkPodcast,
-      presentacion: link_presentacion,
-      mapa:         link_mapa,
-    });
-
-    console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
-
-  } catch (error) {
-    console.error(`❌ [${auditoria_id}] Error al completar con audio:`, error.message);
-    throw error;
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -2642,11 +2611,12 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.5 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.6 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
+  console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
-  console.log(`   PAUSADO: Audio (NotebookLM), PPTX y mapa mental — pendiente definir`);
-  console.log(`   nuevo camino de audio (Google Vertex AI+TTS / ElevenLabs) y revisar diseño`);
-  console.log(`   Funciones intactas y listas para reactivar: dispararNotebookLM(),`);
-  console.log(`   generarPresentacion(), generarMapaMental(), /completar-audio, /regenerar-audio\n`);
+  console.log(`   Recuperación puntual: /regenerar-grafo, /regenerar-presentacion, /regenerar-podcast`);
+  console.log(`   Estados posibles: pendiente → admitida → completada | fallida (o rechazada por el filtro)`);
+  console.log(`   Funciones NotebookLM intactas sin usar (dispararNotebookLM, generarPresentacion viejo,`);
+  console.log(`   generarMapaMental viejo) — por si hace falta reactivar o comparar\n`);
 });
