@@ -32,6 +32,15 @@
 // generarReportePDF.js desde la lección del 7 jul (un salto de línea real
 // dentro de un string JSON rompe JSON.parse; texto con marcadores no tiene
 // esa fragilidad).
+//
+// FIX (27 jul 2026): con max_tokens: 8000 el guion volvió a cortarse a
+// media palabra en una auditoría real (Reforma de la Ley Orgánica del
+// Sistema y Servicio Eléctrico — documento largo y con muchas alertas),
+// igual que ya había pasado el 17 jul con el límite anterior de 4000. Se
+// sube a 16000 en generarGuion() Y en revisarGuion() (el revisor necesita
+// el mismo margen, porque también devuelve el guion completo dentro de
+// GUION_FINAL). Si vuelve a pasar, el chequeo de stop_reason === 'max_tokens'
+// lo va a decir explícitamente, nunca en silencio.
 
 'use strict';
 
@@ -230,23 +239,19 @@ async function generarGuion(datos, metadatos) {
 
   console.log(`   [generarGuion] Escenas seleccionadas: ${escenas.nucleo.length} del núcleo, balance: ${escenas.balance ? escenas.balance.id : 'ninguno'}, tono: ${escenas.tonoGeneral}`);
 
-  // FIX (17 jul 2026): con max_tokens: 4000 el guion se cortó a media
-  // palabra en la primera prueba real (Hidrocarburos) — casi con certeza
-  // porque el pensamiento adaptativo de Sonnet 5 consume del mismo
-  // presupuesto de max_tokens (misma lección del 3 jul con
-  // analizarConClaude, que por esto mismo subió de 8000 a 16000). Subido
-  // a 8000 acá como colchón; si vuelve a pasar, el chequeo de abajo lo va
-  // a decir explícitamente en vez de dejar pasar un guion roto en
-  // silencio (que además le quita al revisor la posibilidad de hacer una
-  // revisión de calidad real — termina "parchando" un corte, no editando).
+  // FIX (27 jul 2026): subido de 8000 a 16000 — ver nota de changelog al
+  // inicio del archivo. Mismo motivo que la subida anterior del 17 jul
+  // (4000 → 8000): el pensamiento adaptativo de Sonnet 5 consume del
+  // mismo presupuesto de max_tokens que el guion en sí, y un documento
+  // largo con varias escenas puede agotarlo.
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 8000,
+    max_tokens: 16000,
     messages: [{ role: 'user', content: prompt }],
   });
 
   if (response.stop_reason === 'max_tokens') {
-    throw new Error('generarGuion: respuesta cortada por max_tokens (8000) — el guion quedó incompleto. Subir max_tokens más, o revisar si el prompt está pidiendo demasiado.');
+    throw new Error('generarGuion: respuesta cortada por max_tokens (16000) — el guion quedó incompleto. Subir max_tokens más, o revisar si el prompt está pidiendo demasiado.');
   }
 
   const guion = extraerTextoRespuesta(response);
@@ -258,17 +263,17 @@ async function revisarGuion(guion, escenas) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const prompt = construirPromptRevisor(guion, escenas);
 
-  // Mismo colchón que el generador — el revisor tiene que poder devolver
-  // el guion completo (GUION_FINAL) más las notas, así que necesita al
-  // menos el mismo margen.
+  // Mismo colchón que el generador (27 jul 2026: 8000 → 16000) — el
+  // revisor tiene que poder devolver el guion completo (GUION_FINAL) más
+  // las notas, así que necesita al menos el mismo margen.
   const response = await anthropic.messages.create({
     model: 'claude-opus-4-8',
-    max_tokens: 8000,
+    max_tokens: 16000,
     messages: [{ role: 'user', content: prompt }],
   });
 
   if (response.stop_reason === 'max_tokens') {
-    throw new Error('revisarGuion: respuesta cortada por max_tokens (8000) — la revisión quedó incompleta.');
+    throw new Error('revisarGuion: respuesta cortada por max_tokens (16000) — la revisión quedó incompleta.');
   }
 
   const textoRespuesta = extraerTextoRespuesta(response);
