@@ -1,6 +1,20 @@
-// worker.js — ACL Worker v3.7
+// worker.js — ACL Worker v3.8
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.8 (28 jul 2026): el grafo (Mapa Mental) ya no usa regex para decidir
+// qué es un artículo real — se rompía con leyes de REFORMA (Claude cita
+// ahí cosas como "Artículo 4 (reforma del artículo 14, numeral 8)", con
+// paréntesis explicativo, que el regex descartaba entero en vez de
+// recortar). Caso real: Ley de Reforma de la Ley Contra la Estafa
+// Inmobiliaria — el grafo mostró 1 solo artículo de 28 citados. Se
+// reemplaza normalizarComponentes() + generarTitulosArticulos() por
+// generarGrafoConClaude() (ver generarDatosGrafo.js): un único llamado a
+// Claude que identifica, clasifica (modifica/suprime/agrega un artículo de
+// la ley vigente, o ninguna) y titula los artículos reales, todo con
+// instrucciones explícitas en el prompt, no con un patrón fijo. Mismo
+// aprendizaje que ya se aplicó el 16 jul al análisis principal de 28
+// criterios.
 //
 // v3.7 (28 jul 2026): las Fuentes Doctrinales ahora guardan una categoría
 // real (columna 'categoria' en fuentes_doctrinales — ver
@@ -84,7 +98,7 @@
 const { generarPodcastPrueba } = require('./testPodcast');
 const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA, normalizarDatosEstructurados } = require('./generarReportePDF');
 const { generarYRevisarGuion } = require('./generarGuionPresentacion');
-const { componentesUnicos, generarTitulosArticulos, calcularDatosGrafo, calcularResumenHorizontes } = require('./generarDatosGrafo');
+const { generarGrafoConClaude, calcularDatosGrafo, calcularResumenHorizontes } = require('./generarDatosGrafo');
 const { calcularVeredictoActivismo, generarIdeasActivismoTotal } = require('./generarActivismo');
 const { generarPresentacionPDF, registrarRutaHTMLTemporalPresentacion } = require('./generarPresentacionPDF');
 const {
@@ -1167,7 +1181,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.7', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.8', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1212,12 +1226,8 @@ app.get('/regenerar-grafo', async (req, res) => {
     await descargarPDF(drive, pdf_drive_id, rutaPDF);
     const textoPDF = await extraerTextoPDF(rutaPDF);
 
-    const articulosCitados = componentesUnicos(datosReporte);
-    let titulosArticulos = {};
-    if (articulosCitados.length > 0) {
-      titulosArticulos = await generarTitulosArticulos(textoPDF, articulosCitados, auditoria_id);
-    }
-    const grafoDatos = calcularDatosGrafo(datosReporte, titulosArticulos);
+    const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id);
+    const grafoDatos = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id);
     await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatos), auditoria_id]);
 
     console.log(`   [REGENERAR-GRAFO] ✅ [${auditoria_id}] grafo_datos actualizado`);
@@ -2197,14 +2207,10 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     );
     console.log(`✅ [${auditoria_id}] PDF del reporte generado — alineación: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'}`);
 
-    console.log(`🕸️  [${auditoria_id}] PASO 6.5: Generando datos del grafo (títulos de artículo)...`);
+    console.log(`🕸️  [${auditoria_id}] PASO 6.5: Generando datos del grafo (artículos + citas con Claude)...`);
     try {
-      const articulosCitados = componentesUnicos(datosReporte);
-      let titulosArticulos = {};
-      if (articulosCitados.length > 0) {
-        titulosArticulos = await generarTitulosArticulos(textoPDF, articulosCitados, auditoria_id);
-      }
-      const grafoDatos = calcularDatosGrafo(datosReporte, titulosArticulos);
+      const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id);
+      const grafoDatos = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id);
       await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatos), auditoria_id]);
       console.log(`✅ [${auditoria_id}] Datos del grafo guardados (${grafoDatos.nodos.length} nodos, ${grafoDatos.enlaces.length} enlaces)`);
     } catch (errorGrafo) {
@@ -2619,10 +2625,12 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.7 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.8 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
+  console.log(`   PASO 6.5 usa generarGrafoConClaude() desde el 28 jul 2026 — sin regex, identifica y`);
+  console.log(`   clasifica artículos (incluye leyes de reforma) con instrucciones de prompt`);
   console.log(`   Recuperación puntual: /regenerar-grafo, /regenerar-presentacion, /regenerar-podcast`);
   console.log(`   Estados posibles: pendiente → admitida → completada | fallida (o rechazada por el filtro)`);
   console.log(`   Fuentes Doctrinales: campo 'categoria' activo en subir/completar-subida-media/lista-admin/editar`);
