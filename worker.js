@@ -1,6 +1,14 @@
-// worker.js — ACL Worker v3.6
+// worker.js — ACL Worker v3.7
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.7 (28 jul 2026): las Fuentes Doctrinales ahora guardan una categoría
+// real (columna 'categoria' en fuentes_doctrinales — ver
+// migracion-categoria-fuentes.sql) en vez de vivir clasificadas a mano en
+// el código del sitio. Los 4 endpoints de /fuentes/ que crean o editan una
+// fuente (subir, completar-subida-media, lista-admin, editar) ahora leen
+// y escriben ese campo. Si no se manda categoría, cae en 'otros' — nunca
+// queda sin clasificar del todo.
 //
 // v3.6 (27 jul 2026): estado de fallo técnico renombrado de 'error' a
 // 'fallida' en todo el archivo, para que coincida con el esquema
@@ -1159,7 +1167,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.6', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.7', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1694,7 +1702,7 @@ app.post('/fuentes/subir', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
   }
-  const { titulo, autor, descripcion, pdf_base64 } = req.body;
+  const { titulo, autor, descripcion, categoria, pdf_base64 } = req.body;
   if (!titulo || !pdf_base64) {
     return res.status(400).json({ error: 'Faltan campos requeridos (titulo, pdf_base64)' });
   }
@@ -1721,10 +1729,10 @@ app.post('/fuentes/subir', async (req, res) => {
 
     const result = await db.query(
       `INSERT INTO fuentes_doctrinales
-         (titulo, autor, descripcion, drive_file_id, drive_link, orden, activo, creado_en, actualizado_en)
-       VALUES ($1, $2, $3, $4, $5, $6, true, NOW(), NOW())
+         (titulo, autor, descripcion, categoria, drive_file_id, drive_link, orden, activo, creado_en, actualizado_en)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, true, NOW(), NOW())
        RETURNING id, titulo`,
-      [titulo, autor || null, descripcion || null, archivo.data.id, archivo.data.webViewLink, siguienteOrden]
+      [titulo, autor || null, descripcion || null, categoria || 'otros', archivo.data.id, archivo.data.webViewLink, siguienteOrden]
     );
 
     console.log(`   Fuente doctrinal subida: "${result.rows[0].titulo}"`);
@@ -1771,7 +1779,7 @@ app.post('/fuentes/completar-subida-media', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
   }
-  const { titulo, autor, descripcion, driveFileId } = req.body;
+  const { titulo, autor, descripcion, categoria, driveFileId } = req.body;
   if (!titulo || !driveFileId) {
     return res.status(400).json({ error: 'Faltan título o driveFileId' });
   }
@@ -1792,10 +1800,10 @@ app.post('/fuentes/completar-subida-media', async (req, res) => {
 
     const result = await db.query(
       `INSERT INTO fuentes_doctrinales
-         (titulo, autor, descripcion, drive_file_id, drive_link, orden, activo, creado_en, actualizado_en)
-       VALUES ($1, $2, $3, $4, $5, $6, true, NOW(), NOW())
+         (titulo, autor, descripcion, categoria, drive_file_id, drive_link, orden, activo, creado_en, actualizado_en)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, true, NOW(), NOW())
        RETURNING id, titulo`,
-      [titulo, autor || null, descripcion || null, driveFileId, archivo.data.webViewLink, siguienteOrden]
+      [titulo, autor || null, descripcion || null, categoria || 'otros', driveFileId, archivo.data.webViewLink, siguienteOrden]
     );
 
     console.log(`   Fuente doctrinal (subida directa) guardada: "${result.rows[0].titulo}"`);
@@ -1812,7 +1820,7 @@ app.get('/fuentes/lista-admin', async (req, res) => {
   }
   try {
     const result = await db.query(
-      `SELECT id, titulo, autor, descripcion, drive_link, orden, activo, creado_en
+      `SELECT id, titulo, autor, descripcion, categoria, drive_link, orden, activo, creado_en
        FROM fuentes_doctrinales ORDER BY orden ASC`
     );
     res.json(result.rows);
@@ -1908,23 +1916,23 @@ app.post('/fuentes/eliminar', async (req, res) => {
   }
 });
 
-// Edita el título, autor y descripción de un documento ya subido. No toca
-// el archivo en Drive — solo los campos de texto.
+// Edita el título, autor, descripción y categoría de un documento ya
+// subido. No toca el archivo en Drive — solo los campos de texto.
 app.post('/fuentes/editar', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
   }
-  const { id, titulo, autor, descripcion } = req.body;
+  const { id, titulo, autor, descripcion, categoria } = req.body;
   if (!id || !titulo) {
     return res.status(400).json({ error: 'Faltan campos requeridos (id, titulo)' });
   }
   try {
     const result = await db.query(
       `UPDATE fuentes_doctrinales
-       SET titulo = $1, autor = $2, descripcion = $3, actualizado_en = NOW()
-       WHERE id = $4
+       SET titulo = $1, autor = $2, descripcion = $3, categoria = $4, actualizado_en = NOW()
+       WHERE id = $5
        RETURNING id, titulo`,
-      [titulo, autor || null, descripcion || null, id]
+      [titulo, autor || null, descripcion || null, categoria || 'otros', id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
     console.log(`   Fuente doctrinal editada: "${result.rows[0].titulo}"`);
@@ -2611,12 +2619,13 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.6 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.7 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
   console.log(`   Recuperación puntual: /regenerar-grafo, /regenerar-presentacion, /regenerar-podcast`);
   console.log(`   Estados posibles: pendiente → admitida → completada | fallida (o rechazada por el filtro)`);
+  console.log(`   Fuentes Doctrinales: campo 'categoria' activo en subir/completar-subida-media/lista-admin/editar`);
   console.log(`   Funciones NotebookLM intactas sin usar (dispararNotebookLM, generarPresentacion viejo,`);
   console.log(`   generarMapaMental viejo) — por si hace falta reactivar o comparar\n`);
 });
