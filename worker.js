@@ -1,6 +1,16 @@
-// worker.js — ACL Worker v3.8
+// worker.js — ACL Worker v3.9
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.9 (28 jul 2026): 3 ajustes al correo "Tu auditoría está lista"
+// (enviarEmailFinal): (1) saludo personal con el primer nombre del
+// ciudadano en vez de "Ciudadano," genérico — se agrega una consulta chica
+// a ciudadanos por email justo antes de enviar; (2) se quita el link al
+// Documento original (no lo generó la plataforma) y se agrega el link real
+// al Mapa Mental interactivo (/auditoria/[id]/grafo) — antes el correo
+// tenía un link a "Mapa Mental (PNG)" que nunca se llenaba (links.mapa no
+// se pasaba desde ningún lado, quedaba muerto); (3) se agrega una frase de
+// cierre invitando a reenviar el correo, con "Saludos," como despedida.
 //
 // v3.8 (28 jul 2026): el grafo (Mapa Mental) ya no usa regex para decidir
 // qué es un artículo real — se rompía con leyes de REFORMA (Claude cita
@@ -1181,7 +1191,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.8', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.9', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2284,8 +2294,9 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`✅ [${auditoria_id}] Archivos subidos a Drive`);
 
     console.log(`📧 [${auditoria_id}] PASO 8: Enviando email al ciudadano...`);
-	    await enviarEmailFinal(ciudadano_email, metadatos.titulo, auditoria_id, {
-	      original: linkOriginal,
+	    const ciudadanoInfo = await db.query(`SELECT nombre FROM ciudadanos WHERE email = $1`, [ciudadano_email]);
+	    const nombreCiudadano = ciudadanoInfo.rows[0]?.nombre || null;
+	    await enviarEmailFinal(ciudadano_email, nombreCiudadano, metadatos.titulo, auditoria_id, {
 	      reporte: linkReporte,
 	      podcast: linkPodcast,
 	      presentacion: linkPresentacion,
@@ -2493,7 +2504,10 @@ async function actualizarEstado(auditoria_id, estado) {
   await db.query(`UPDATE auditorias SET estado = $1 WHERE id = $2`, [estado, auditoria_id]);
 }
 
-async function enviarEmailFinal(email, titulo, auditoria_id, links) {
+async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links) {
+  const primerNombre = nombre ? nombre.split(' ')[0] : null;
+  const saludo = primerNombre ? `Hola, ${primerNombre}.` : 'Hola,';
+
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
@@ -2502,16 +2516,16 @@ async function enviarEmailFinal(email, titulo, auditoria_id, links) {
       to: email,
       subject: '🎉 Tu auditoría está lista',
       html: `
-        <p>Ciudadano,</p>
+        <p>${saludo}</p>
         <p>Tu auditoría de <strong>${titulo}</strong> está lista. Aquí están tus materiales:</p>
         <ul>
-          ${links.original     ? `<li><a href="${links.original}">📄 Documento original (PDF)</a></li>` : ''}
           ${links.reporte      ? `<li><a href="${links.reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
           ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Podcast — Audio Overview</a></li>` : ''}
           ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Presentación (PPTX)</a></li>` : ''}
-          ${links.mapa         ? `<li><a href="${links.mapa}">🗺️ Mapa Mental (PNG)</a></li>` : ''}
+          <li><a href="https://liberalmente.app/auditoria/${auditoria_id}/grafo">🌐 Mapa Mental (interactivo)</a></li>
         </ul>
-        <p>Accede a todos tus análisis en <a href="https://liberalmente.app/biblioteca">liberalmente.app/biblioteca</a></p>
+        <p>Accede a todos tus análisis en <a href="https://liberalmente.app/biblioteca">liberalmente.app/biblioteca</a>; y si quieres compartir este correo con otras personas, ¡no dudes en reenviárselos!</p>
+        <p>Saludos,</p>
         <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>
       `,
     }),
@@ -2625,7 +2639,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.8 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.9 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
