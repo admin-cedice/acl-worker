@@ -1,6 +1,21 @@
-// worker.js — ACL Worker v3.10
+// worker.js — ACL Worker v3.11
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.11 (31 jul 2026): los pesos de criterios (v3.10) ya se usan de
+// verdad en el puntaje del Reporte. Nueva función obtenerPesosCriterios()
+// (lee configuracion_doctrinal.pesos_criterios) y generarReportePDF.js
+// v4.4 (quinto parámetro pesosCriterios en generarReportePDF(), tercero en
+// normalizarDatosEstructurados()). Se llama en procesarAuditoria() antes
+// del PASO 6, y también en /regenerar-grafo, /regenerar-presentacion y
+// /regenerar-podcast (los tres leen reporte_texto ya guardado y llaman a
+// normalizarDatosEstructurados() directo) — así cualquier regeneración
+// posterior a un cambio de pesos también los refleja. Con pesos_criterios
+// vacío (caso normal hoy) el resultado es idéntico al de antes.
+// TODAVÍA PENDIENTE: el veredicto de activismo de la Presentación
+// (calcularVeredictoActivismo, en generarActivismo.js) no recibe pesos —
+// depende de resumenHorizontes, que se arma en un archivo que este worker
+// no tiene todavía a la vista (generarDatosGrafo.js / generarPresentacionPDF.js).
 //
 // v3.10 (31 jul 2026): dos cambios de la reunión con Roberto y Felipe.
 // (1) ALCANCE VENEZUELA: el filtro de admisibilidad ahora rechaza también
@@ -1224,7 +1239,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.10', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.11', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1261,7 +1276,8 @@ app.get('/regenerar-grafo', async (req, res) => {
       return res.status(400).type('text/plain').send('Esta auditoría no tiene pdf_drive_id guardado — no se puede re-titular artículos.');
     }
 
-    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id);
+    const pesosCriterios = await obtenerPesosCriterios();
+    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, pesosCriterios);
 
     const rutaPDF = path.join(dir, 'original.pdf');
     const driveAuth = autenticarDrive();
@@ -1319,7 +1335,7 @@ app.get('/regenerar-presentacion', async (req, res) => {
       return res.status(400).type('text/plain').send('Esta auditoría no tiene drive_carpeta_id guardado.');
     }
 
-    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id);
+    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, await obtenerPesosCriterios());
     const rutaPDF = path.join(dir, 'presentacion.pdf');
 
     console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
@@ -1391,7 +1407,7 @@ app.get('/regenerar-podcast', async (req, res) => {
       return res.status(400).type('text/plain').send('Esta auditoría no tiene drive_carpeta_id guardado.');
     }
 
-    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id);
+    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, await obtenerPesosCriterios());
 
     console.log(`   [REGENERAR-PODCAST] Generando guion y audio para: ${titulo_documento}`);
     const resultadoGuion = await generarYRevisarGuion(datosReporte, { titulo: titulo_documento, pais: pais || '' });
@@ -2315,6 +2331,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} chars)`);
 
     console.log(`📄 [${auditoria_id}] PASO 6: Generando PDF del reporte (diseño institucional)...`);
+    const pesosCriterios = await obtenerPesosCriterios();
     const datosReporte = await generarReportePDF(
       reporte,
       {
@@ -2326,7 +2343,8 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
         generadoEl:     new Date().toLocaleDateString('es-VE', { year:'numeric', month:'long', day:'numeric' }),
       },
       rutaReportePDF,
-      auditoria_id
+      auditoria_id,
+      pesosCriterios
     );
     console.log(`✅ [${auditoria_id}] PDF del reporte generado — alineación: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'}`);
 
@@ -2480,6 +2498,19 @@ async function obtenerManualActivo() {
     LIMIT 1
   `);
   return rows[0] || null;
+}
+
+// Lee los pesos de criterios guardados en la versión activa de
+// configuracion_doctrinal (columna pesos_criterios, JSONB — ver
+// migracion-pesos-criterios.sql). Devuelve un objeto vacío si no hay
+// ninguno guardado — normalizarDatosEstructurados() ya trata "sin peso
+// para este id" como peso 1, así que un objeto vacío es exactamente
+// equivalente al comportamiento de antes de este cambio (31 jul 2026).
+async function obtenerPesosCriterios() {
+  const { rows } = await db.query(
+    `SELECT pesos_criterios FROM configuracion_doctrinal WHERE activo = true ORDER BY version DESC LIMIT 1`
+  );
+  return rows[0]?.pesos_criterios || {};
 }
 
 async function extraerTextoPDF(rutaPDF) {
@@ -2764,7 +2795,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.10 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.11 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
@@ -2775,7 +2806,8 @@ app.listen(PORT, () => {
   console.log(`   Recuperación puntual: /regenerar-grafo, /regenerar-presentacion, /regenerar-podcast`);
   console.log(`   Estados posibles: pendiente → admitida → completada | fallida (o rechazada por el filtro)`);
   console.log(`   Fuentes Doctrinales: campo 'categoria' activo en subir/completar-subida-media/lista-admin/editar`);
-  console.log(`   Pesos de criterios: GET /pesos, POST /pesos/actualizar — todavía sin conectar a las fórmulas`);
+  console.log(`   Pesos de criterios: GET /pesos, POST /pesos/actualizar — YA conectados al puntaje del Reporte`);
+  console.log(`   (todavía no al veredicto de activismo de la Presentación — ver changelog v3.11)`);
   console.log(`   Funciones NotebookLM intactas sin usar (dispararNotebookLM, generarPresentacion viejo,`);
   console.log(`   generarMapaMental viejo) — por si hace falta reactivar o comparar\n`);
 });

@@ -84,6 +84,17 @@
 //      recibidos e ignora bajo qué clave llegaron, reclasificándolos con
 //      ese mapa. Log nuevo: conteo de criterios por categoría en cada
 //      corrida, y aviso si el total no da 28.
+//
+// CAMBIOS v4.4 (31 jul 2026) — PESOS DE CRITERIOS:
+//  45. normalizarDatosEstructurados() y generarReportePDF() aceptan un
+//      tercer/quinto parámetro opcional `pesosCriterios` — objeto
+//      {id: peso}, ej. {"C-01": 1.5}. El puntaje ahora es un promedio
+//      PONDERADO por criterio (peso por defecto 1 si el id no está en el
+//      objeto), en vez de tratar los 28 criterios como si pesaran igual.
+//      Si pesosCriterios llega vacío o undefined, el resultado es
+//      matemáticamente idéntico al de antes de este cambio — no hace
+//      falta que nadie edite nada en /admin/pesos para que el sistema
+//      siga funcionando exactamente igual que hoy.
 
 'use strict';
 
@@ -728,8 +739,15 @@ const CSS = `
 // Claude ya garantizó válido según SCHEMA_ANALISIS_AUDITORIA. Si esto
 // lanza un error, significa que reporte_texto no es JSON (probablemente
 // una auditoría de antes del 16 jul 2026, previa a esta migración).
+//
+// v4.4 (31 jul 2026): tercer parámetro opcional `pesosCriterios` —
+// {id: peso}, ej. {"C-01": 1.5}. Un criterio ausente de este objeto pesa 1
+// (comportamiento idéntico al de antes de este cambio). El llamador
+// (worker.js) es responsable de leer los pesos vigentes de
+// configuracion_doctrinal y pasarlos aquí — esta función no toca la base
+// de datos.
 
-function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A') {
+function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCriterios = {}) {
   let resultado;
   try {
     resultado = typeof reporteJSON === 'string' ? JSON.parse(reporteJSON) : reporteJSON;
@@ -828,17 +846,35 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A') {
   console.log(`   ║ Alertas    : ${(resultado.alertas || []).length}`);
   console.log(`   ╚══════════════════════════════════════════════════\n`);
 
-  // PONDERACIÓN DEL PUNTAJE (20 jul 2026) — decisión de Moisés: un SÍ con
-  // matiz ya no vale cero en el numerador. Antes solo restaba terreno (contaba
-  // en "aplicables" pero no sumaba nada), lo cual castigaba con dureza a un
-  // documento que avanza parcialmente en un criterio. Ahora cada SÍ con matiz
-  // aporta medio punto de un SÍ pleno — el divisor (aplicables) no cambia,
-  // solo el numerador. La condición para mostrar puntaje en absoluto (que
-  // haya al menos un SÍ pleno) tampoco cambia — eso es una decisión aparte,
-  // no se tocó.
-  const aplicables = siPlenos + siMatiz + noCount;
-  const puntaje = (aplicables > 0 && siPlenos > 0)
-    ? Math.round(((siPlenos + siMatiz * 0.5) / aplicables) * 100)
+  // PONDERACIÓN DEL PUNTAJE
+  // — 20 jul 2026: un SÍ con matiz vale medio punto de un SÍ pleno en el
+  //   numerador (antes solo contaba en el divisor, sin sumar nada).
+  // — 31 jul 2026 (v4.4): cada criterio pesa `pesosCriterios[id]` en vez
+  //   de pesar 1 fijo. Si el id no está en el objeto (caso normal mientras
+  //   nadie edite nada en /admin/pesos), su peso es 1 — así el resultado
+  //   es matemáticamente idéntico al de antes cuando pesosCriterios está
+  //   vacío. Los criterios NA no participan (ni sumaban, ni pesaban,
+  //   antes tampoco).
+  const PESO_POR_DEFECTO = 1;
+  function pesoDe(id) {
+    const valor = pesosCriterios ? pesosCriterios[id] : undefined;
+    const numero = Number(valor);
+    return (valor !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO;
+  }
+
+  let numeradorPonderado = 0;
+  let denominadorPonderado = 0;
+  todos.forEach(c => {
+    if (c.resultado === 'NA') return;
+    const peso = pesoDe(c.id);
+    denominadorPonderado += peso;
+    if (c.resultado === 'SI')        numeradorPonderado += peso * 1;
+    else if (c.resultado === 'SI_MATIZ') numeradorPonderado += peso * 0.5;
+    // NO suma 0 al numerador, pero sí pesa en el denominador — igual que antes.
+  });
+
+  const puntaje = (denominadorPonderado > 0 && siPlenos > 0)
+    ? Math.round((numeradorPonderado / denominadorPonderado) * 100)
     : null;
 
   return {
@@ -1338,12 +1374,15 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 }
 
 // ── Función principal exportada ──────────────────────────────────────────────
+// v4.4 (31 jul 2026): quinto parámetro opcional `pesosCriterios`, pasado
+// tal cual a normalizarDatosEstructurados(). worker.js lo obtiene de
+// configuracion_doctrinal.pesos_criterios antes de llamar esta función.
 
-async function generarReportePDF(reporteJSON, metadatos, rutaSalida, auditoria_id) {
+async function generarReportePDF(reporteJSON, metadatos, rutaSalida, auditoria_id, pesosCriterios = {}) {
   console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v4.0 (salida estructurada)`);
 
   console.log(`   [${auditoria_id}] Paso 1: Normalizando datos estructurados...`);
-  const datos = normalizarDatosEstructurados(reporteJSON, auditoria_id);
+  const datos = normalizarDatosEstructurados(reporteJSON, auditoria_id, pesosCriterios);
 
   console.log(`   [${auditoria_id}] Paso 2: Generando resumen ejecutivo y puntos clave con Claude...`);
   const { puntosClave, resumen } = await generarResumenEjecutivo(datos, metadatos);
