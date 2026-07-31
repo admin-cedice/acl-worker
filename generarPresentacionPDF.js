@@ -62,6 +62,11 @@
 // veredicto de activismo también respeta los pesos definidos en
 // /admin/pesos, igual que ya hace el puntaje del Reporte desde el 31 jul.
 
+// v2.6 (31 jul 2026) — TARJETA ROJA: si datos.descalificado viene true
+// (ver generarReportePDF.js v4.5 — un criterio marcado "descalificador"
+// en /admin/pesos que dio NO), el veredicto se fuerza a rechazo_total
+// aquí también, sin importar el promedio ponderado por horizonte.
+
 'use strict';
 
 const fs = require('fs');
@@ -576,7 +581,18 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
   }
 
   const resumenHorizontes = calcularResumenHorizontes(enlaces, pesosCriterios);
-  const veredicto = calcularVeredictoActivismo(resumenHorizontes);
+  let veredicto = calcularVeredictoActivismo(resumenHorizontes);
+
+  // 31 jul 2026 — TARJETA ROJA: si normalizarDatosEstructurados() (Reporte)
+  // marcó el documento como descalificado (un criterio eliminatorio dio
+  // NO), el veredicto de activismo se fuerza a rechazo_total, sin importar
+  // el promedio ponderado por horizonte — mismo criterio que el puntaje
+  // del Reporte, que también se fuerza a 0%.
+  if (datos.descalificado) {
+    console.warn(`   🟥 [${auditoria_id}] generarPresentacionPDF: documento DESCALIFICADO (criterio eliminatorio en NO: ${(datos.criteriosDescalificadores || []).join(', ')}) — veredicto forzado a rechazo_total.`);
+    veredicto = { modo: 'rechazo_total', alineacionPorcentaje: 0 };
+  }
+
   const secciones = calcularSeccionesHorizonte(datos);
   const articulosPorCriterio = calcularArticulosPorCriterio(enlaces);
 

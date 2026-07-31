@@ -1,6 +1,26 @@
-// worker.js — ACL Worker v3.12
+// worker.js — ACL Worker v3.13
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.13 (31 jul 2026) — 3 correcciones a /admin/pesos, reportadas por
+// Moisés al probar la pantalla:
+// (1) FALLA DE DATA: GET /pesos ya no toma la lista de los 28 criterios
+//     de la auditoría completada más reciente (podía venir incompleta —
+//     pasó con la Ley de Reforma de la Ley Contra la Estafa Inmobiliaria,
+//     solo 3 de 7 categorías). Ahora la lista sale siempre de
+//     CRITERIO_A_CATEGORIA, el mapa fijo del Test de Libertad (28 ids, 7
+//     categorías) que ya vive en generarReportePDF.js. La auditoría más
+//     reciente se sigue usando, pero solo como enriquecimiento opcional
+//     del texto de cada pregunta.
+// (2) DESCALIFICADORES ("tarjeta roja"): pesos_criterios ahora puede
+//     guardar {peso, descalificador} por criterio, no solo un número. Si
+//     un criterio marcado descalificador resulta en NO, el puntaje del
+//     Reporte se fuerza a 0% y el veredicto de la Presentación se fuerza
+//     a rechazo_total — ver generarReportePDF.js v4.5 y
+//     generarPresentacionPDF.js v2.6. Compatible con lo que ya hubiera
+//     quedado guardado en formato número simple.
+// (3) Falla gráfica (color del input de peso invisible): corregida en
+//     app/admin/pesos/page.js — no afecta este archivo.
 //
 // v3.12 (31 jul 2026) — FIX IMPORTANTE + pesos en la Presentación:
 // generarPresentacionPDF.js calculaba SIEMPRE sus enlaces artículo↔criterio
@@ -155,7 +175,7 @@
 
 'use strict';
 const { generarPodcastPrueba } = require('./testPodcast');
-const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA, normalizarDatosEstructurados } = require('./generarReportePDF');
+const { generarReportePDF, registrarRutaHTMLTemporal, SCHEMA_ANALISIS_AUDITORIA, normalizarDatosEstructurados, CRITERIO_A_CATEGORIA, CATEGORIAS_NOMBRES } = require('./generarReportePDF');
 const { generarYRevisarGuion } = require('./generarGuionPresentacion');
 const { generarGrafoConClaude, calcularDatosGrafo, calcularResumenHorizontes } = require('./generarDatosGrafo');
 const { calcularVeredictoActivismo, generarIdeasActivismoTotal } = require('./generarActivismo');
@@ -1253,7 +1273,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.12', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.13', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1783,10 +1803,28 @@ app.get('/prompts/versiones', async (req, res) => {
 // ── Pesos de criterios (31 jul 2026) — jerarquía y ponderación ────────────
 // pesos_criterios vive en la misma fila activa de configuracion_doctrinal,
 // SIN versionado propio (a diferencia de los prompts): se edita en el
-// momento. Estructura: { "C-01": 1, "C-02": 1.5, ... } — cualquier
-// criterio ausente se trata como peso 1, así que mientras nadie toque
-// nada desde /admin/pesos, el resultado es idéntico al de hoy. Requiere
-// la migración migracion-pesos-criterios.sql (columna JSONB nueva).
+// momento. Estructura por criterio: { peso: 1.5, descalificador: false }
+// (o, por compatibilidad con lo que ya hubiera quedado guardado antes de
+// este cambio, un número simple — se trata como {peso: numero,
+// descalificador: false}). Cualquier criterio ausente se trata como
+// {peso: 1, descalificador: false}, así que mientras nadie toque nada
+// desde /admin/pesos, el resultado es idéntico al de hoy. Requiere la
+// migración migracion-pesos-criterios.sql (columna JSONB nueva).
+//
+// FIX (31 jul 2026): la LISTA de los 28 criterios ya NO se toma de la
+// auditoría completada más reciente — ese enfoque tenía dos problemas
+// reales, encontrados por Moisés al probar la pantalla: (1) si esa
+// auditoría no citaba los 28 criterios (pasó con la Ley de Reforma de la
+// Ley Contra la Estafa Inmobiliaria — solo aparecieron 3 de 7
+// categorías), la pantalla quedaba incompleta; (2) conceptualmente, el
+// Test de Libertad no debería depender de qué auditoría se corrió
+// último. La lista ahora sale de CRITERIO_A_CATEGORIA — el mapa fijo
+// id→categoría que ya vive en generarReportePDF.js y que el propio
+// Reporte usa para clasificar cada criterio (28 ids, 7 categorías,
+// conocido de antemano, no depende de ninguna auditoría en particular).
+// La auditoría más reciente se sigue consultando, pero solo como
+// ENRIQUECIMIENTO OPCIONAL — para mostrar el texto exacto de cada
+// pregunta junto al id — nunca como fuente de qué criterios existen.
 app.get('/pesos', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -1797,36 +1835,65 @@ app.get('/pesos', async (req, res) => {
     );
     const pesosGuardados = configResult.rows[0]?.pesos_criterios || {};
 
-    // No existe un catálogo fijo de los 28 criterios en ningún otro lado
-    // del sistema — se toma prestado de la auditoría completada más
-    // reciente, reutilizando el mismo normalizarDatosEstructurados() que
-    // ya usa el Reporte, así se garantiza que la lista siempre coincide
-    // exactamente con lo que Claude está devolviendo hoy.
-    const auditoriaResult = await db.query(
-      `SELECT id, titulo_documento, completada_en, reporte_texto
-       FROM auditorias
-       WHERE estado = 'completada' AND reporte_texto IS NOT NULL
-       ORDER BY completada_en DESC LIMIT 1`
-    );
-
-    if (auditoriaResult.rows.length === 0) {
-      return res.json({ ok: true, criterios: [], fuente_lista: null, aviso: 'Todavía no hay ninguna auditoría completada de la cual tomar la lista de criterios.' });
+    function leerPesoYDescalificador(valorGuardado) {
+      if (valorGuardado && typeof valorGuardado === 'object') {
+        const numero = Number(valorGuardado.peso);
+        return {
+          peso: (valorGuardado.peso !== undefined && !Number.isNaN(numero)) ? numero : 1,
+          descalificador: !!valorGuardado.descalificador,
+        };
+      }
+      const numero = Number(valorGuardado);
+      return {
+        peso: (valorGuardado !== undefined && !Number.isNaN(numero)) ? numero : 1,
+        descalificador: false,
+      };
     }
 
-    const { id, titulo_documento, completada_en, reporte_texto } = auditoriaResult.rows[0];
-    const datos = normalizarDatosEstructurados(reporte_texto, id);
+    // Enriquecimiento opcional, no bloqueante: si hay una auditoría
+    // completada, se usa para mostrar el texto exacto de cada pregunta.
+    // Si falla o no hay ninguna, la lista de los 28 criterios sigue
+    // completa igual — solo se pierde el texto de la pregunta.
+    let preguntaPorCriterio = {};
+    let fuenteLista = null;
+    try {
+      const auditoriaResult = await db.query(
+        `SELECT id, titulo_documento, completada_en, reporte_texto
+         FROM auditorias
+         WHERE estado = 'completada' AND reporte_texto IS NOT NULL
+         ORDER BY completada_en DESC LIMIT 1`
+      );
+      if (auditoriaResult.rows.length > 0) {
+        const { id, titulo_documento, completada_en, reporte_texto } = auditoriaResult.rows[0];
+        const datos = normalizarDatosEstructurados(reporte_texto, id);
+        datos.categorias.forEach(cat => {
+          cat.criterios.forEach(c => { if (c.pregunta) preguntaPorCriterio[c.id] = c.pregunta; });
+        });
+        fuenteLista = { auditoria_id: id, titulo_documento, completada_en };
+      }
+    } catch (errEnriquecimiento) {
+      console.warn('   [pesos] No se pudo enriquecer con el texto de preguntas de una auditoría reciente (no bloqueante):', errEnriquecimiento.message);
+    }
 
-    const criterios = datos.categorias.flatMap(cat =>
-      cat.criterios.map(c => ({
-        id: c.id,
-        categoria: cat.num,
-        categoriaNombre: cat.nombre,
-        pregunta: c.pregunta || c.resumen || '',
-        peso: pesosGuardados[c.id] !== undefined ? pesosGuardados[c.id] : 1,
-      }))
-    );
+    const criterios = Object.entries(CRITERIO_A_CATEGORIA)
+      .map(([id, categoria]) => {
+        const { peso, descalificador } = leerPesoYDescalificador(pesosGuardados[id]);
+        return {
+          id,
+          categoria,
+          categoriaNombre: CATEGORIAS_NOMBRES[categoria],
+          pregunta: preguntaPorCriterio[id] || '(texto de la pregunta no disponible todavía — aparece en cuanto haya una auditoría completada que cite este criterio)',
+          peso,
+          descalificador,
+        };
+      })
+      .sort((a, b) => a.id.localeCompare(b.id));
 
-    res.json({ ok: true, criterios, fuente_lista: { auditoria_id: id, titulo_documento, completada_en } });
+    const aviso = fuenteLista
+      ? null
+      : 'Todavía no hay ninguna auditoría completada — se muestran los 28 criterios del Test de Libertad, pero sin el texto exacto de cada pregunta hasta que exista al menos una.';
+
+    res.json({ ok: true, criterios, fuente_lista: fuenteLista, aviso });
   } catch (error) {
     console.error('❌ Error en /pesos:', error.message);
     res.status(500).json({ error: error.message });
@@ -2821,10 +2888,12 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.12 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.13 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
+  console.log(`   /pesos ya no depende de la auditoría más reciente — usa el Test de Libertad (28 fijos)`);
+  console.log(`   Descalificadores ("tarjeta roja"): un NO en un criterio marcado fuerza 0% / rechazo_total`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
   console.log(`   PASO 6.5 usa generarGrafoConClaude() desde el 28 jul 2026 — sin regex, identifica y`);
   console.log(`   clasifica artículos (incluye leyes de reforma) con instrucciones de prompt`);

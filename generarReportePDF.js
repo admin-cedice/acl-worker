@@ -855,30 +855,61 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
   //   es matemáticamente idéntico al de antes cuando pesosCriterios está
   //   vacío. Los criterios NA no participan (ni sumaban, ni pesaban,
   //   antes tampoco).
+  // — 31 jul 2026 (v4.5) — FORMATO ENRIQUECIDO + DESCALIFICADORES:
+  //   pesosCriterios[id] ahora puede ser un objeto {peso, descalificador}
+  //   (lo que guarda /admin/pesos desde este cambio), o —por compatibilidad
+  //   con lo que ya hubiera quedado guardado antes— un número simple, que
+  //   se trata como {peso: numero, descalificador: false}. Un criterio
+  //   marcado "descalificador" (tarjeta roja) que resulte en NO fuerza el
+  //   puntaje del documento entero a 0, sin importar cómo haya quedado el
+  //   promedio ponderado del resto — igual que un jugador expulsado saca
+  //   a su equipo del partido sin importar el marcador. Se documenta en
+  //   `descalificado` y `criteriosDescalificadores` para que tanto el
+  //   Reporte como la Presentación puedan reflejarlo.
   const PESO_POR_DEFECTO = 1;
-  function pesoDe(id) {
+  function leerPesoYDescalificador(id) {
     const valor = pesosCriterios ? pesosCriterios[id] : undefined;
+    if (valor && typeof valor === 'object') {
+      const numero = Number(valor.peso);
+      return {
+        peso: (valor.peso !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO,
+        descalificador: !!valor.descalificador,
+      };
+    }
     const numero = Number(valor);
-    return (valor !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO;
+    return {
+      peso: (valor !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO,
+      descalificador: false,
+    };
   }
 
   let numeradorPonderado = 0;
   let denominadorPonderado = 0;
+  const criteriosDescalificadores = [];
   todos.forEach(c => {
     if (c.resultado === 'NA') return;
-    const peso = pesoDe(c.id);
+    const { peso, descalificador } = leerPesoYDescalificador(c.id);
     denominadorPonderado += peso;
     if (c.resultado === 'SI')        numeradorPonderado += peso * 1;
     else if (c.resultado === 'SI_MATIZ') numeradorPonderado += peso * 0.5;
     // NO suma 0 al numerador, pero sí pesa en el denominador — igual que antes.
+    if (descalificador && c.resultado === 'NO') criteriosDescalificadores.push(c.id);
   });
 
-  const puntaje = (denominadorPonderado > 0 && siPlenos > 0)
+  const descalificado = criteriosDescalificadores.length > 0;
+
+  const puntajePonderado = (denominadorPonderado > 0 && siPlenos > 0)
     ? Math.round((numeradorPonderado / denominadorPonderado) * 100)
     : null;
+  const puntaje = descalificado ? 0 : puntajePonderado;
+
+  if (descalificado) {
+    console.warn(`   🟥 [${auditoria_id}] DESCALIFICADO — criterio(s) eliminatorio(s) en NO: ${criteriosDescalificadores.join(', ')}. Puntaje forzado a 0% sin importar el promedio ponderado (que hubiera sido ${puntajePonderado !== null ? puntajePonderado + '%' : 'sin total general'}).`);
+  }
 
   return {
     puntaje, siPlenos, siMatiz, noCount, naCount,
+    descalificado, criteriosDescalificadores,
     resumenEjecutivo: '', puntosClave: [],
     categorias,
     alertas: resultado.alertas || [],
@@ -1412,4 +1443,6 @@ module.exports = {
   generarHTML,
   registrarRutaHTMLTemporal,
   SCHEMA_ANALISIS_AUDITORIA,
+  CRITERIO_A_CATEGORIA,
+  CATEGORIAS_NOMBRES,
 };

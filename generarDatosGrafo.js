@@ -403,8 +403,17 @@ function calcularResumenHorizontes(enlaces, pesosCriterios = {}) {
     grupos[horizonte].push(enlace);
   });
 
+  // 31 jul 2026: pesosCriterios[id] puede ser un objeto {peso,
+  // descalificador} (formato actual de /admin/pesos) o un número simple
+  // (formato viejo) — en ambos casos, aquí solo interesa el peso. El
+  // efecto de "descalificador" se maneja en generarPresentacionPDF.js,
+  // sobre el veredicto completo, no acá sobre el conteo por horizonte.
   function pesoDeCriterio(criterioId) {
     const valor = pesosCriterios ? pesosCriterios[criterioId] : undefined;
+    if (valor && typeof valor === 'object') {
+      const numero = Number(valor.peso);
+      return (valor.peso !== undefined && !Number.isNaN(numero)) ? numero : 1;
+    }
     const numero = Number(valor);
     return (valor !== undefined && !Number.isNaN(numero)) ? numero : 1;
   }
