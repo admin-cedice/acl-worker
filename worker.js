@@ -1,6 +1,20 @@
-// worker.js — ACL Worker v3.11
+// worker.js — ACL Worker v3.12
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.12 (31 jul 2026) — FIX IMPORTANTE + pesos en la Presentación:
+// generarPresentacionPDF.js calculaba SIEMPRE sus enlaces artículo↔criterio
+// llamando a calcularDatosGrafo(datos) sin el analisisGrafo real — con el
+// valor por defecto (vacío), el veredicto de activismo daba total=0 en
+// TODAS las auditorías, lo cual calcularVeredictoActivismo() interpreta
+// como RECHAZO TOTAL siempre, sin importar el documento. Corregido:
+// procesarAuditoria() ahora comparte el grafo real que ya calcula en el
+// PASO 6.5 (grafoDatosCompartido) con el PASO 6.7 (Presentación), en vez
+// de que cada paso lo recalculara por separado. /regenerar-presentacion
+// hace lo mismo leyendo auditorias.grafo_datos. De paso, los pesos de
+// criterios (v3.10/v3.11) ya llegan también al veredicto de activismo —
+// ver calcularResumenHorizontes() en generarDatosGrafo.js v2 y
+// calcularVeredictoActivismo() en generarActivismo.js v3.
 //
 // v3.11 (31 jul 2026): los pesos de criterios (v3.10) ya se usan de
 // verdad en el puntaje del Reporte. Nueva función obtenerPesosCriterios()
@@ -1239,7 +1253,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.11', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.12', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1324,18 +1338,19 @@ app.get('/regenerar-presentacion', async (req, res) => {
 
   try {
     const result = await db.query(
-      `SELECT reporte_texto, titulo_documento, pais, drive_carpeta_id FROM auditorias WHERE id = $1`,
+      `SELECT reporte_texto, titulo_documento, pais, drive_carpeta_id, grafo_datos FROM auditorias WHERE id = $1`,
       [auditoria_id]
     );
     if (!result.rows[0]?.reporte_texto) {
       return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría.');
     }
-    const { reporte_texto, titulo_documento, pais, drive_carpeta_id } = result.rows[0];
+    const { reporte_texto, titulo_documento, pais, drive_carpeta_id, grafo_datos } = result.rows[0];
     if (!drive_carpeta_id) {
       return res.status(400).type('text/plain').send('Esta auditoría no tiene drive_carpeta_id guardado.');
     }
 
-    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, await obtenerPesosCriterios());
+    const pesosCriterios = await obtenerPesosCriterios();
+    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, pesosCriterios);
     const rutaPDF = path.join(dir, 'presentacion.pdf');
 
     console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
@@ -1347,7 +1362,9 @@ app.get('/regenerar-presentacion', async (req, res) => {
         generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
       },
       rutaPDF,
-      auditoria_id
+      auditoria_id,
+      grafo_datos,
+      pesosCriterios
     );
 
     const driveAuth = autenticarDrive();
@@ -2349,15 +2366,22 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`✅ [${auditoria_id}] PDF del reporte generado — alineación: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'}`);
 
     console.log(`🕸️  [${auditoria_id}] PASO 6.5: Generando datos del grafo (artículos + citas con Claude)...`);
+    // grafoDatosCompartido se declara AFUERA del try (31 jul 2026) para que
+    // el PASO 6.7 (Presentación), más abajo, pueda reutilizar el mismo
+    // grafo real en vez de recalcular uno vacío por su cuenta — ver el fix
+    // completo documentado en generarPresentacionPDF.js v2.5.
+    let grafoDatosCompartido = null;
     try {
       const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id);
-      const grafoDatos = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id);
-      await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatos), auditoria_id]);
-      console.log(`✅ [${auditoria_id}] Datos del grafo guardados (${grafoDatos.nodos.length} nodos, ${grafoDatos.enlaces.length} enlaces)`);
+      grafoDatosCompartido = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id);
+      await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatosCompartido), auditoria_id]);
+      console.log(`✅ [${auditoria_id}] Datos del grafo guardados (${grafoDatosCompartido.nodos.length} nodos, ${grafoDatosCompartido.enlaces.length} enlaces)`);
     } catch (errorGrafo) {
       // No bloqueante a propósito: si esto falla, la auditoría sigue su
       // curso normal (Reporte, Drive, email) — el grafo simplemente queda
-      // sin datos (grafo_datos = NULL) hasta que se reintente a mano.
+      // sin datos (grafo_datos = NULL) hasta que se reintente a mano, y
+      // grafoDatosCompartido queda en null (la Presentación lo maneja con
+      // su propio aviso, no truena por esto).
       console.error(`⚠️  [${auditoria_id}] No se pudieron generar los datos del grafo (no bloqueante):`, errorGrafo.message);
     }
 
@@ -2390,7 +2414,9 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	          generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
 	        },
 	        rutaPresentacionPDF,
-	        auditoria_id
+	        auditoria_id,
+	        grafoDatosCompartido,
+	        pesosCriterios
 	      );
 	      linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 	      console.log(`✅ [${auditoria_id}] Presentación generada y subida`);
@@ -2795,9 +2821,10 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.11 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.12 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
+  console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
   console.log(`   PASO 6.5 usa generarGrafoConClaude() desde el 28 jul 2026 — sin regex, identifica y`);
   console.log(`   clasifica artículos (incluye leyes de reforma) con instrucciones de prompt`);
@@ -2806,8 +2833,7 @@ app.listen(PORT, () => {
   console.log(`   Recuperación puntual: /regenerar-grafo, /regenerar-presentacion, /regenerar-podcast`);
   console.log(`   Estados posibles: pendiente → admitida → completada | fallida (o rechazada por el filtro)`);
   console.log(`   Fuentes Doctrinales: campo 'categoria' activo en subir/completar-subida-media/lista-admin/editar`);
-  console.log(`   Pesos de criterios: GET /pesos, POST /pesos/actualizar — YA conectados al puntaje del Reporte`);
-  console.log(`   (todavía no al veredicto de activismo de la Presentación — ver changelog v3.11)`);
+  console.log(`   Pesos de criterios: GET /pesos, POST /pesos/actualizar — conectados al Reporte Y a la Presentación`);
   console.log(`   Funciones NotebookLM intactas sin usar (dispararNotebookLM, generarPresentacion viejo,`);
   console.log(`   generarMapaMental viejo) — por si hace falta reactivar o comparar\n`);
 });

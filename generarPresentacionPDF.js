@@ -30,6 +30,37 @@
 // SIN CAMBIOS: mecanismo HTML→PDF (CloudConvert), mapa temporal de
 // HTMLs, firma pública de generarPresentacionPDF(). La lámina de
 // hallazgos ilustrados sigue definida pero sin llamarse (ver v2.2).
+//
+// v2.5 (31 jul 2026) — FIX IMPORTANTE + PESOS DE CRITERIOS:
+//
+// FIX: generarPresentacionPDF() calculaba SIEMPRE sus enlaces
+// artículo↔criterio llamando a calcularDatosGrafo(datos) SIN el segundo
+// argumento (analisisGrafo). Como ese parámetro es opcional y por defecto
+// vale { articulos: [], citas: [] }, y calcularDatosGrafo() solo arma
+// "enlaces" a partir de analisisGrafo.citas, el resultado era SIEMPRE un
+// arreglo vacío — sin importar el documento auditado. Eso hacía que
+// calcularResumenHorizontes() viera total=0 en todos los casos, y
+// calcularVeredictoActivismo() interpreta un total de 0 como 0% de
+// alineación — por debajo del umbral de rechazo (20%) siempre. En la
+// práctica: TODAS las Presentaciones generadas hasta hoy recomendaban
+// "RECHAZAR 100% A ESTE INSTRUMENTO", sin importar si el documento era
+// liberal o no. La causa no estaba en calcularVeredictoActivismo() ni en
+// calcularResumenHorizontes() — estaba en que esta función nunca les pasó
+// datos reales.
+//
+// SOLUCIÓN: generarPresentacionPDF() ahora recibe un quinto parámetro
+// `grafoDatos` — el mismo objeto {nodos, enlaces} que el PASO 6.5 de
+// procesarAuditoria() (worker.js) ya calcula con generarGrafoConClaude(),
+// o el que ya está guardado en auditorias.grafo_datos si se está
+// regenerando la Presentación de una auditoría vieja. Si no llega (ej. el
+// PASO 6.5 falló para esa auditoría), se cae al comportamiento anterior
+// (enlaces vacíos) pero con una advertencia explícita en el log, en vez de
+// fallar en silencio.
+//
+// PESOS: sexto parámetro opcional `pesosCriterios` — se pasa a
+// calcularResumenHorizontes() (ver generarDatosGrafo.js v2), así el
+// veredicto de activismo también respeta los pesos definidos en
+// /admin/pesos, igual que ya hace el puntaje del Reporte desde el 31 jul.
 
 'use strict';
 
@@ -525,11 +556,26 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 }
 
 // ── Función principal exportada ───────────────────────────────────────────
-async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.4`);
+// v2.5 (31 jul 2026): quinto parámetro `grafoDatos` (objeto {nodos, enlaces}
+// ya calculado — ver el fix documentado arriba) y sexto `pesosCriterios`
+// (objeto {id: peso}, pasado a calcularResumenHorizontes()). Ambos
+// opcionales para no romper ningún llamador viejo que todavía no los
+// mande — aunque sin `grafoDatos` real, el veredicto vuelve a salir
+// siempre RECHAZO TOTAL (el comportamiento de antes del fix), así que
+// ahora se avisa explícitamente en el log en vez de quedar en silencio.
+async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}) {
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.5`);
 
-  const { enlaces } = calcularDatosGrafo(datos);
-  const resumenHorizontes = calcularResumenHorizontes(enlaces);
+  let enlaces;
+  if (grafoDatos && Array.isArray(grafoDatos.enlaces)) {
+    enlaces = grafoDatos.enlaces;
+    console.log(`   [${auditoria_id}] Usando grafo real recibido: ${enlaces.length} enlaces`);
+  } else {
+    console.warn(`   ⚠️ [${auditoria_id}] generarPresentacionPDF: no se recibió un grafo real (grafoDatos) — el veredicto de activismo se calculará con 0 enlaces, lo cual SIEMPRE da RECHAZO TOTAL sin importar el documento. Revisar si el Paso 6.5 falló para esta auditoría, o si el llamador todavía no pasa grafoDatos.`);
+    enlaces = calcularDatosGrafo(datos).enlaces; // respaldo: siempre vacío sin analisisGrafo real
+  }
+
+  const resumenHorizontes = calcularResumenHorizontes(enlaces, pesosCriterios);
   const veredicto = calcularVeredictoActivismo(resumenHorizontes);
   const secciones = calcularSeccionesHorizonte(datos);
   const articulosPorCriterio = calcularArticulosPorCriterio(enlaces);

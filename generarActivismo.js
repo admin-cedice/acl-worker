@@ -27,6 +27,21 @@
 // cuando exista la lista real. Si más adelante se quiere poder editarla
 // sin desplegar código, el patrón ya existe en el proyecto:
 // fuentes_doctrinales (tabla + endpoints en worker.js).
+//
+// v3 (31 jul 2026) — FIX + PESOS: calcularVeredictoActivismo() ahora usa
+// neutral.peso / a_favor.peso en vez de neutral.cantidad / a_favor.cantidad
+// cuando esos campos vienen presentes en resumenHorizontes (ver
+// calcularResumenHorizontes() en generarDatosGrafo.js v2 — suma ponderada
+// por los pesos de criterios de /admin/pesos, en vez de contar enlaces
+// crudos). Con fallback a .cantidad si algún llamador todavía pasa un
+// resumenHorizontes sin .peso, para no romper nada. De paso: se descubrió
+// (31 jul 2026) que generarPresentacionPDF.js llamaba a esta función
+// pasando SIEMPRE un resumenHorizontes con total=0 (por un bug ajeno a
+// este archivo — ver el fix en generarPresentacionPDF.js v2.5 y
+// worker.js v3.12), lo cual hacía que el veredicto fuera RECHAZO TOTAL en
+// el 100% de las Presentaciones generadas hasta hoy, sin importar el
+// documento. Esta función en sí nunca tuvo el bug — solo recibía datos
+// vacíos de su llamador.
 
 'use strict';
 
@@ -35,11 +50,19 @@ const Anthropic = require('@anthropic-ai/sdk');
 const UMBRAL_RECHAZO_TOTAL   = 0.20;
 const UMBRAL_PROMOCION_TOTAL = 0.80;
 
-// ── Veredicto general del instrumento (sin cambios respecto a v1) ───────
+// ── Veredicto general del instrumento ────────────────────────────────────
+// v3 (31 jul 2026): usa el peso ponderado (neutral.peso / a_favor.peso) si
+// viene presente en resumenHorizontes — que es lo que calcularResumenHorizontes()
+// entrega desde su v2 (31 jul 2026). Si por algún motivo llega un
+// resumenHorizontes viejo sin `.peso` (no debería pasar con el código
+// actual, pero por seguridad), cae de vuelta a `.cantidad` — mismo
+// comportamiento que existía antes de que se agregaran los pesos.
 function calcularVeredictoActivismo(resumenHorizontes) {
   const { total, neutral, a_favor } = resumenHorizontes;
+  const pesoNeutral = neutral.peso !== undefined ? neutral.peso : neutral.cantidad;
+  const pesoAFavor  = a_favor.peso  !== undefined ? a_favor.peso  : a_favor.cantidad;
   const alineacionFraccion = total > 0
-    ? (neutral.cantidad + a_favor.cantidad) / total
+    ? (pesoNeutral + pesoAFavor) / total
     : 0;
   const alineacionPorcentaje = Math.round(alineacionFraccion * 100);
 

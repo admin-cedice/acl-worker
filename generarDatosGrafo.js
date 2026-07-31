@@ -38,6 +38,14 @@
 // teniendo sus propias funciones SVG+sharp, huérfanas desde el 27 jul, ver
 // el documento de arquitectura), solo prepara el JSON que se guarda en
 // auditorias.grafo_datos.
+//
+// v3 (31 jul 2026): calcularResumenHorizontes() acepta un segundo parámetro
+// opcional pesosCriterios — objeto {id: peso}, el mismo que usa
+// normalizarDatosEstructurados() en generarReportePDF.js. Motivo: el
+// veredicto de activismo de la Presentación (generarPresentacionPDF.js →
+// generarActivismo.js) ahora también respeta los pesos de criterios
+// definidos en /admin/pesos, no solo el puntaje del Reporte. Ver el
+// comentario completo dentro de la función.
 
 'use strict';
 
@@ -362,18 +370,31 @@ function calcularDatosGrafo(datos, analisisGrafo = { articulos: [], citas: [] },
 }
 
 // ── En uso — resumen por horizonte (Presentación) ─────────────────────────
-// Sin cambios. Cuenta y calcula el % de enlaces en_contra/neutral/a_favor
-// a partir de "enlaces" — el concepto de horizontes no está descartado en
-// general, sigue siendo la lógica real detrás de cómo la Presentación
-// agrupa sus recomendaciones de activismo en RECHAZO/MEJORA/PROMOCIÓN. Lo
-// que se descartó fue usarlo como agrupación visual del Mapa Mental.
+// Cuenta y calcula el % de enlaces en_contra/neutral/a_favor a partir de
+// "enlaces" — el concepto de horizontes no está descartado en general,
+// sigue siendo la lógica real detrás de cómo la Presentación agrupa sus
+// recomendaciones de activismo en RECHAZO/MEJORA/PROMOCIÓN. Lo que se
+// descartó fue usarlo como agrupación visual del Mapa Mental.
+//
+// v2 (31 jul 2026) — PESOS DE CRITERIOS: segundo parámetro opcional
+// pesosCriterios, mismo objeto {id: peso} que ya usa
+// normalizarDatosEstructurados() en generarReportePDF.js. Cada enlace pesa
+// lo que pese su criterio de DESTINO (peso por defecto 1 si el id no está
+// en el objeto) — un criterio con peso 2 cuenta el doble en el horizonte
+// que le corresponda, sin importar cuántos artículos lo citen. `cantidad`
+// se conserva sin cambios (conteo simple de enlaces, dato informativo);
+// `peso` es la suma ponderada nueva, y es lo que ahora usa
+// calcularVeredictoActivismo() (en generarActivismo.js) para decidir el
+// veredicto — ver ese archivo. Con pesosCriterios vacío, peso === cantidad
+// en los tres grupos y el resultado es idéntico al de antes de este
+// cambio.
 const HORIZONTE_POR_RESULTADO = {
   'NO': 'en_contra',
   'SI_MATIZ': 'neutral',
   'SI': 'a_favor',
 };
 
-function calcularResumenHorizontes(enlaces) {
+function calcularResumenHorizontes(enlaces, pesosCriterios = {}) {
   const grupos = { en_contra: [], neutral: [], a_favor: [] };
 
   enlaces.forEach(enlace => {
@@ -382,14 +403,26 @@ function calcularResumenHorizontes(enlaces) {
     grupos[horizonte].push(enlace);
   });
 
-  const total = grupos.en_contra.length + grupos.neutral.length + grupos.a_favor.length;
-  const conPorcentaje = lista => ({
-    cantidad: lista.length,
-    porcentaje: total > 0 ? Math.round((lista.length / total) * 100) : 0,
-  });
+  function pesoDeCriterio(criterioId) {
+    const valor = pesosCriterios ? pesosCriterios[criterioId] : undefined;
+    const numero = Number(valor);
+    return (valor !== undefined && !Number.isNaN(numero)) ? numero : 1;
+  }
+  const pesoDeLista = lista => lista.reduce((acc, e) => acc + pesoDeCriterio(e.destino), 0);
+
+  const pesoTotal = pesoDeLista(grupos.en_contra) + pesoDeLista(grupos.neutral) + pesoDeLista(grupos.a_favor);
+
+  const conPorcentaje = lista => {
+    const peso = pesoDeLista(lista);
+    return {
+      cantidad: lista.length,
+      peso,
+      porcentaje: pesoTotal > 0 ? Math.round((peso / pesoTotal) * 100) : 0,
+    };
+  };
 
   return {
-    total,
+    total: pesoTotal,
     en_contra: conPorcentaje(grupos.en_contra),
     neutral: conPorcentaje(grupos.neutral),
     a_favor: conPorcentaje(grupos.a_favor),
