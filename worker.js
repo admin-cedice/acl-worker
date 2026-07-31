@@ -1,6 +1,26 @@
-// worker.js — ACL Worker v3.9
+// worker.js — ACL Worker v3.10
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.10 (31 jul 2026): dos cambios de la reunión con Roberto y Felipe.
+// (1) ALCANCE VENEZUELA: el filtro de admisibilidad ahora rechaza también
+// documentos legítimos pero de otro país, con un motivo y un mensaje al
+// ciudadano propios (fuera_de_alcance_geografico), distintos del genérico
+// "no_pertinente". La instrucción de alcance se agrega SIEMPRE en código
+// (INSTRUCCION_ALCANCE_VENEZUELA), sin importar qué prompt_admisibilidad
+// esté activo en configuracion_doctrinal — así no depende de editar el
+// texto largo guardado en la base de datos, y revertirlo más adelante es
+// borrar ese bloque y su uso en filtrarAdmisibilidad(), nada más.
+// (2) PESOS DE CRITERIOS: nuevos endpoints GET /pesos y POST
+// /pesos/actualizar, que leen y escriben configuracion_doctrinal.pesos_criterios
+// (columna JSONB nueva, ver migracion-pesos-criterios.sql). /pesos arma la
+// lista de los 28 criterios reutilizando normalizarDatosEstructurados()
+// sobre la auditoría completada más reciente (no hay un catálogo fijo de
+// criterios en ningún otro lado). Cualquier criterio sin peso guardado
+// vale 1 — mientras nadie edite nada desde /admin/pesos, el comportamiento
+// es idéntico al de antes. Este archivo todavía NO usa esos pesos en
+// ningún cálculo — eso vive en generarReportePDF.js y generarActivismo.js,
+// pendientes de recibir el mismo cambio.
 //
 // v3.9 (28 jul 2026): 3 ajustes al correo "Tu auditoría está lista"
 // (enviarEmailFinal): (1) saludo personal con el primer nombre del
@@ -195,6 +215,18 @@ EXPLICACION: [una frase breve]
 
 Ante la duda razonable, prefiere ADMITIR.`;
 
+// Instrucción de alcance geográfico (31 jul 2026) — decisión del equipo de
+// concentrar la plataforma en Venezuela mientras dure esta fase. Se agrega
+// SIEMPRE al final del prompt de admisibilidad, sin importar si ese prompt
+// viene de configuracion_doctrinal (editable en /admin/prompts) o del
+// respaldo interno — así no depende de editar el texto largo guardado en
+// la base de datos. Revertir esto más adelante es borrar este bloque y su
+// uso en filtrarAdmisibilidad(), nada más.
+const INSTRUCCION_ALCANCE_VENEZUELA = `
+
+INSTRUCCIÓN ADICIONAL DE ALCANCE (vigente desde el 31 jul 2026):
+Además de lo anterior, evalúa si el documento corresponde a Venezuela (leyes, decretos, reglamentos o políticas públicas venezolanas, de cualquier nivel — nacional, estadal o municipal). Si el documento es pertinente pero es claramente de otro país, RECHAZA usando MOTIVO: fuera_de_alcance_geografico (no uses no_pertinente en ese caso). Ante la duda razonable sobre si un documento aplica a Venezuela, prefiere ADMITIR.`;
+
 // Lee la respuesta de texto plano de Claude y la convierte en un veredicto.
 // Mismo criterio que generarReportePDF.js: texto con marcadores, nunca
 // JSON, para no repetir el bug de JSON.parse() de la sesión anterior.
@@ -219,7 +251,7 @@ function parsearVeredictoAdmisibilidad(textoRespuesta) {
     return { admitido: true };
   }
 
-  const motivo = /MOTIVO:\s*(no_pertinente|intento_manipulacion)/i.exec(limpio)?.[1]?.toLowerCase() || 'no_pertinente';
+  const motivo = /MOTIVO:\s*(no_pertinente|fuera_de_alcance_geografico|intento_manipulacion)/i.exec(limpio)?.[1]?.toLowerCase() || 'no_pertinente';
   const explicacionMatch = /EXPLICACION:\s*([\s\S]*)$/i.exec(limpio);
   const explicacion = explicacionMatch ? explicacionMatch[1].trim() : 'Sin explicación detallada.';
   console.log(`   [filtrarAdmisibilidad] Veredicto: RECHAZADO (${motivo})`);
@@ -229,9 +261,10 @@ function parsearVeredictoAdmisibilidad(textoRespuesta) {
 // El filtro en sí — un llamado breve y barato a Claude, antes del análisis
 // completo de 28 criterios.
 async function filtrarAdmisibilidad(textoDocumento, promptAdmisibilidad) {
-  const promptFinal = (promptAdmisibilidad && promptAdmisibilidad.trim())
+  const promptBase = (promptAdmisibilidad && promptAdmisibilidad.trim())
     ? promptAdmisibilidad
     : PROMPT_ADMISIBILIDAD_RESPALDO;
+  const promptFinal = promptBase + INSTRUCCION_ALCANCE_VENEZUELA;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
@@ -1191,7 +1224,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.9', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.10', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1710,6 +1743,86 @@ app.get('/prompts/versiones', async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     console.error('❌ Error listando versiones de prompts:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── Pesos de criterios (31 jul 2026) — jerarquía y ponderación ────────────
+// pesos_criterios vive en la misma fila activa de configuracion_doctrinal,
+// SIN versionado propio (a diferencia de los prompts): se edita en el
+// momento. Estructura: { "C-01": 1, "C-02": 1.5, ... } — cualquier
+// criterio ausente se trata como peso 1, así que mientras nadie toque
+// nada desde /admin/pesos, el resultado es idéntico al de hoy. Requiere
+// la migración migracion-pesos-criterios.sql (columna JSONB nueva).
+app.get('/pesos', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const configResult = await db.query(
+      `SELECT pesos_criterios FROM configuracion_doctrinal WHERE activo = true ORDER BY version DESC LIMIT 1`
+    );
+    const pesosGuardados = configResult.rows[0]?.pesos_criterios || {};
+
+    // No existe un catálogo fijo de los 28 criterios en ningún otro lado
+    // del sistema — se toma prestado de la auditoría completada más
+    // reciente, reutilizando el mismo normalizarDatosEstructurados() que
+    // ya usa el Reporte, así se garantiza que la lista siempre coincide
+    // exactamente con lo que Claude está devolviendo hoy.
+    const auditoriaResult = await db.query(
+      `SELECT id, titulo_documento, completada_en, reporte_texto
+       FROM auditorias
+       WHERE estado = 'completada' AND reporte_texto IS NOT NULL
+       ORDER BY completada_en DESC LIMIT 1`
+    );
+
+    if (auditoriaResult.rows.length === 0) {
+      return res.json({ ok: true, criterios: [], fuente_lista: null, aviso: 'Todavía no hay ninguna auditoría completada de la cual tomar la lista de criterios.' });
+    }
+
+    const { id, titulo_documento, completada_en, reporte_texto } = auditoriaResult.rows[0];
+    const datos = normalizarDatosEstructurados(reporte_texto, id);
+
+    const criterios = datos.categorias.flatMap(cat =>
+      cat.criterios.map(c => ({
+        id: c.id,
+        categoria: cat.num,
+        categoriaNombre: cat.nombre,
+        pregunta: c.pregunta || c.resumen || '',
+        peso: pesosGuardados[c.id] !== undefined ? pesosGuardados[c.id] : 1,
+      }))
+    );
+
+    res.json({ ok: true, criterios, fuente_lista: { auditoria_id: id, titulo_documento, completada_en } });
+  } catch (error) {
+    console.error('❌ Error en /pesos:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/pesos/actualizar', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { pesos } = req.body;
+  if (!pesos || typeof pesos !== 'object') {
+    return res.status(400).json({ error: 'Falta el campo "pesos" (objeto {id: peso})' });
+  }
+  try {
+    const result = await db.query(
+      `UPDATE configuracion_doctrinal
+       SET pesos_criterios = $1, actualizado_en = NOW()
+       WHERE activo = true
+       RETURNING id, version`,
+      [JSON.stringify(pesos)]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No hay ninguna versión activa de configuracion_doctrinal' });
+    }
+    console.log(`   [pesos/actualizar] ✅ Pesos guardados sobre la versión activa (${result.rows[0].version})`);
+    res.json({ ok: true, version: result.rows[0].version });
+  } catch (error) {
+    console.error('❌ Error en /pesos/actualizar:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -2540,17 +2653,29 @@ async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links) {
 // manipulación (para no darle pistas a quien intente manipular el filtro
 // sobre qué detectamos exactamente).
 async function enviarEmailRechazo(email, motivo) {
-  const esNoPertinente = motivo === 'no_pertinente';
-
-  const cuerpo = esNoPertinente
-    ? `<p>Hola,</p>
+  // 3 mensajes distintos (31 jul 2026, se agrega fuera_de_alcance_geografico):
+  // no_pertinente y fuera_de_alcance_geografico son específicos y amables
+  // (le dicen a la persona exactamente qué pasó); intento_manipulacion sigue
+  // siendo deliberadamente genérico, para no darle pistas a quien intente
+  // manipular el filtro sobre qué detectamos exactamente.
+  const cuerpos = {
+    no_pertinente: `<p>Hola,</p>
        <p>Revisamos el documento que subiste a Auditoría Cívica Liberal, y no pudimos admitirlo para el análisis: no parece tratarse de una ley, decreto, reglamento o política pública — que es justamente lo que audita nuestra plataforma.</p>
        <p>Si crees que esto es un error, puedes volver a subir el documento correcto, o escribirnos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
-       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`
-    : `<p>Hola,</p>
+       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`,
+
+    fuera_de_alcance_geografico: `<p>Hola,</p>
+       <p>Revisamos el documento que subiste a Auditoría Cívica Liberal. Es un documento legítimo, pero por ahora nuestro alcance se concentra únicamente en leyes, decretos y políticas públicas venezolanas — no pudimos admitirlo porque corresponde a otro país.</p>
+       <p>Esta es una limitación temporal: esperamos poder ampliar la plataforma a otros países de la región más adelante. Si crees que esto es un error, escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
+       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`,
+
+    intento_manipulacion: `<p>Hola,</p>
        <p>No pudimos procesar el documento que subiste a Auditoría Cívica Liberal. Verifica que el archivo sea un documento legítimo de ley, decreto o política pública, e inténtalo de nuevo.</p>
        <p>Si crees que esto es un error, escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
-       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`;
+       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`,
+  };
+
+  const cuerpo = cuerpos[motivo] || cuerpos.intento_manipulacion;
 
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -2639,15 +2764,18 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.9 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.10 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
   console.log(`   PASO 6.5 usa generarGrafoConClaude() desde el 28 jul 2026 — sin regex, identifica y`);
   console.log(`   clasifica artículos (incluye leyes de reforma) con instrucciones de prompt`);
+  console.log(`   Filtro de admisibilidad ahora también rechaza documentos legítimos de otro país`);
+  console.log(`   (fuera_de_alcance_geografico) — instrucción agregada en código, no en el prompt guardado`);
   console.log(`   Recuperación puntual: /regenerar-grafo, /regenerar-presentacion, /regenerar-podcast`);
   console.log(`   Estados posibles: pendiente → admitida → completada | fallida (o rechazada por el filtro)`);
   console.log(`   Fuentes Doctrinales: campo 'categoria' activo en subir/completar-subida-media/lista-admin/editar`);
+  console.log(`   Pesos de criterios: GET /pesos, POST /pesos/actualizar — todavía sin conectar a las fórmulas`);
   console.log(`   Funciones NotebookLM intactas sin usar (dispararNotebookLM, generarPresentacion viejo,`);
   console.log(`   generarMapaMental viejo) — por si hace falta reactivar o comparar\n`);
 });
