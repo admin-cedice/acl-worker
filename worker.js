@@ -1,6 +1,16 @@
-// worker.js — ACL Worker v3.14
+// worker.js — ACL Worker v3.15
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.15 (1 ago 2026) — Manual con descarga dinámica real: el botón de la
+// landing pasa de apuntar a un PDF fijo en el repo del frontend, a pedirle
+// el PDF al worker (GET /manual/activo/pdf, público, sin secreto — igual
+// que /reporte-temp y /presentacion-temp). POST /manual/subir-version
+// ahora guarda también el PDF original (columna archivo_pdf, requiere
+// migracion-manual-pdf.sql) cuando la subida vino como pdf_base64, no solo
+// el texto extraído. La versión activa de HOY no tiene archivo_pdf
+// guardado (se subió antes de este cambio) — hay que volver a subirla
+// desde /admin/manual una vez desplegado esto para que el botón sirva algo.
 //
 // v3.14 (31 jul 2026): el texto de cada pregunta en GET /pesos ya no se
 // toma prestado de ninguna auditoría (ni siquiera como enriquecimiento
@@ -1282,7 +1292,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.14', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.15', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2282,6 +2292,10 @@ app.post('/eliminar-auditoria', async (req, res) => {
 // (el índice único de la migración lo garantiza a nivel de base de datos).
 
 // GET /manual/versiones — lista versiones con metadatos (sin el texto completo)
+// FIX (1 ago 2026): agregado `tiene_pdf` — así se ve en /admin/manual, sin
+// adivinar, cuáles versiones (probablemente las viejas, subidas antes de
+// este cambio, o las que se subieron pegando texto en vez de un PDF) no
+// tienen el archivo que necesita el botón dinámico de la landing.
 app.get('/manual/versiones', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -2289,7 +2303,8 @@ app.get('/manual/versiones', async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT id, version, notas_version, activo, creado_en,
-             length(contenido_texto) AS longitud_caracteres
+             length(contenido_texto) AS longitud_caracteres,
+             (archivo_pdf IS NOT NULL) AS tiene_pdf
       FROM manual_liberalismo
       ORDER BY creado_en DESC
     `);
@@ -2304,6 +2319,16 @@ app.get('/manual/versiones', async (req, res) => {
 // el texto con pdf-parse, ya usado en extraerTextoPDF). Queda inactiva hasta
 // que se active con POST /manual/activar.
 // Body: { version, notas_version, contenido_texto } o { version, notas_version, pdf_base64 }
+//
+// FIX (1 ago 2026): además de extraer el texto, ahora se guarda también el
+// PDF original tal cual (columna archivo_pdf, base64 — ver
+// migracion-manual-pdf.sql) cuando la subida vino como pdf_base64. Antes
+// solo se guardaba el texto extraído, así que el botón "Descargar PDF del
+// Manual" de la landing no tenía de dónde sacar un archivo real y quedaba
+// apuntando a un PDF fijo en el repo del frontend, sin relación con la
+// versión activa en la base de datos. Si la versión se sube pegando texto
+// (sin pdf_base64), archivo_pdf queda NULL — no hay PDF que guardar, y
+// GET /manual/activo/pdf lo informa en vez de fallar en silencio.
 app.post('/manual/subir-version', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -2335,18 +2360,57 @@ app.post('/manual/subir-version', async (req, res) => {
       });
     }
 
-    const { rows } = await db.query(`
-      INSERT INTO manual_liberalismo (version, contenido_texto, notas_version, activo)
-      VALUES ($1, $2, $3, false)
-      RETURNING id, version, creado_en
-    `, [version, texto, notas_version || null]);
+    // Solo se guarda archivo_pdf si la subida vino como PDF — si vino como
+    // texto pegado, no hay ningún PDF real que archivar.
+    const archivoPdf = pdf_base64 || null;
 
-    console.log(`   [manual/subir-version] ✅ Versión ${version} guardada (id: ${rows[0].id}, ${texto.length} caracteres)`);
-    res.json({ ok: true, manual: rows[0], longitud_caracteres: texto.length });
+    const { rows } = await db.query(`
+      INSERT INTO manual_liberalismo (version, contenido_texto, archivo_pdf, notas_version, activo)
+      VALUES ($1, $2, $3, $4, false)
+      RETURNING id, version, creado_en
+    `, [version, texto, archivoPdf, notas_version || null]);
+
+    console.log(`   [manual/subir-version] ✅ Versión ${version} guardada (id: ${rows[0].id}, ${texto.length} caracteres${archivoPdf ? ', con PDF' : ', sin PDF — se subió como texto'})`);
+    res.json({ ok: true, manual: rows[0], longitud_caracteres: texto.length, tiene_pdf: !!archivoPdf });
 
   } catch (err) {
     console.error('[manual/subir-version] Error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /manual/activo/pdf — sirve el PDF de la versión activa del Manual.
+// SIN autenticación a propósito (a diferencia de todo el resto de /manual/*):
+// este endpoint lo llama directo el botón de la landing pública
+// (<a href="...">), que no puede mandar el header x-worker-secret — mismo
+// criterio que ya usan /reporte-temp/:id y /presentacion-temp/:id, los
+// otros dos endpoints públicos sin secreto de este archivo.
+app.get('/manual/activo/pdf', async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT version, archivo_pdf
+      FROM manual_liberalismo
+      WHERE activo = true
+      LIMIT 1
+    `);
+
+    if (rows.length === 0) {
+      return res.status(404).type('text/plain').send('No hay ninguna versión activa del Manual Cívico Liberal.');
+    }
+    const { version, archivo_pdf } = rows[0];
+    if (!archivo_pdf) {
+      return res.status(404).type('text/plain').send(
+        `La versión activa del Manual (${version}) no tiene un PDF asociado — probablemente se subió pegando texto, o antes de este cambio (1 ago 2026). Vuelve a subirla desde /admin/manual con el archivo PDF para que este botón funcione.`
+      );
+    }
+
+    const buffer = Buffer.from(archivo_pdf, 'base64');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="Manual-Civico-Liberal-${version}.pdf"`);
+    res.send(buffer);
+  } catch (err) {
+    console.error('[manual/activo/pdf] Error:', err.message);
+    res.status(500).type('text/plain').send('Error interno sirviendo el Manual.');
   }
 });
 
@@ -2937,10 +3001,11 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.14 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.15 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
+  console.log(`   Manual: GET /manual/activo/pdf sirve el PDF real de la versión activa (público, sin secreto)`);
   console.log(`   /pesos: ids del mapa fijo del Test de Libertad, preguntas extraídas de prompt_analisis`);
   console.log(`   activo con Claude — nada de esto depende ya de ninguna auditoría en particular`);
   console.log(`   Descalificadores ("Indispensable" en la UI): un NO ahí fuerza 0% / rechazo total`);
