@@ -1,6 +1,21 @@
-// worker.js — ACL Worker v3.19
+// worker.js — ACL Worker v3.20
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.20 (2 ago 2026) — ROLES: Superadmin vs. Editor, con dientes reales.
+// Nuevo verificarJWTAdmin()/exigirSuperadmin() (verifica con "crypto"
+// nativo el JWT que ya firma Next.js con ADMIN_JWT_SECRET — sin agregar
+// el paquete "jose" al worker). Protegidos con esto: POST
+// /manual/subir-version, /manual/activar, /prompts/subir-version,
+// /prompts/activar, /pesos/actualizar. Antes, WORKER_SECRET era la única
+// llave y no distinguía roles — cualquier admin con sesión válida podía
+// llamar cualquier endpoint. REQUIERE: ADMIN_JWT_SECRET configurada en
+// Railway (mismo valor que ya usa Next.js/Netlify) — sin eso, estos 5
+// endpoints rechazan a todos, incluyendo Superadmin. Pendiente: la
+// pantalla de Administradores no pasa por este worker (vive en rutas de
+// Next.js que no se han compartido todavía) — sigue sin protección de rol
+// hasta que se revise aparte. /eliminar-auditoria y /reintentar-rechazada
+// quedan sin este candado a propósito — Editor puede usarlos.
 //
 // v3.19 (2 ago 2026): agregado GET /prompts/:id — devuelve el contenido
 // completo de una versión (los 4 prompts), para que /admin/prompts pueda
@@ -253,6 +268,7 @@ const ffmpeg     = require('fluent-ffmpeg');
 const fs         = require('fs');
 const path       = require('path');
 const pdfParse   = require('pdf-parse');
+const crypto     = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -273,6 +289,88 @@ const anthropic     = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const db            = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const DIRECTORIO_TEMP = '/tmp/acl-worker';
+
+// ── Verificación de rol Superadmin (2 ago 2026) ──────────────────────────
+// Hasta ahora, WORKER_SECRET era el único candado de todo el worker — no
+// distinguía entre Superadmin y Editor, así que cualquier admin con sesión
+// válida podía llamar CUALQUIER endpoint, incluyendo los que decidimos
+// reservar para Superadmin (activar/subir versiones del Manual y del Test,
+// actualizar pesos). Esconder el botón en la pantalla no alcanzaba —
+// alguien con el secreto en el navegador podía llamar la ruta directo.
+//
+// La solución: además de WORKER_SECRET (que sigue exigiéndose igual),
+// estos endpoints ahora piden también el JWT de sesión del admin (el mismo
+// token que ya vive en la cookie admin_session de Next.js, firmado con
+// ADMIN_JWT_SECRET) — viaja en el header 'x-admin-token'. El worker lo
+// verifica y confirma que el rol adentro sea SUPERADMIN antes de proceder.
+//
+// Se verifica con el módulo "crypto" nativo de Node, no con el paquete
+// "jose" — el formato HS256 que genera jose en Next.js (SignJWT) es un
+// JWT estándar (HMAC-SHA256 sobre "header.payload", en base64url), así
+// que no hace falta agregar una dependencia nueva ni un npm install en
+// Railway para esto.
+//
+// REQUIERE: la variable de entorno ADMIN_JWT_SECRET configurada en
+// Railway, con el MISMO valor que ya usa Next.js/Netlify. Sin eso, todo
+// endpoint que pase por exigirSuperadmin() rechaza cualquier intento,
+// incluyendo los del propio Moisés.
+function decodificarBase64Url(segmento) {
+  const base64 = segmento.replace(/-/g, '+').replace(/_/g, '/');
+  const relleno = base64.length % 4 === 0 ? '' : '='.repeat(4 - (base64.length % 4));
+  return JSON.parse(Buffer.from(base64 + relleno, 'base64').toString('utf8'));
+}
+
+function verificarJWTAdmin(token) {
+  try {
+    const secreto = process.env.ADMIN_JWT_SECRET;
+    if (!secreto || !token) return null;
+
+    const partes = token.split('.');
+    if (partes.length !== 3) return null;
+    const [headerB64, payloadB64, firmaB64] = partes;
+
+    const firmaEsperada = crypto
+      .createHmac('sha256', secreto)
+      .update(`${headerB64}.${payloadB64}`)
+      .digest('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    // Comparación en tiempo constante — evita filtrar información por
+    // cuánto tarda la comparación (timing attack) al validar la firma.
+    const bufFirma = Buffer.from(firmaB64);
+    const bufEsperada = Buffer.from(firmaEsperada);
+    if (bufFirma.length !== bufEsperada.length || !crypto.timingSafeEqual(bufFirma, bufEsperada)) {
+      return null;
+    }
+
+    const payload = decodificarBase64Url(payloadB64);
+    if (payload.exp && Date.now() >= payload.exp * 1000) return null; // token expirado
+
+    return payload; // { id, email, nombre, rol, iat, exp }
+  } catch {
+    return null;
+  }
+}
+
+// Uso: if (!exigirSuperadmin(req, res)) return;
+// Ya escribe la respuesta de error (401/403) si no pasa — el llamador solo
+// necesita cortar la ejecución cuando devuelve null.
+function exigirSuperadmin(req, res) {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    res.status(401).json({ error: 'No autorizado' });
+    return null;
+  }
+  const payload = verificarJWTAdmin(req.headers['x-admin-token']);
+  if (!payload) {
+    res.status(401).json({ error: 'Sesión inválida o expirada — vuelve a iniciar sesión en /admin.' });
+    return null;
+  }
+  if (payload.rol !== 'SUPERADMIN') {
+    res.status(403).json({ error: 'Esta acción requiere el rol Superadmin.' });
+    return null;
+  }
+  return payload;
+}
 
 // ── Utilidad: extraer el bloque de texto de una respuesta de Claude ─────────
 // Sonnet 5 activa "pensamiento adaptativo" por defecto: cuando decide pensar,
@@ -1324,7 +1422,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.19', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.20', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1814,9 +1912,7 @@ app.post('/reintentar-rechazada', async (req, res) => {
 // botón "Descargar el PDF del Test" de la landing apuntaba a un archivo
 // fijo en el repo del frontend, sin relación con la versión activa.
 app.post('/prompts/subir-version', async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
+  if (!exigirSuperadmin(req, res)) return;
   const { version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, fuentes_activas, basado_en_manual_version, pdf_base64 } = req.body;
   if (!version || !prompt_sistema || !prompt_analisis) {
     return res.status(400).json({ error: 'Faltan campos requeridos (version, prompt_sistema, prompt_analisis)' });
@@ -1869,9 +1965,7 @@ app.get('/prompts/versiones', async (req, res) => {
 // porque, mientras solo hubo una versión activa desde el principio, nadie
 // necesitó activar una distinta.
 app.post('/prompts/activar', async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
+  if (!exigirSuperadmin(req, res)) return;
 
   const { id } = req.body;
   if (!id) return res.status(400).json({ error: 'Falta el campo "id"' });
@@ -2111,9 +2205,7 @@ app.get('/pesos', async (req, res) => {
 });
 
 app.post('/pesos/actualizar', async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
+  if (!exigirSuperadmin(req, res)) return;
   const { pesos } = req.body;
   if (!pesos || typeof pesos !== 'object') {
     return res.status(400).json({ error: 'Falta el campo "pesos" (objeto {id: peso})' });
@@ -2481,9 +2573,7 @@ app.get('/manual/versiones', async (req, res) => {
 // (sin pdf_base64), archivo_pdf queda NULL — no hay PDF que guardar, y
 // GET /manual/activo/pdf lo informa en vez de fallar en silencio.
 app.post('/manual/subir-version', async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
+  if (!exigirSuperadmin(req, res)) return;
 
   const { version, notas_version, contenido_texto, pdf_base64 } = req.body;
 
@@ -2569,9 +2659,7 @@ app.get('/manual/activo/pdf', async (req, res) => {
 // transacción (evita que dos versiones queden activas si algo falla a mitad).
 // Body: { id }
 app.post('/manual/activar', async (req, res) => {
-  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'No autorizado' });
-  }
+  if (!exigirSuperadmin(req, res)) return;
 
   const { id } = req.body;
   if (!id) return res.status(400).json({ error: 'Falta el campo "id"' });
@@ -3152,7 +3240,9 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.19 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.20 corriendo en puerto ${PORT}`);
+  console.log(`   ROLES: exigirSuperadmin() protege /manual y /prompts (subir-version, activar) y`);
+  console.log(`   /pesos/actualizar — requiere ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
