@@ -1,6 +1,16 @@
-// worker.js — ACL Worker v3.15
+// worker.js — ACL Worker v3.16
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.16 (2 ago 2026) — Test de Libertad con descarga dinámica, mismo
+// patrón que el Manual (v3.15), con una diferencia real: el Test nunca
+// había tenido capacidad de adjuntar un PDF (a diferencia del Manual, que
+// ya la tenía). /prompts/subir-version ahora acepta pdf_base64 opcional
+// (columna archivo_pdf nueva, requiere migracion-test-libertad-pdf.sql), y
+// GET /prompts/activo/pdf (público, sin secreto) sirve el PDF de la
+// versión activa. La versión activa de HOY no tiene archivo_pdf guardado
+// — hay que volver a subirla desde /admin/prompts con el PDF adjunto una
+// vez desplegado esto, igual que pasó con el Manual.
 //
 // v3.15 (1 ago 2026) — Manual con descarga dinámica real: el botón de la
 // landing pasa de apuntar a un PDF fijo en el repo del frontend, a pedirle
@@ -1292,7 +1302,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.15', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.16', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1775,26 +1785,33 @@ app.post('/reintentar-rechazada', async (req, res) => {
   }
 });
 
+// FIX (2 ago 2026): acepta un pdf_base64 opcional, guardado tal cual en la
+// columna archivo_pdf (requiere migracion-test-libertad-pdf.sql) — mismo
+// patrón que ya usa /manual/subir-version. Antes de este cambio no existía
+// ninguna forma de adjuntar un PDF a una versión del Test de Libertad; el
+// botón "Descargar el PDF del Test" de la landing apuntaba a un archivo
+// fijo en el repo del frontend, sin relación con la versión activa.
 app.post('/prompts/subir-version', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
   }
-  const { version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, fuentes_activas, basado_en_manual_version } = req.body;
+  const { version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, fuentes_activas, basado_en_manual_version, pdf_base64 } = req.body;
   if (!version || !prompt_sistema || !prompt_analisis) {
     return res.status(400).json({ error: 'Faltan campos requeridos (version, prompt_sistema, prompt_analisis)' });
   }
   try {
     const result = await db.query(
       `INSERT INTO configuracion_doctrinal
-         (version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, fuentes_activas, basado_en_manual_version, activo, creado_en, actualizado_en)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, false, NOW(), NOW())
+         (version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, fuentes_activas, basado_en_manual_version, archivo_pdf, activo, creado_en, actualizado_en)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, NOW(), NOW())
        RETURNING id, version`,
       [version, prompt_sistema, prompt_analisis, prompt_semantico || null, prompt_admisibilidad || null,
        fuentes_activas ? JSON.stringify(fuentes_activas) : null,
-       basado_en_manual_version || null]
+       basado_en_manual_version || null,
+       pdf_base64 || null]
     );
-    console.log(`   Nueva versión de prompts creada (inactiva): ${result.rows[0].version}`);
-    res.json({ ok: true, id: result.rows[0].id, version: result.rows[0].version });
+    console.log(`   Nueva versión de prompts creada (inactiva): ${result.rows[0].version}${pdf_base64 ? ' — con PDF' : ' — sin PDF'}`);
+    res.json({ ok: true, id: result.rows[0].id, version: result.rows[0].version, tiene_pdf: !!pdf_base64 });
   } catch (error) {
     console.error('❌ Error subiendo versión de prompts:', error.message);
     res.status(500).json({ error: error.message });
@@ -1808,7 +1825,8 @@ app.get('/prompts/versiones', async (req, res) => {
   try {
     const result = await db.query(
       `SELECT id, version, activo, creado_en, actualizado_en, basado_en_manual_version,
-              LEFT(prompt_analisis, 200) AS prompt_analisis_preview
+              LEFT(prompt_analisis, 200) AS prompt_analisis_preview,
+              (archivo_pdf IS NOT NULL) AS tiene_pdf
        FROM configuracion_doctrinal
        ORDER BY creado_en DESC`
     );
@@ -1816,6 +1834,41 @@ app.get('/prompts/versiones', async (req, res) => {
   } catch (error) {
     console.error('❌ Error listando versiones de prompts:', error.message);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /prompts/activo/pdf — sirve el PDF de la versión activa del Test de
+// Libertad. SIN autenticación a propósito, igual que /manual/activo/pdf,
+// /reporte-temp/:id y /presentacion-temp/:id: lo llama directo el botón
+// de la landing pública (<a href="...">), que no puede mandar el header
+// x-worker-secret.
+app.get('/prompts/activo/pdf', async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT version, archivo_pdf
+      FROM configuracion_doctrinal
+      WHERE activo = true
+      ORDER BY version DESC
+      LIMIT 1
+    `);
+
+    if (rows.length === 0) {
+      return res.status(404).type('text/plain').send('No hay ninguna versión activa del Test de Libertad.');
+    }
+    const { version, archivo_pdf } = rows[0];
+    if (!archivo_pdf) {
+      return res.status(404).type('text/plain').send(
+        `La versión activa del Test de Libertad (${version}) no tiene un PDF asociado — probablemente se subió antes de este cambio (2 ago 2026), o solo se cargó el texto de los prompts. Vuelve a subirla desde /admin/prompts con el archivo PDF para que este botón funcione.`
+      );
+    }
+
+    const buffer = Buffer.from(archivo_pdf, 'base64');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="Test-de-Libertad-${version}.pdf"`);
+    res.send(buffer);
+  } catch (err) {
+    console.error('[prompts/activo/pdf] Error:', err.message);
+    res.status(500).type('text/plain').send('Error interno sirviendo el Test de Libertad.');
   }
 });
 
@@ -3001,11 +3054,12 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.15 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.16 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
   console.log(`   Manual: GET /manual/activo/pdf sirve el PDF real de la versión activa (público, sin secreto)`);
+  console.log(`   Test de Libertad: GET /prompts/activo/pdf, mismo patrón — nuevo, requiere volver a subir PDF`);
   console.log(`   /pesos: ids del mapa fijo del Test de Libertad, preguntas extraídas de prompt_analisis`);
   console.log(`   activo con Claude — nada de esto depende ya de ninguna auditoría en particular`);
   console.log(`   Descalificadores ("Indispensable" en la UI): un NO ahí fuerza 0% / rechazo total`);
