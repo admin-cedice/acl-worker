@@ -1,6 +1,13 @@
-// worker.js — ACL Worker v3.16
+// worker.js — ACL Worker v3.17
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.17 (2 ago 2026): agregado POST /prompts/activar — no existía. El
+// botón "Activar" de /admin/prompts llevaba tiempo llamando a una ruta
+// nunca construida (404 en cada clic); no se había notado porque, con una
+// sola versión activa desde el principio, nadie había necesitado cambiarla.
+// Mismo patrón transaccional que /manual/activar (desactiva todas, activa
+// la elegida, todo o nada).
 //
 // v3.16 (2 ago 2026) — Test de Libertad con descarga dinámica, mismo
 // patrón que el Manual (v3.15), con una diferencia real: el Test nunca
@@ -1302,7 +1309,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.16', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.17', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1834,6 +1841,50 @@ app.get('/prompts/versiones', async (req, res) => {
   } catch (error) {
     console.error('❌ Error listando versiones de prompts:', error.message);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /prompts/activar — activa una versión del Test de Libertad y
+// desactiva las demás en una transacción (evita que dos versiones queden
+// activas si algo falla a mitad). Mismo patrón exacto que /manual/activar.
+//
+// FIX (2 ago 2026): este endpoint NO EXISTÍA. El botón "Activar" de
+// /admin/prompts llevaba tiempo llamando a esta ruta sin que nadie la
+// hubiera construido — cada clic devolvía un 404. No se detectó antes
+// porque, mientras solo hubo una versión activa desde el principio, nadie
+// necesitó activar una distinta.
+app.post('/prompts/activar', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'Falta el campo "id"' });
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`UPDATE configuracion_doctrinal SET activo = false WHERE activo = true`);
+    const { rows } = await client.query(`
+      UPDATE configuracion_doctrinal SET activo = true, actualizado_en = NOW() WHERE id = $1
+      RETURNING id, version
+    `, [id]);
+
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Versión no encontrada' });
+    }
+
+    await client.query('COMMIT');
+    console.log(`   [prompts/activar] ✅ Versión ${rows[0].version} activada (id: ${rows[0].id})`);
+    res.json({ ok: true, activado: rows[0] });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[prompts/activar] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -3054,12 +3105,14 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.16 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.17 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
   console.log(`   Manual: GET /manual/activo/pdf sirve el PDF real de la versión activa (público, sin secreto)`);
-  console.log(`   Test de Libertad: GET /prompts/activo/pdf, mismo patrón — nuevo, requiere volver a subir PDF`);
+  console.log(`   Test de Libertad: GET /prompts/activo/pdf, mismo patrón — requiere volver a subir PDF`);
+  console.log(`   FIX 2 ago: POST /prompts/activar ya existe — el botón "Activar" de /admin/prompts llevaba`);
+  console.log(`   tiempo dando 404 en cada clic`);
   console.log(`   /pesos: ids del mapa fijo del Test de Libertad, preguntas extraídas de prompt_analisis`);
   console.log(`   activo con Claude — nada de esto depende ya de ninguna auditoría en particular`);
   console.log(`   Descalificadores ("Indispensable" en la UI): un NO ahí fuerza 0% / rechazo total`);
