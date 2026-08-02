@@ -1,6 +1,14 @@
-// worker.js — ACL Worker v3.20
+// worker.js — ACL Worker v3.21
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.21 (2 ago 2026): FIX — exigirSuperadmin() comparaba payload.rol contra
+// "SUPERADMIN" en mayúsculas exactas. La insignia del topbar se ve en
+// mayúsculas por CSS (text-transform), no porque el valor real guardado en
+// usuarios_admin.rol esté necesariamente así — con cualquier otra
+// combinación de mayúsculas/minúsculas, un Superadmin real quedaba tratado
+// como si no lo fuera. Ahora la comparación ignora mayúsculas/minúsculas.
+// Mismo fix aplicado en admin/prompts/page.js y admin/pesos/page.js.
 //
 // v3.20 (2 ago 2026) — ROLES: Superadmin vs. Editor, con dientes reales.
 // Nuevo verificarJWTAdmin()/exigirSuperadmin() (verifica con "crypto"
@@ -365,7 +373,11 @@ function exigirSuperadmin(req, res) {
     res.status(401).json({ error: 'Sesión inválida o expirada — vuelve a iniciar sesión en /admin.' });
     return null;
   }
-  if (payload.rol !== 'SUPERADMIN') {
+  // Insensible a mayúsculas/minúsculas — el valor real guardado en
+  // usuarios_admin.rol puede no coincidir exactamente con "SUPERADMIN" en
+  // mayúsculas (la insignia del topbar se ve así por una regla de diseño,
+  // no porque el dato en sí esté en mayúsculas).
+  if (typeof payload.rol !== 'string' || payload.rol.toUpperCase() !== 'SUPERADMIN') {
     res.status(403).json({ error: 'Esta acción requiere el rol Superadmin.' });
     return null;
   }
@@ -1422,7 +1434,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.20', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.21', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -3240,7 +3252,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.20 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.21 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual y /prompts (subir-version, activar) y`);
   console.log(`   /pesos/actualizar — requiere ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
