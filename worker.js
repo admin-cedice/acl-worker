@@ -1,6 +1,12 @@
-// worker.js — ACL Worker v3.18
+// worker.js — ACL Worker v3.19
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.19 (2 ago 2026): agregado GET /prompts/:id — devuelve el contenido
+// completo de una versión (los 4 prompts), para que /admin/prompts pueda
+// prellenar el formulario de "+ Nueva versión" con el contenido de la
+// versión activa, en vez de abrirlo en blanco. Registrado al final del
+// grupo /prompts/* a propósito, para no interceptar las rutas específicas.
 //
 // v3.18 (2 ago 2026): ajuste de formato en la lista de materiales del
 // correo "Tu auditoría está lista" (enviarEmailFinal) — Podcast y
@@ -1318,7 +1324,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.18', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.19', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1929,6 +1935,38 @@ app.get('/prompts/activo/pdf', async (req, res) => {
   } catch (err) {
     console.error('[prompts/activo/pdf] Error:', err.message);
     res.status(500).type('text/plain').send('Error interno sirviendo el Test de Libertad.');
+  }
+});
+
+// GET /prompts/:id — devuelve el contenido completo (los 4 prompts) de
+// una versión específica. Necesario porque /prompts/versiones solo manda
+// una vista previa de 200 caracteres de prompt_analisis y nada de los
+// otros 3 prompts — no alcanza para prellenar el formulario de
+// "+ Nueva versión" con el contenido de la versión activa (2 ago 2026,
+// a pedido de Moisés: el formulario aparecía en blanco y no había forma
+// de partir de lo que ya existía). NO devuelve archivo_pdf — el PDF no
+// se arrastra solo de una versión a otra, hay que volver a adjuntarlo
+// cada vez, a propósito.
+//
+// IMPORTANTE: esta ruta debe quedar registrada DESPUÉS de todas las
+// demás rutas /prompts/* (arriba) — Express prueba las rutas en el orden
+// en que se registran, y ':id' como comodín intentaría interceptar
+// '/prompts/versiones', '/prompts/activo', etc. si quedara antes.
+app.get('/prompts/:id', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const { rows } = await db.query(
+      `SELECT id, version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, basado_en_manual_version
+       FROM configuracion_doctrinal WHERE id = $1`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Versión no encontrada' });
+    res.json({ ok: true, ...rows[0] });
+  } catch (error) {
+    console.error('❌ Error obteniendo detalle de versión de prompts:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -3114,7 +3152,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.18 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.19 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
