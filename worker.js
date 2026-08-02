@@ -1,6 +1,15 @@
-// worker.js — ACL Worker v3.21
+// worker.js — ACL Worker v3.22
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.22 (2 ago 2026): exigirSuperadmin() ahora distingue 3 causas de
+// rechazo que antes daban el mismo mensaje genérico ("Sesión inválida o
+// expirada"): (1) ADMIN_JWT_SECRET no configurada en este servidor, (2)
+// falta el header x-admin-token, (3) el token llegó pero su firma no
+// coincide o expiró. Cada una dice explícitamente qué revisar — se
+// necesitó hoy mismo, en vivo, para diagnosticar por qué Moisés (Superadmin
+// real, confirmado en el payload del JWT) seguía viendo el mensaje
+// genérico tras agregar la variable en Railway.
 //
 // v3.21 (2 ago 2026): FIX — exigirSuperadmin() comparaba payload.rol contra
 // "SUPERADMIN" en mayúsculas exactas. La insignia del topbar se ve en
@@ -368,9 +377,22 @@ function exigirSuperadmin(req, res) {
     res.status(401).json({ error: 'No autorizado' });
     return null;
   }
+
+  // Diagnóstico específico (2 ago 2026): antes, "sin ADMIN_JWT_SECRET
+  // configurada" y "token con firma que no coincide" daban el mismo
+  // mensaje genérico — imposible saber cuál de las dos cosas pasaba sin
+  // mirar el código. Ahora cada caso dice exactamente qué revisar.
+  if (!process.env.ADMIN_JWT_SECRET) {
+    res.status(500).json({ error: 'El worker no tiene configurada la variable ADMIN_JWT_SECRET en Railway. Agrégala y vuelve a desplegar — sin ella, ninguna acción de Superadmin puede verificarse.' });
+    return null;
+  }
+  if (!req.headers['x-admin-token']) {
+    res.status(401).json({ error: 'Falta el token de sesión (x-admin-token) — vuelve a iniciar sesión en /admin.' });
+    return null;
+  }
   const payload = verificarJWTAdmin(req.headers['x-admin-token']);
   if (!payload) {
-    res.status(401).json({ error: 'Sesión inválida o expirada — vuelve a iniciar sesión en /admin.' });
+    res.status(401).json({ error: 'La firma del token no coincide o expiró. Si acabas de configurar ADMIN_JWT_SECRET en Railway, confirma que sea EXACTAMENTE igual (sin espacios de más) a la que usa Netlify, y que el worker se haya vuelto a desplegar después de guardarla.' });
     return null;
   }
   // Insensible a mayúsculas/minúsculas — el valor real guardado en
@@ -1434,7 +1456,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.21', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.22', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -3252,7 +3274,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.21 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.22 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual y /prompts (subir-version, activar) y`);
   console.log(`   /pesos/actualizar — requiere ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
