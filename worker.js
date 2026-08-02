@@ -1,6 +1,15 @@
-// worker.js — ACL Worker v3.17
+// worker.js — ACL Worker v3.18
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.18 (2 ago 2026): ajuste de formato en la lista de materiales del
+// correo "Tu auditoría está lista" (enviarEmailFinal) — Podcast y
+// Presentación ahora muestran su formato de archivo fuera del link, no
+// dentro (ej. "Podcast (mp3)" en vez de "Podcast — Audio Overview"). De
+// paso, se corrige una etiqueta desactualizada: Presentación decía
+// "(PPTX)" — quedó así de cuando el archivo era un pptx real; hoy
+// generarPresentacionPDF.js genera un PDF (HTML→PDF vía CloudConvert)
+// desde hace semanas, el correo nunca se había actualizado para reflejarlo.
 //
 // v3.17 (2 ago 2026): agregado POST /prompts/activar — no existía. El
 // botón "Activar" de /admin/prompts llevaba tiempo llamando a una ruta
@@ -1309,7 +1318,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.17', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.18', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2974,9 +2983,9 @@ async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links) {
         <p>Tu auditoría de <strong>${titulo}</strong> está lista. Aquí están tus materiales:</p>
         <ul>
           ${links.reporte      ? `<li><a href="${links.reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
-          ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Podcast — Audio Overview</a></li>` : ''}
-          ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Presentación (PPTX)</a></li>` : ''}
-          <li><a href="https://liberalmente.app/auditoria/${auditoria_id}/grafo">🌐 Mapa Mental (interactivo)</a></li>
+          ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Podcast </a>(mp3)</li>` : ''}
+          ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Presentación </a>(PDF)</li>` : ''}
+          <li><a href="https://liberalmente.app/auditoria/${auditoria_id}/grafo">🌐 Mapa Mental (Web, Grafo3D interactivo)</a></li>
         </ul>
         <p>Accede a todos tus análisis en <a href="https://liberalmente.app/biblioteca">liberalmente.app/biblioteca</a>; y si quieres compartir este correo con otras personas, ¡no dudes en reenviárselos!</p>
         <p>Saludos,</p>
@@ -3105,7 +3114,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.17 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.18 corriendo en puerto ${PORT}`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
   console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
