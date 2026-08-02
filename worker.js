@@ -1,6 +1,22 @@
-// worker.js — ACL Worker v3.22
+// worker.js — ACL Worker v3.24
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.24 (2 ago 2026): agregado POST /registrar-clic (público, sin
+// secreto) — clicks_auditoria y su lectura (/metricas/resumen, v3.23) ya
+// existían, pero nada escribía en la tabla. app/page.js ahora dispara este
+// endpoint al hacer clic en cualquier link de producto de la biblioteca
+// (Reporte/Podcast/Presentación/Mapa Mental/Original), sin bloquear la
+// descarga real (fire-and-forget). ciudadano_id y pais quedan NULL —
+// requiere migracion-clicks-nullable.sql si esas columnas eran NOT NULL.
+//
+// v3.23 (2 ago 2026): agregado GET /metricas/resumen — NO EXISTÍA.
+// /admin/metricas llevaba tiempo pidiéndolo sin que nadie lo hubiera
+// construido; el error que veía cualquiera al abrir esa pantalla
+// ("<!DOCTYPE ... is not valid JSON") era el 404 de Express en HTML, no
+// un error real de datos. Detectado por Sarah, primera cuenta Editor real
+// probando la pantalla. Cada consulta corre con su propio respaldo — un
+// problema puntual en una sola sección no tumba el resto del panel.
 //
 // v3.22 (2 ago 2026): exigirSuperadmin() ahora distingue 3 causas de
 // rechazo que antes daban el mismo mensaje genérico ("Sesión inválida o
@@ -1456,7 +1472,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.22', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.24', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2263,6 +2279,92 @@ app.post('/pesos/actualizar', async (req, res) => {
   }
 });
 
+// ── Métricas (2 ago 2026) ─────────────────────────────────────────────────
+// FIX: este endpoint NO EXISTÍA — /admin/metricas llevaba tiempo pidiendo
+// GET /metricas/resumen sin que nadie lo hubiera construido nunca. Por eso
+// el error que vio Sarah (primera cuenta Editor real probando la pantalla)
+// era "<!DOCTYPE ... is not valid JSON": Express devuelve su página de 404
+// en HTML para cualquier ruta que no existe, no un error JSON — y el
+// frontend, al intentar parsear esa página como JSON, truena.
+//
+// Disponible para cualquier admin autenticado (Superadmin o Editor) — es
+// un panel de solo lectura, no una acción que modifique nada, así que no
+// pasa por exigirSuperadmin().
+//
+// Cada consulta corre en su propio try/catch (consultaSegura) — si una
+// tabla o columna no coincide exactamente con lo que este endpoint asume
+// (ver nota sobre clicks_auditoria más abajo), esa sección específica
+// queda vacía con un aviso en el log, en vez de tumbar toda la pantalla
+// de métricas por un solo problema puntual.
+app.get('/metricas/resumen', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  async function consultaSegura(sql, params, porDefecto) {
+    try {
+      const { rows } = await db.query(sql, params);
+      return rows;
+    } catch (err) {
+      console.error(`   [metricas/resumen] Una consulta falló, se usa el valor por defecto:`, err.message);
+      return porDefecto;
+    }
+  }
+
+  try {
+    const [
+      totalCiudadanosRows,
+      totalAuditoriasRows,
+      porEstado,
+      porMotivoRechazo,
+      porPais,
+      porTipoClick,
+    ] = await Promise.all([
+      consultaSegura(`SELECT COUNT(*)::int AS total FROM ciudadanos`, [], [{ total: 0 }]),
+      consultaSegura(`SELECT COUNT(*)::int AS total FROM auditorias`, [], [{ total: 0 }]),
+      consultaSegura(
+        `SELECT estado, COUNT(*)::int AS total FROM auditorias GROUP BY estado ORDER BY total DESC`,
+        [], []
+      ),
+      consultaSegura(
+        `SELECT COALESCE(motivo_rechazo_tipo, 'sin_motivo') AS motivo, COUNT(*)::int AS total
+         FROM auditorias WHERE estado = 'rechazada' GROUP BY motivo ORDER BY total DESC`,
+        [], []
+      ),
+      consultaSegura(
+        `SELECT COALESCE(pais, 'General') AS pais, COUNT(*)::int AS total
+         FROM auditorias WHERE pais IS NOT NULL GROUP BY pais ORDER BY total DESC`,
+        [], []
+      ),
+      // NOTA: se asume que clicks_auditoria tiene una columna "tipo_link"
+      // con valores reporte/podcast/presentacion/mapa/original — es lo
+      // único consistente con lo que ya espera app/admin/metricas/page.js
+      // (LABELS_CLICK), pero no tengo la migración que creó esta tabla
+      // para confirmar el nombre exacto de la columna. Si el nombre real
+      // es otro, esta sección queda vacía (con aviso en el log) sin
+      // tumbar el resto — avísame si "Consumo por tipo de producto" sale
+      // siempre vacío y reviso el nombre real de la columna.
+      consultaSegura(
+        `SELECT tipo_link, COUNT(*)::int AS total FROM clicks_auditoria GROUP BY tipo_link ORDER BY total DESC`,
+        [], []
+      ),
+    ]);
+
+    res.json({
+      ok: true,
+      totalCiudadanos: totalCiudadanosRows[0]?.total || 0,
+      totalAuditorias: totalAuditoriasRows[0]?.total || 0,
+      porEstado,
+      porMotivoRechazo,
+      porPais,
+      porTipoClick,
+    });
+  } catch (error) {
+    console.error('❌ Error en /metricas/resumen:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const { Readable } = require('stream');
 
 const DRIVE_CARPETA_FUENTES_ID = process.env.DRIVE_CARPETA_FUENTES_ID;
@@ -2508,6 +2610,49 @@ app.post('/fuentes/editar', async (req, res) => {
     res.json({ ok: true, titulo: result.rows[0].titulo });
   } catch (error) {
     console.error('❌ Error editando fuente doctrinal:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── Registro de clics (2 ago 2026) ────────────────────────────────────────
+// FIX: la tabla clicks_auditoria y su lectura (/metricas/resumen) existían
+// desde antes, pero nada la alimentaba — ningún endpoint escribía en ella,
+// y ningún link de la biblioteca pública disparaba nada al hacer clic. Por
+// eso "Consumo por tipo de producto" en Métricas siempre iba a salir
+// vacío, no por falta de uso real sino porque nadie estaba registrando
+// nada.
+//
+// SIN autenticación a propósito — lo llama cualquier visitante de la
+// landing pública al abrir un Reporte, Podcast, Presentación, Mapa Mental
+// u Original, no un admin logueado (mismo criterio que /manual/activo/pdf
+// y /prompts/activo/pdf: rutas públicas, sin secreto).
+//
+// Diseñado para NUNCA bloquear la descarga real: el frontend dispara este
+// POST sin esperar su respuesta (fire-and-forget) al mismo tiempo que el
+// link ya se está abriendo — si esto falla, el visitante igual recibe su
+// archivo, solo se pierde el dato de la métrica.
+//
+// ciudadano_id y pais quedan NULL a propósito: hoy no hay ningún mecanismo
+// para saber qué ciudadano (si acaso) está navegando la biblioteca pública
+// sin haber iniciado sesión — no se inventa un valor falso solo para
+// llenar la columna.
+app.post('/registrar-clic', async (req, res) => {
+  const { auditoria_id, tipo_link } = req.body || {};
+  const TIPOS_VALIDOS = ['reporte', 'podcast', 'presentacion', 'mapa', 'original'];
+  if (!auditoria_id || !TIPOS_VALIDOS.includes(tipo_link)) {
+    return res.status(400).json({ error: 'Faltan o son inválidos auditoria_id / tipo_link' });
+  }
+  try {
+    await db.query(
+      `INSERT INTO clicks_auditoria (auditoria_id, tipo_link) VALUES ($1, $2)`,
+      [auditoria_id, tipo_link]
+    );
+    res.json({ ok: true });
+  } catch (error) {
+    // No bloqueante por diseño — ver nota arriba. El frontend ni siquiera
+    // espera esta respuesta, pero igual queda registrado en el log para
+    // poder diagnosticar si algo como ciudadano_id/pais resultan NOT NULL.
+    console.error('❌ Error registrando clic (no bloqueante):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -3274,7 +3419,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.22 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.24 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual y /prompts (subir-version, activar) y`);
   console.log(`   /pesos/actualizar — requiere ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
