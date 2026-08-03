@@ -1,6 +1,28 @@
-// worker.js — ACL Worker v3.24
+// worker.js — ACL Worker v3.26
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.26 (2 ago 2026): cerrado el último cabo suelto de la sección de
+// piezas fijas del podcast — /mezclar-musica-pieza-fija (música desde
+// Drive por fileId, ?secret= en la URL). Reemplazada por POST
+// /podcast/mezclar-musica-drive (exigirSuperadmin), misma lógica exacta
+// (descarga desde Drive con autenticarDrive()/descargarPDF(), mezcla con
+// agregarFondoMusical()). De paso, se corrigió un comentario huérfano que
+// había quedado partido a la mitad por la edición de v3.25.
+//
+// v3.25 (2 ago 2026): piezas fijas del podcast (cortina/cierre) movidas
+// a Admin. Cerradas /generar-pieza-fija y /subir-musica-fija (GET+POST) —
+// vivían fuera de /admin/*, protegidas con ?secret= pegado en la URL
+// (expuesto en historial y logs). Reemplazadas por GET /podcast/textos-fijos
+// (cualquier admin, solo lectura), POST /podcast/textos-fijos/actualizar,
+// POST /podcast/generar-pieza y POST /podcast/subir-musica-fija (los 3
+// últimos, exigirSuperadmin). El texto de cada pieza ahora vive en
+// configuracion_podcast (requiere migracion-configuracion-podcast.sql),
+// no fijo en el código — aunque el paso de subir el mp3 resultante a
+// acl-worker/assets/ y desplegar sigue siendo manual, porque esos son
+// archivos del repo, no algo guardado en la base de datos.
+// /mezclar-musica-pieza-fija (música desde Drive) cerrada también en
+// v3.26 — ver más abajo.
 //
 // v3.24 (2 ago 2026): agregado POST /registrar-clic (público, sin
 // secreto) — clicks_auditoria y su lectura (/metricas/resumen, v3.23) ya
@@ -1472,7 +1494,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.24', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.26', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1669,30 +1691,88 @@ app.get('/regenerar-podcast', async (req, res) => {
   }
 });
 
-// ENDPOINT DE UN SOLO USO — genera las piezas fijas de la cortina del
-// podcast (intro y cierre) y las devuelve como mp3 descargable. Se corre
-// UNA vez; el resultado se descarga y se sube manualmente al repo en
-// acl-worker/assets/cortina-fija.mp3 y acl-worker/assets/cierre-fijo.mp3.
-// No se vuelve a llamar en producción — generarPodcastMp3() lee esos
-// archivos ya guardados, no genera esta pieza en cada podcast (sería
-// gastar caracteres del plan en algo que nunca cambia).
+// ── Piezas fijas del podcast (cortina/cierre) — movido a Admin (2 ago 2026) ──
+// FIX: /generar-pieza-fija y /subir-musica-fija vivían fuera de /admin/*,
+// protegidas con un ?secret= pegado en la URL del navegador — quedaba
+// expuesto en el historial y en logs de acceso. Cerradas ambas. Todo lo
+// que hacían sigue existiendo, pero ahora vive detrás de sesión real
+// (exigirSuperadmin) y se llama desde /admin/podcast, no desde una URL
+// suelta. El texto de cada pieza ahora se lee de configuracion_podcast
+// (requiere migracion-configuracion-podcast.sql) en vez de estar fijo en
+// el código — así el formulario de Admin puede editarlo de verdad.
 //
-// En el navegador:
-//   https://acl-worker-production.up.railway.app/generar-pieza-fija?secret=TU_SECRETO_NUEVO&pieza=intro
-//   https://acl-worker-production.up.railway.app/generar-pieza-fija?secret=TU_SECRETO_NUEVO&pieza=cierre
-// Cada una descarga un archivo — guárdalo con el nombre que indica el
-// comentario de arriba, dentro de una carpeta nueva `assets/` en el repo.
-app.get('/generar-pieza-fija', async (req, res) => {
-  if (req.query.secret !== WORKER_SECRET) {
-    return res.status(401).send('No autorizado');
+// Lo que NO cambia: el resultado sigue siendo un mp3 que se descarga al
+// navegador — subirlo a acl-worker/assets/ y desplegar sigue siendo
+// manual, porque las piezas fijas son archivos del repositorio, no algo
+// guardado en la base de datos (a diferencia del Manual y el Test).
+//
+// /mezclar-musica-pieza-fija (música desde Drive por fileId) cerrada en
+// v3.26 — ver POST /podcast/mezclar-musica-drive más abajo.
+
+async function obtenerTextosPodcast() {
+  try {
+    const { rows } = await db.query(
+      `SELECT texto_cortina, texto_cierre FROM configuracion_podcast ORDER BY id DESC LIMIT 1`
+    );
+    if (rows.length > 0) return rows[0];
+  } catch (err) {
+    console.warn('   [obtenerTextosPodcast] No se pudo leer configuracion_podcast, se usa el texto fijo del código:', err.message);
   }
-  const pieza = req.query.pieza; // 'intro' | 'cierre'
-  const textos = { intro: TEXTO_CORTINA_FIJA, cierre: TEXTO_CIERRE_FIJO };
-  const texto = textos[pieza];
-  if (!texto) {
-    return res.status(400).send('Falta ?pieza=intro o ?pieza=cierre en la URL');
+  // Respaldo: si la migración todavía no corrió, o la tabla está vacía,
+  // se usa exactamente el mismo texto que tenía el código antes de este
+  // cambio — comportamiento idéntico al de siempre, nunca se rompe por
+  // esto.
+  return { texto_cortina: TEXTO_CORTINA_FIJA, texto_cierre: TEXTO_CIERRE_FIJO };
+}
+
+// GET /podcast/textos-fijos — disponible para cualquier admin (Superadmin
+// o Editor); es de solo lectura, no una acción que modifique nada.
+app.get('/podcast/textos-fijos', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
   }
   try {
+    const textos = await obtenerTextosPodcast();
+    res.json({ ok: true, ...textos });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /podcast/textos-fijos/actualizar — Superadmin. Guarda el texto
+// nuevo. No genera ningún audio por sí solo — solo actualiza qué texto va
+// a usar la próxima vez que alguien le dé "Generar audio".
+app.post('/podcast/textos-fijos/actualizar', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+  const { texto_cortina, texto_cierre } = req.body || {};
+  if (!texto_cortina?.trim() || !texto_cierre?.trim()) {
+    return res.status(400).json({ error: 'Faltan texto_cortina o texto_cierre' });
+  }
+  try {
+    await db.query(
+      `INSERT INTO configuracion_podcast (texto_cortina, texto_cierre) VALUES ($1, $2)`,
+      [texto_cortina.trim(), texto_cierre.trim()]
+    );
+    console.log('   [podcast/textos-fijos/actualizar] ✅ Textos guardados');
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error en /podcast/textos-fijos/actualizar:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /podcast/generar-pieza — Superadmin. Reemplaza /generar-pieza-fija.
+// Genera la voz (ElevenLabs) con el texto guardado en configuracion_podcast
+// y devuelve el mp3 como descarga directa — solo voz, sin música todavía.
+app.post('/podcast/generar-pieza', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+  const { pieza } = req.body || {};
+  if (!['intro', 'cierre'].includes(pieza)) {
+    return res.status(400).json({ error: 'Falta o es inválido el campo "pieza" (intro | cierre)' });
+  }
+  try {
+    const textos = await obtenerTextosPodcast();
+    const texto = pieza === 'intro' ? textos.texto_cortina : textos.texto_cierre;
     const buffer = await generarAudioLote(
       [{ voice_id: VOZ_ID.ANITA, text: texto }],
       'pieza-fija',
@@ -1703,171 +1783,30 @@ app.get('/generar-pieza-fija', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
     res.send(buffer);
   } catch (error) {
-    console.error('   [generar-pieza-fija] ❌ Error:', error.message);
-    res.status(500).send('Error: ' + error.message);
+    console.error('   [podcast/generar-pieza] ❌ Error:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// ENDPOINT DE USO OCASIONAL — mezcla música de fondo con una pieza FIJA ya
-// generada (cortina o cierre). No toca ElevenLabs para nada — descarga la
-// pista de música desde Drive (por su fileId) y la mezcla localmente con
-// ffmpeg contra el mp3 de voz que ya está en assets/. Se puede correr las
-// veces que haga falta para probar distintas pistas o volúmenes, sin
-// gastar ni un carácter del plan de ElevenLabs.
-//
-// Requisito: subir la pista de música a Drive primero (cualquier carpeta),
-// obtener su fileId (clic derecho → Compartir → copiar el ID de la URL),
-// y confirmar que su licencia permite uso comercial antes de usarla.
-//
-// En el navegador:
-//   https://acl-worker-production.up.railway.app/mezclar-musica-pieza-fija?secret=TU_SECRETO_NUEVO&pieza=intro&musica_drive_id=EL_ID_DE_DRIVE
-//   https://acl-worker-production.up.railway.app/mezclar-musica-pieza-fija?secret=TU_SECRETO_NUEVO&pieza=cierre&musica_drive_id=EL_ID_DE_DRIVE
-// Opcional: &inicio_musica=1:10 (o solo segundos, ej. 70) — para empezar
-// a media pista en vez de desde el principio. Sin este parámetro, empieza
-// desde el segundo 0.
-// Descarga el resultado y súbelo al repo reemplazando el archivo en
-// assets/ (mismo nombre: cortina-fija.mp3 o cierre-fijo.mp3).
-app.get('/mezclar-musica-pieza-fija', async (req, res) => {
-  if (req.query.secret !== WORKER_SECRET) {
-    return res.status(401).send('No autorizado');
-  }
-  const pieza = req.query.pieza; // 'intro' | 'cierre'
-  const musicaDriveId = req.query.musica_drive_id;
-  const inicioSegundos = parsearTiempoASegundos(req.query.inicio_musica);
-  const rutasVoz = { intro: RUTA_CORTINA_FIJA_DEFECTO, cierre: RUTA_CIERRE_FIJO_DEFECTO };
-  const rutaVoz = rutasVoz[pieza];
+// POST /podcast/subir-musica-fija — Superadmin. Reemplaza el POST
+// /subir-musica-fija viejo. Mezcla el mp3 de música que suba el admin con
+// la pieza de voz (intro o cierre) que ya exista en assets/, y devuelve
+// el resultado como descarga directa.
+app.post('/podcast/subir-musica-fija', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
 
-  if (!rutaVoz) {
-    return res.status(400).send('Falta ?pieza=intro o ?pieza=cierre en la URL');
-  }
-  if (!musicaDriveId) {
-    return res.status(400).send('Falta ?musica_drive_id en la URL — sube la pista a Drive primero y copia su fileId');
-  }
-  if (!fs.existsSync(rutaVoz)) {
-    return res.status(404).send(`No existe todavía ${rutaVoz} — genera la pieza de voz primero con /generar-pieza-fija?pieza=${pieza}, súbela al repo como assets/, y despliega antes de mezclar música.`);
-  }
-
-  const dirTemp = path.join(DIRECTORIO_TEMP, `mezcla-musica-${pieza}-${Date.now()}`);
-  fs.mkdirSync(dirTemp, { recursive: true });
-
-  try {
-    console.log(`   [mezclar-musica-pieza-fija] Descargando música (Drive: ${musicaDriveId})...`);
-    const driveAuth = autenticarDrive();
-    const drive = google.drive({ version: 'v3', auth: driveAuth });
-    const rutaMusica = path.join(dirTemp, 'musica.mp3');
-    await descargarPDF(drive, musicaDriveId, rutaMusica); // sirve para cualquier archivo, no solo PDF
-
-    console.log(`   [mezclar-musica-pieza-fija] Mezclando con ${rutaVoz} (música desde el segundo ${inicioSegundos})...`);
-    const rutaSalida = path.join(dirTemp, `${pieza}-con-musica.mp3`);
-    await agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, { inicioSegundos });
-
-    const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
-    fs.createReadStream(rutaSalida).pipe(res).on('close', () => {
-      fs.rmSync(dirTemp, { recursive: true, force: true });
-    });
-  } catch (error) {
-    console.error('   [mezclar-musica-pieza-fija] ❌ Error:', error.message);
-    fs.rmSync(dirTemp, { recursive: true, force: true });
-    res.status(500).send('Error: ' + error.message);
-  }
-});
-
-// ENDPOINT DE RESPALDO (20 jul 2026) — sube el mp3 de música directo al
-// worker, sin pasar por Google Drive en ningún momento. Se agregó después
-// de que /mezclar-musica-pieza-fija diera 404 en un archivo con permisos
-// aparentemente correctos ("cualquiera con el enlace", ID confirmado) —
-// probable política de la organización de Workspace restringiendo acceso
-// externo, más allá de lo que muestra el diálogo de "Compartir" de un
-// archivo individual. En vez de depurar esa política, este camino evita
-// el problema por completo: el archivo nunca toca Drive.
-//
-// GET sirve un formulario HTML simple (elegir archivo, elegir pieza,
-// opcional el punto de inicio) — pensado para usarse desde el navegador,
-// sin Postman ni curl. POST recibe el archivo en base64 (mismo patrón que
-// /fuentes/subir), lo mezcla con la pieza de voz correspondiente, y
-// devuelve el resultado como descarga directa.
-app.get('/subir-musica-fija', (req, res) => {
-  if (req.query.secret !== WORKER_SECRET) {
-    return res.status(401).send('No autorizado');
-  }
-  const secretoParaFormulario = String(req.query.secret).replace(/"/g, '');
-  res.type('html').send(`<!DOCTYPE html>
-<html lang="es">
-<head><meta charset="UTF-8"><title>Subir música — Liberalmente</title></head>
-<body style="font-family: sans-serif; max-width: 480px; margin: 40px auto; line-height: 1.5;">
-  <h2>Subir música de fondo</h2>
-  <p>Sube el mp3 directo — no pasa por Drive.</p>
-  <form id="f">
-    <p><label>Archivo mp3:<br><input type="file" id="archivo" accept="audio/mpeg" required></label></p>
-    <p><label>Pieza:<br>
-      <select id="pieza">
-        <option value="intro">Cortina (intro)</option>
-        <option value="cierre">Cierre</option>
-      </select>
-    </label></p>
-    <p><label>Empezar en (mm:ss, opcional):<br><input type="text" id="inicio" placeholder="1:10"></label></p>
-    <button type="submit">Subir y mezclar</button>
-  </form>
-  <pre id="resultado" style="white-space: pre-wrap;"></pre>
-  <script>
-    document.getElementById('f').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const archivo = document.getElementById('archivo').files[0];
-      const pieza = document.getElementById('pieza').value;
-      const inicio = document.getElementById('inicio').value;
-      const resultado = document.getElementById('resultado');
-      resultado.textContent = 'Subiendo y mezclando, un momento...';
-
-      const reader = new FileReader();
-      reader.onload = async () => {
-        try {
-          const base64 = reader.result.split(',')[1];
-          const resp = await fetch('/subir-musica-fija?secret=${secretoParaFormulario}', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ musica_base64: base64, pieza, inicio_musica: inicio }),
-          });
-          if (resp.ok) {
-            const blob = await resp.blob();
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
-            document.body.appendChild(a);
-            a.click();
-            resultado.textContent = '✅ Listo — revisa la carpeta de descargas de tu navegador.';
-          } else {
-            resultado.textContent = '❌ Error: ' + await resp.text();
-          }
-        } catch (err) {
-          resultado.textContent = '❌ Error: ' + err.message;
-        }
-      };
-      reader.readAsDataURL(archivo);
-    });
-  </script>
-</body>
-</html>`);
-});
-
-app.post('/subir-musica-fija', async (req, res) => {
-  if (req.query.secret !== WORKER_SECRET) {
-    return res.status(401).send('No autorizado');
-  }
   const { musica_base64, pieza, inicio_musica } = req.body || {};
   const rutasVoz = { intro: RUTA_CORTINA_FIJA_DEFECTO, cierre: RUTA_CIERRE_FIJO_DEFECTO };
   const rutaVoz = rutasVoz[pieza];
 
   if (!rutaVoz) {
-    return res.status(400).send('Falta pieza=intro o pieza=cierre');
+    return res.status(400).json({ error: 'Falta o es inválido el campo "pieza" (intro | cierre)' });
   }
   if (!musica_base64) {
-    return res.status(400).send('Falta el archivo de música');
+    return res.status(400).json({ error: 'Falta el archivo de música' });
   }
   if (!fs.existsSync(rutaVoz)) {
-    return res.status(404).send(`No existe todavía ${rutaVoz} — genera la pieza de voz primero con /generar-pieza-fija?pieza=${pieza}`);
+    return res.status(404).json({ error: `No existe todavía ${rutaVoz} — genera la pieza de voz primero.` });
   }
 
   const dirTemp = path.join(DIRECTORIO_TEMP, `subir-musica-${pieza}-${Date.now()}`);
@@ -1876,22 +1815,76 @@ app.post('/subir-musica-fija', async (req, res) => {
   try {
     const rutaMusica = path.join(dirTemp, 'musica.mp3');
     fs.writeFileSync(rutaMusica, Buffer.from(musica_base64, 'base64'));
-    console.log(`   [subir-musica-fija] Música recibida (${Math.round(fs.statSync(rutaMusica).size / 1024)} KB), mezclando con ${rutaVoz}...`);
+    console.log(`   [podcast/subir-musica-fija] Música recibida (${Math.round(fs.statSync(rutaMusica).size / 1024)} KB), mezclando con ${rutaVoz}...`);
 
     const inicioSegundos = parsearTiempoASegundos(inicio_musica);
     const rutaSalida = path.join(dirTemp, `${pieza}-con-musica.mp3`);
     await agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, { inicioSegundos });
 
     const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
+    const buffer = fs.readFileSync(rutaSalida);
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
-    fs.createReadStream(rutaSalida).pipe(res).on('close', () => {
-      fs.rmSync(dirTemp, { recursive: true, force: true });
-    });
+    res.send(buffer);
   } catch (error) {
-    console.error('   [subir-musica-fija] ❌ Error:', error.message);
+    console.error('   [podcast/subir-musica-fija] ❌ Error:', error.message);
+    res.status(500).json({ error: error.message });
+  } finally {
     fs.rmSync(dirTemp, { recursive: true, force: true });
-    res.status(500).send('Error: ' + error.message);
+  }
+});
+// POST /podcast/mezclar-musica-drive — Superadmin. Reemplaza
+// /mezclar-musica-pieza-fija (cerrado, mismo motivo que las otras dos
+// rutas viejas de esta sección: ?secret= expuesto en la URL). Descarga la
+// pista de música desde Drive por su fileId (en vez de subirla directo,
+// que es lo que hace /podcast/subir-musica-fija) y la mezcla con la pieza
+// de voz correspondiente — no toca ElevenLabs, mismo ffmpeg local.
+//
+// Requisito: subir la pista a Drive primero (cualquier carpeta), obtener
+// su fileId (clic derecho → Compartir → copiar el ID de la URL), y
+// confirmar que su licencia permite uso comercial antes de usarla.
+app.post('/podcast/mezclar-musica-drive', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+
+  const { pieza, musica_drive_id, inicio_musica } = req.body || {};
+  const rutasVoz = { intro: RUTA_CORTINA_FIJA_DEFECTO, cierre: RUTA_CIERRE_FIJO_DEFECTO };
+  const rutaVoz = rutasVoz[pieza];
+
+  if (!rutaVoz) {
+    return res.status(400).json({ error: 'Falta o es inválido el campo "pieza" (intro | cierre)' });
+  }
+  if (!musica_drive_id) {
+    return res.status(400).json({ error: 'Falta musica_drive_id — sube la pista a Drive primero y copia su fileId' });
+  }
+  if (!fs.existsSync(rutaVoz)) {
+    return res.status(404).json({ error: `No existe todavía ${rutaVoz} — genera la pieza de voz primero.` });
+  }
+
+  const dirTemp = path.join(DIRECTORIO_TEMP, `mezcla-musica-drive-${pieza}-${Date.now()}`);
+  fs.mkdirSync(dirTemp, { recursive: true });
+
+  try {
+    console.log(`   [podcast/mezclar-musica-drive] Descargando música (Drive: ${musica_drive_id})...`);
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const rutaMusica = path.join(dirTemp, 'musica.mp3');
+    await descargarPDF(drive, musica_drive_id, rutaMusica); // sirve para cualquier archivo, no solo PDF
+
+    const inicioSegundos = parsearTiempoASegundos(inicio_musica);
+    console.log(`   [podcast/mezclar-musica-drive] Mezclando con ${rutaVoz} (música desde el segundo ${inicioSegundos})...`);
+    const rutaSalida = path.join(dirTemp, `${pieza}-con-musica.mp3`);
+    await agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, { inicioSegundos });
+
+    const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
+    const buffer = fs.readFileSync(rutaSalida);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    res.send(buffer);
+  } catch (error) {
+    console.error('   [podcast/mezclar-musica-drive] ❌ Error:', error.message);
+    res.status(500).json({ error: error.message });
+  } finally {
+    fs.rmSync(dirTemp, { recursive: true, force: true });
   }
 });
 
@@ -3419,7 +3412,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.24 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.26 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual y /prompts (subir-version, activar) y`);
   console.log(`   /pesos/actualizar — requiere ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
