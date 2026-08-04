@@ -1,6 +1,45 @@
-// worker.js — ACL Worker v3.26
+// worker.js — ACL Worker v3.27
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.27 (4 ago 2026) — CONEXIÓN COMPLETA DE prompts_productos Y
+// contactos_apoyo AL PIPELINE REAL. Hasta esta versión, los endpoints de
+// /prompts-productos ya guardaban/leían datos, pero nada en
+// procesarAuditoria() ni en los endpoints de recuperación los usaba
+// todavía — el pipeline seguía leyendo los strings fijos de
+// generarDatosGrafo.js y generarGuionPresentacion.js. Igual, la tabla
+// contactos_apoyo (creada la sesión anterior) todavía no tenía ni
+// endpoints ni conexión al pipeline. Esta versión cierra ambos cabos:
+//
+// (1) Nuevo helper obtenerPromptProducto(clave) — lee prompts_productos
+//     por clave, null si no existe (cada llamador decide su propio
+//     respaldo, mismo patrón que prompt_admisibilidad).
+// (2) PASO 6.5 (Mapa Mental) y /regenerar-grafo ahora leen
+//     "mapa_articulos" y se lo pasan a generarGrafoConClaude() como
+//     cuarto parámetro.
+// (3) PASO 6.6 (Podcast) y /regenerar-podcast ahora leen
+//     "podcast_generador_voces", "podcast_generador_reglas" y
+//     "podcast_revisor_criterios" en paralelo, y se los pasan a
+//     generarYRevisarGuion().
+// (4) 6 endpoints nuevos para contactos_apoyo (lista-admin, crear,
+//     editar, toggle-visible, reordenar, eliminar) — TODOS exigen
+//     Superadmin (más estricto que /fuentes/*, a propósito: un contacto
+//     equivocado podría usarse en una situación real y urgente).
+// (5) Nuevo helper obtenerContactosApoyoActivos() — lee solo los
+//     contactos activos, en orden. PASO 6.7 (Presentación) y
+//     /regenerar-presentacion ahora lo llaman y le pasan el resultado a
+//     generarPresentacionPDF() como séptimo parámetro. Si la tabla está
+//     vacía, generarPresentacionPDF.js cae solo al respaldo DUMMY de
+//     generarActivismo.js — no hace falta ningún manejo especial acá.
+//
+// Requiere que ya estén desplegados: generarDatosGrafo.js (v4, con
+// promptPersonalizado como cuarto parámetro de generarGrafoConClaude),
+// generarGuionPresentacion.js (v2, con los 3 parámetros de estilo) y
+// generarPresentacionPDF.js (v2.7, con contactosApoyo como séptimo
+// parámetro) — si alguno de los tres sigue en su versión vieja, esta
+// versión de worker.js sigue funcionando igual (los parámetros nuevos
+// simplemente no se usan del lado receptor), no hay riesgo de romper el
+// pipeline por desincronía de versiones.
 //
 // v3.26 (2 ago 2026): cerrado el último cabo suelto de la sección de
 // piezas fijas del podcast — /mezclar-musica-pieza-fija (música desde
@@ -167,10 +206,6 @@
 // normalizarDatosEstructurados() directo) — así cualquier regeneración
 // posterior a un cambio de pesos también los refleja. Con pesos_criterios
 // vacío (caso normal hoy) el resultado es idéntico al de antes.
-// TODAVÍA PENDIENTE: el veredicto de activismo de la Presentación
-// (calcularVeredictoActivismo, en generarActivismo.js) no recibe pesos —
-// depende de resumenHorizontes, que se arma en un archivo que este worker
-// no tiene todavía a la vista (generarDatosGrafo.js / generarPresentacionPDF.js).
 //
 // v3.10 (31 jul 2026): dos cambios de la reunión con Roberto y Felipe.
 // (1) ALCANCE VENEZUELA: el filtro de admisibilidad ahora rechaza también
@@ -183,116 +218,45 @@
 // borrar ese bloque y su uso en filtrarAdmisibilidad(), nada más.
 // (2) PESOS DE CRITERIOS: nuevos endpoints GET /pesos y POST
 // /pesos/actualizar, que leen y escriben configuracion_doctrinal.pesos_criterios
-// (columna JSONB nueva, ver migracion-pesos-criterios.sql). /pesos arma la
-// lista de los 28 criterios reutilizando normalizarDatosEstructurados()
-// sobre la auditoría completada más reciente (no hay un catálogo fijo de
-// criterios en ningún otro lado). Cualquier criterio sin peso guardado
-// vale 1 — mientras nadie edite nada desde /admin/pesos, el comportamiento
-// es idéntico al de antes. Este archivo todavía NO usa esos pesos en
-// ningún cálculo — eso vive en generarReportePDF.js y generarActivismo.js,
-// pendientes de recibir el mismo cambio.
+// (columna JSONB nueva, ver migracion-pesos-criterios.sql).
 //
 // v3.9 (28 jul 2026): 3 ajustes al correo "Tu auditoría está lista"
-// (enviarEmailFinal): (1) saludo personal con el primer nombre del
-// ciudadano en vez de "Ciudadano," genérico — se agrega una consulta chica
-// a ciudadanos por email justo antes de enviar; (2) se quita el link al
-// Documento original (no lo generó la plataforma) y se agrega el link real
-// al Mapa Mental interactivo (/auditoria/[id]/grafo) — antes el correo
-// tenía un link a "Mapa Mental (PNG)" que nunca se llenaba (links.mapa no
-// se pasaba desde ningún lado, quedaba muerto); (3) se agrega una frase de
-// cierre invitando a reenviar el correo, con "Saludos," como despedida.
+// (enviarEmailFinal): saludo personal, link real al Mapa Mental, frase de
+// cierre invitando a reenviar el correo.
 //
 // v3.8 (28 jul 2026): el grafo (Mapa Mental) ya no usa regex para decidir
-// qué es un artículo real — se rompía con leyes de REFORMA (Claude cita
-// ahí cosas como "Artículo 4 (reforma del artículo 14, numeral 8)", con
-// paréntesis explicativo, que el regex descartaba entero en vez de
-// recortar). Caso real: Ley de Reforma de la Ley Contra la Estafa
-// Inmobiliaria — el grafo mostró 1 solo artículo de 28 citados. Se
-// reemplaza normalizarComponentes() + generarTitulosArticulos() por
-// generarGrafoConClaude() (ver generarDatosGrafo.js): un único llamado a
-// Claude que identifica, clasifica (modifica/suprime/agrega un artículo de
-// la ley vigente, o ninguna) y titula los artículos reales, todo con
-// instrucciones explícitas en el prompt, no con un patrón fijo. Mismo
-// aprendizaje que ya se aplicó el 16 jul al análisis principal de 28
-// criterios.
+// qué es un artículo real — se reemplaza normalizarComponentes() +
+// generarTitulosArticulos() por generarGrafoConClaude() (ver
+// generarDatosGrafo.js): un único llamado a Claude que identifica,
+// clasifica y titula los artículos reales.
 //
 // v3.7 (28 jul 2026): las Fuentes Doctrinales ahora guardan una categoría
-// real (columna 'categoria' en fuentes_doctrinales — ver
-// migracion-categoria-fuentes.sql) en vez de vivir clasificadas a mano en
-// el código del sitio. Los 4 endpoints de /fuentes/ que crean o editan una
-// fuente (subir, completar-subida-media, lista-admin, editar) ahora leen
-// y escriben ese campo. Si no se manda categoría, cae en 'otros' — nunca
-// queda sin clasificar del todo.
+// real (columna 'categoria' en fuentes_doctrinales).
 //
 // v3.6 (27 jul 2026): estado de fallo técnico renombrado de 'error' a
-// 'fallida' en todo el archivo, para que coincida con el esquema
-// documentado (pendiente|admitida|completada|fallida|rechazada — ya sin
-// 'parcialmente_completada', ver más abajo). Se eliminaron /regenerar-audio
-// y /completar-audio (junto con completarConAudio()) — eran el flujo de
-// NotebookLM Enterprise manual (crear notebook → editor genera audio a
-// mano → sube el wav), superado desde que el podcast se genera solo con
-// Claude + ElevenLabs dentro de procesarAuditoria() (PASO 6.6, 22 jul
-// 2026). En su lugar se agregó /regenerar-podcast, mismo patrón que
-// /regenerar-grafo y /regenerar-presentacion: reintenta solo esa pieza
-// sobre una auditoría ya completada, sin tocar el campo estado — así el
-// pipeline solo puede terminar en 'completada' o 'fallida', nunca en un
-// estado intermedio esperando una acción manual. Las funciones de
-// NotebookLM (dispararNotebookLM, nlm*, slugificar, convertirWavAMp3)
-// quedan intactas y sin usar, mismo criterio que ya se aplicaba a
-// generarPresentacion()/generarMapaMental() (versiones viejas) — no se
-// borran, por si hace falta reactivar o comparar.
+// 'fallida'. Se agregó /regenerar-podcast, mismo patrón que
+// /regenerar-grafo y /regenerar-presentacion.
 //
-// v3.5 (26 jul 2026): limpieza de seguridad — se eliminaron todos los
-// endpoints de "PRUEBA TEMPORAL" / "ENDPOINT TEMPORAL" que ya habían
-// cumplido su propósito (/test-reporte, /test-activismo, /test-presentacion,
-// /test-guion, /test-titulos-articulos, /test-schema-articulos, /test-grafo,
-// /test-grafo-horizonte, /test-podcast-audio, /test-podcast). Se hizo
-// después de detectar que WORKER_SECRET había quedado expuesto en texto
-// plano en los comentarios de ejemplo de este archivo — todas esas URLs de
-// ejemplo se limpiaron reemplazando el secreto real por el placeholder
-// TU_SECRETO_NUEVO. No se tocó ningún endpoint de "RECUPERACIÓN" ni
-// ninguna función marcada explícitamente "no se borra" (dispararNotebookLM,
-// generarPresentacion, generarMapaMental, generarGrafoComponentes, etc.) —
-// esas siguen intactas para reactivarse cuando corresponda.
+// v3.5 (26 jul 2026): limpieza de seguridad — eliminados endpoints de
+// prueba temporal que exponían WORKER_SECRET en comentarios de ejemplo.
 //
 // v3.4 (3 jul 2026): pipeline simplificado — solo genera el reporte de
 // auditoría (PDF) y lo envía por correo. NotebookLM (audio), PPTX y mapa
-// mental quedan PAUSADOS (no eliminados) mientras se define el nuevo camino
-// de audio y se revisa el diseño de PPTX/mapa. Las funciones y endpoints
-// siguen intactos para reactivarse sin reconstruir nada.
+// mental quedan PAUSADOS (no eliminados).
 //
-// FIX (5 jul 2026): lectura segura de las respuestas de Claude. Sonnet 5
-// activa "pensamiento adaptativo" por defecto: cuando decide pensar, agrega
-// un bloque { type: 'thinking' } ANTES del bloque de texto en response.content.
-// El código asumía que el texto siempre está en content[0], lo cual rompía
-// analizarConClaude() (y silenciosamente degradaba extraerMetadatos()) cuando
-// el modelo pensaba antes de responder. Se agrega extraerTextoRespuesta() y
-// se usa en los 3 puntos donde antes se leía content[0].text directamente.
+// FIX (5 jul 2026): lectura segura de las respuestas de Claude —
+// extraerTextoRespuesta() busca el bloque 'text' sin asumir posición fija.
 //
 // FILTRO DE ADMISIBILIDAD (8 jul 2026): nuevo Paso 3.5 dentro de
-// procesarAuditoria(), justo después de leer la configuración doctrinal y
-// antes de extraer metadatos. Un llamado breve y barato a Claude decide si
-// el documento es pertinente (¿es una ley/decreto/política pública?) y si
-// no muestra señales de intento de manipulación (prompt injection) antes de
-// gastar en el análisis completo de 28 criterios. Si rechaza, la auditoría
-// pasa a estado 'rechazada' con el motivo guardado y se envía un email
-// distinto al ciudadano — el pipeline se detiene ahí, sin generar reporte.
-// El prompt del filtro vive en configuracion_doctrinal.prompt_admisibilidad
-// (mismo patrón de versionado que los otros 3 prompts); si esa versión no
-// lo tiene lleno, se usa PROMPT_ADMISIBILIDAD_RESPALDO como red de
-// seguridad, para que el filtro nunca quede desactivado por accidente.
+// procesarAuditoria(). El prompt del filtro vive en
+// configuracion_doctrinal.prompt_admisibilidad; si esa versión no lo
+// tiene lleno, se usa PROMPT_ADMISIBILIDAD_RESPALDO como red de
+// seguridad.
 //
-// SALIDA ESTRUCTURADA (16 jul 2026): analizarConClaude() migró de pedirle a
-// Claude que escriba texto libre con instrucciones de formato (que podía
-// incumplir — pasó con la tabla markdown del 7 jul, y con un conteo de
-// categorías erróneo el 16 jul) a exigir la estructura vía
-// output_config.format (Structured Outputs de la API de Claude, GA para
-// claude-sonnet-5, compatible con el pensamiento adaptativo). El schema
-// (SCHEMA_ANALISIS_AUDITORIA) vive en generarReportePDF.js, que también
-// reemplazó su parser de regex (parsearReporte) por
-// normalizarDatosEstructurados(), que solo organiza JSON ya garantizado
-// válido. reporte_texto en la BD sigue siendo un string igual que antes,
-// solo que ahora ese string es JSON en vez de markdown/prosa libre.
+// SALIDA ESTRUCTURADA (16 jul 2026): analizarConClaude() usa
+// output_config.format (Structured Outputs) en vez de texto libre con
+// instrucciones de formato. El schema (SCHEMA_ANALISIS_AUDITORIA) vive en
+// generarReportePDF.js.
 
 'use strict';
 const { generarPodcastPrueba } = require('./testPodcast');
@@ -346,29 +310,6 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
 const DIRECTORIO_TEMP = '/tmp/acl-worker';
 
 // ── Verificación de rol Superadmin (2 ago 2026) ──────────────────────────
-// Hasta ahora, WORKER_SECRET era el único candado de todo el worker — no
-// distinguía entre Superadmin y Editor, así que cualquier admin con sesión
-// válida podía llamar CUALQUIER endpoint, incluyendo los que decidimos
-// reservar para Superadmin (activar/subir versiones del Manual y del Test,
-// actualizar pesos). Esconder el botón en la pantalla no alcanzaba —
-// alguien con el secreto en el navegador podía llamar la ruta directo.
-//
-// La solución: además de WORKER_SECRET (que sigue exigiéndose igual),
-// estos endpoints ahora piden también el JWT de sesión del admin (el mismo
-// token que ya vive en la cookie admin_session de Next.js, firmado con
-// ADMIN_JWT_SECRET) — viaja en el header 'x-admin-token'. El worker lo
-// verifica y confirma que el rol adentro sea SUPERADMIN antes de proceder.
-//
-// Se verifica con el módulo "crypto" nativo de Node, no con el paquete
-// "jose" — el formato HS256 que genera jose en Next.js (SignJWT) es un
-// JWT estándar (HMAC-SHA256 sobre "header.payload", en base64url), así
-// que no hace falta agregar una dependencia nueva ni un npm install en
-// Railway para esto.
-//
-// REQUIERE: la variable de entorno ADMIN_JWT_SECRET configurada en
-// Railway, con el MISMO valor que ya usa Next.js/Netlify. Sin eso, todo
-// endpoint que pase por exigirSuperadmin() rechaza cualquier intento,
-// incluyendo los del propio Moisés.
 function decodificarBase64Url(segmento) {
   const base64 = segmento.replace(/-/g, '+').replace(/_/g, '/');
   const relleno = base64.length % 4 === 0 ? '' : '='.repeat(4 - (base64.length % 4));
@@ -390,8 +331,6 @@ function verificarJWTAdmin(token) {
       .digest('base64')
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
-    // Comparación en tiempo constante — evita filtrar información por
-    // cuánto tarda la comparación (timing attack) al validar la firma.
     const bufFirma = Buffer.from(firmaB64);
     const bufEsperada = Buffer.from(firmaEsperada);
     if (bufFirma.length !== bufEsperada.length || !crypto.timingSafeEqual(bufFirma, bufEsperada)) {
@@ -408,18 +347,12 @@ function verificarJWTAdmin(token) {
 }
 
 // Uso: if (!exigirSuperadmin(req, res)) return;
-// Ya escribe la respuesta de error (401/403) si no pasa — el llamador solo
-// necesita cortar la ejecución cuando devuelve null.
 function exigirSuperadmin(req, res) {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     res.status(401).json({ error: 'No autorizado' });
     return null;
   }
 
-  // Diagnóstico específico (2 ago 2026): antes, "sin ADMIN_JWT_SECRET
-  // configurada" y "token con firma que no coincide" daban el mismo
-  // mensaje genérico — imposible saber cuál de las dos cosas pasaba sin
-  // mirar el código. Ahora cada caso dice exactamente qué revisar.
   if (!process.env.ADMIN_JWT_SECRET) {
     res.status(500).json({ error: 'El worker no tiene configurada la variable ADMIN_JWT_SECRET en Railway. Agrégala y vuelve a desplegar — sin ella, ninguna acción de Superadmin puede verificarse.' });
     return null;
@@ -433,10 +366,6 @@ function exigirSuperadmin(req, res) {
     res.status(401).json({ error: 'La firma del token no coincide o expiró. Si acabas de configurar ADMIN_JWT_SECRET en Railway, confirma que sea EXACTAMENTE igual (sin espacios de más) a la que usa Netlify, y que el worker se haya vuelto a desplegar después de guardarla.' });
     return null;
   }
-  // Insensible a mayúsculas/minúsculas — el valor real guardado en
-  // usuarios_admin.rol puede no coincidir exactamente con "SUPERADMIN" en
-  // mayúsculas (la insignia del topbar se ve así por una regla de diseño,
-  // no porque el dato en sí esté en mayúsculas).
   if (typeof payload.rol !== 'string' || payload.rol.toUpperCase() !== 'SUPERADMIN') {
     res.status(403).json({ error: 'Esta acción requiere el rol Superadmin.' });
     return null;
@@ -445,14 +374,6 @@ function exigirSuperadmin(req, res) {
 }
 
 // ── Utilidad: extraer el bloque de texto de una respuesta de Claude ─────────
-// Sonnet 5 activa "pensamiento adaptativo" por defecto: cuando decide pensar,
-// antepone un bloque { type: 'thinking' } al bloque { type: 'text' } dentro
-// de response.content. Leer siempre content[0].text ya no es seguro. Esta
-// función busca el bloque de tipo 'text' sin importar en qué posición venga.
-// Sigue haciendo falta con Structured Outputs: la gramática de
-// output_config.format solo restringe el bloque de texto final, no el
-// bloque de thinking que puede venir antes (confirmado en la documentación
-// de Anthropic).
 function extraerTextoRespuesta(response) {
   const bloqueTexto = response.content.find(b => b.type === 'text');
   if (!bloqueTexto) {
@@ -462,9 +383,6 @@ function extraerTextoRespuesta(response) {
 }
 
 // ── Filtro de Admisibilidad ───────────────────────────────────────────────
-// Texto de respaldo por si la versión activa de configuracion_doctrinal no
-// tiene prompt_admisibilidad lleno (nunca queremos que el filtro se
-// desactive por accidente solo porque un campo quedó vacío).
 const PROMPT_ADMISIBILIDAD_RESPALDO = `Evalúa si el documento adjunto es admisible para una Auditoría Cívica Liberal. NO analices su contenido doctrinal todavía — eso viene después, en un paso separado. Aquí solo decides dos cosas:
 
 1. PERTINENCIA: ¿el documento es una ley, decreto, reglamento, proyecto de ley, política pública, o un texto oficial de naturaleza normativa o de política pública? Rechaza si es claramente otra cosa.
@@ -485,30 +403,12 @@ EXPLICACION: [una frase breve]
 
 Ante la duda razonable, prefiere ADMITIR.`;
 
-// Instrucción de alcance geográfico (31 jul 2026) — decisión del equipo de
-// concentrar la plataforma en Venezuela mientras dure esta fase. Se agrega
-// SIEMPRE al final del prompt de admisibilidad, sin importar si ese prompt
-// viene de configuracion_doctrinal (editable en /admin/prompts) o del
-// respaldo interno — así no depende de editar el texto largo guardado en
-// la base de datos. Revertir esto más adelante es borrar este bloque y su
-// uso en filtrarAdmisibilidad(), nada más.
 const INSTRUCCION_ALCANCE_VENEZUELA = `
 
 INSTRUCCIÓN ADICIONAL DE ALCANCE (vigente desde el 31 jul 2026):
 Además de lo anterior, evalúa si el documento corresponde a Venezuela (leyes, decretos, reglamentos o políticas públicas venezolanas, de cualquier nivel — nacional, estadal o municipal). Si el documento es pertinente pero es claramente de otro país, RECHAZA usando MOTIVO: fuera_de_alcance_geografico (no uses no_pertinente en ese caso). Ante la duda razonable sobre si un documento aplica a Venezuela, prefiere ADMITIR.`;
 
-// Lee la respuesta de texto plano de Claude y la convierte en un veredicto.
-// Mismo criterio que generarReportePDF.js: texto con marcadores, nunca
-// JSON, para no repetir el bug de JSON.parse() de la sesión anterior.
 function parsearVeredictoAdmisibilidad(textoRespuesta) {
-  // v2 (8 jul 2026): se detectó en pruebas que Claude a veces agrega
-  // formato markdown (ej. "**VEREDICTO:**") pese a la instrucción de no
-  // usarlo, y eso rompía el match — el filtro "admitía por accidente" sin
-  // ningún aviso, porque el diseño original prefiere admitir ante
-  // cualquier duda. Se limpia el markdown antes de buscar el marcador, y
-  // se registra siempre el veredicto detectado (o la respuesta cruda si
-  // no se detectó ninguno) para que un fallo de lectura futuro se vea en
-  // los logs en vez de disfrazarse de una admisión normal.
   const limpio = textoRespuesta.replace(/[*_`#]/g, '');
   const veredicto = /VEREDICTO:\s*(ADMISIBLE|RECHAZADO)/i.exec(limpio)?.[1]?.toUpperCase();
 
@@ -528,8 +428,6 @@ function parsearVeredictoAdmisibilidad(textoRespuesta) {
   return { admitido: false, motivo, explicacion };
 }
 
-// El filtro en sí — un llamado breve y barato a Claude, antes del análisis
-// completo de 28 criterios.
 async function filtrarAdmisibilidad(textoDocumento, promptAdmisibilidad) {
   const promptBase = (promptAdmisibilidad && promptAdmisibilidad.trim())
     ? promptAdmisibilidad
@@ -570,8 +468,7 @@ async function obtenerTokenGoogle() {
 }
 
 // ── NotebookLM Enterprise API ────────────────────────────────────────────────
-// Sin usar en producción desde el 27 jul 2026 (ver changelog v3.6 arriba) —
-// se deja intacta, no se borra, por si hace falta reactivar o comparar.
+// Sin usar en producción desde el 27 jul 2026 — se deja intacta.
 
 const NLM_BASE    = 'https://global-discoveryengine.googleapis.com/v1alpha';
 const NLM_PROJECT = process.env.GOOGLE_CLOUD_PROJECT_NUMBER || '721904248474';
@@ -659,8 +556,6 @@ async function dispararNotebookLM(reporteTexto, titulo, auditoria_id) {
 
 // ── Utilidades de audio ──────────────────────────────────────────────────────
 
-// slugificar() y convertirWavAMp3() quedan sin usar desde el 27 jul 2026
-// (eran del flujo manual de NotebookLM) — se dejan intactas, no se borran.
 function slugificar(texto) {
   return texto
     .toLowerCase()
@@ -671,7 +566,6 @@ function slugificar(texto) {
     .slice(0, 60);
 }
 
-// Convierte "Decreto 5364 Gaceta 7039" en "Decreto_5364_Gaceta_7039"
 function limpiarIdentificador(identificador) {
   return (identificador || 'Documento')
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -902,13 +796,7 @@ function laminaAlerta(pres, alerta, numero, total) {
 }
 
 // ── Extraer estructura del reporte con Claude ─────────────────────────────────
-// PAUSADO junto con generarPresentacion() y generarMapaMental() (ver
-// changelog v3.4 en el encabezado del archivo). Nota para cuando se
-// reactive: extraerEstructura() todavía le pide a Claude "reinterpretar" el
-// reporte en texto libre, pero desde la migración a Structured Outputs
-// (16 jul 2026) el reporte YA es JSON estructurado — al reactivar esta
-// función probablemente ya no haga falta llamar a Claude otra vez, se
-// puede construir "estructura" directamente a partir del JSON parseado.
+// PAUSADO junto con generarPresentacion() y generarMapaMental().
 
 const PROMPT_EXTRACCION = `Eres un asistente que convierte reportes de auditoría liberal en estructuras JSON para generar presentaciones y mapas mentales.
 Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks.
@@ -983,44 +871,9 @@ async function generarPresentacion(reporteTexto, titulo, rutaSalida, auditoria_i
 }
 
 // ── Normalizar componentes citados (grafo componentes→criterios) ───────────
-// Primera pieza del grafo componentes→criterios para el Mapa Mental nuevo
-// (20 jul 2026). Toma el campo "articulos" (string, separado por ";") que
-// devuelve cada criterio desde SCHEMA_ANALISIS_AUDITORIA y lo convierte en
-// una lista de nodos de componente reales.
-//
-// Tres decisiones doctrinales de Moisés (20 jul 2026, confirmadas con datos
-// reales del Proyecto de Ley de Arrendamientos Inmobiliarios) — no reabrir
-// sin que él lo traiga de nuevo:
-//   1. La Exposición de Motivos NO es un componente (no establece reglas de
-//      juego, es el preámbulo explicativo) — se descarta.
-//   2. Las citas a leyes externas (ej. artículos de la Constitución) NO son
-//      componentes DE ESTE instrumento — se descartan.
-//   3. Los criterios que solo citaban la Exposición de Motivos quedan SIN
-//      ningún componente — se dejan como nodos aislados en el grafo, sin
-//      flecha entrante. Es información real (nada específico los
-//      respalda), no un caso a "arreglar".
-//
-// Enfoque: en vez de intentar detectar cada posible referencia externa
-// (lista abierta, imposible de enumerar), solo se reconoce como componente
-// lo que calza con el patrón esperado de un artículo interno. Todo lo que
-// no calce se descarta por defecto — más seguro que asumir que es válido.
-//
-// IMPORTANTE — confirmado con un caso real: cuando el artículo trae una
-// anotación de sección ("Disposiciones Finales" / "Disposiciones
-// Transitorias"), esa anotación se conserva como parte del identificador
-// del nodo. "Artículo 64 (Disposiciones Finales)" y "Artículo 64
-// (Disposiciones Transitorias)" son DOS artículos distintos que comparten
-// número porque cada sección reinicia su propia numeración — fusionarlos
-// en un solo nodo "Art. 64" sería un error de contenido, no solo de forma.
 const PATRON_ARTICULO  = /^art[íi]culo\s+(\d+)\s*[°ºo]?\s*(\(\s*disposici[oó]n(?:es)?\s+(finales?|transitorias?)[^)]*\))?\s*$/i;
 const PATRON_PARAGRAFO = /^par[áa]grafo\s+\S+\s+del\s+art[íi]culo\s+(\d+)\s*[°ºo]?\s*$/i;
 
-// FIX (20 jul 2026): faltaba esta función — se usa en generarSVGGrafoComponentes()
-// y en generarSVGGrafoPorHorizonte() (más abajo) para limpiar texto antes de
-// insertarlo en SVG/HTML, pero se quedó en los archivos de prueba sueltos de
-// esa sesión y nunca se copió a worker.js. No se detectó hasta ahora porque
-// /test-grafo y /test-grafo-horizonte nunca se habían corrido de verdad
-// contra el worker desplegado — solo se habían visto renders hechos aparte.
 function esc(str) {
   if (!str) return '';
   return String(str)
@@ -1048,29 +901,14 @@ function normalizarComponentes(articulosCrudo) {
       }
       const matchParagrafo = PATRON_PARAGRAFO.exec(pieza);
       if (matchParagrafo) {
-        // Un parágrafo no es un componente aparte — se fusiona con su
-        // artículo padre (mismo nodo).
         return `Art. ${matchParagrafo[1]}`;
       }
-      // No calza con el patrón de artículo interno — se descarta
-      // (Exposición de Motivos, citas a leyes externas, etc.)
       return null;
     })
     .filter(Boolean)
-    .filter((valor, i, arr) => arr.indexOf(valor) === i); // sin duplicados
+    .filter((valor, i, arr) => arr.indexOf(valor) === i);
 }
 
-// ── Grafo componentes → criterios (nuevo Mapa Mental, 20 jul 2026) ─────────
-// Reutiliza normalizarComponentes() de arriba. A diferencia de
-// generarMapaMental() (abajo, ahora superada), esta función NO necesita un
-// llamado nuevo a Claude — usa directamente el mismo "datos" que ya produce
-// normalizarDatosEstructurados() para el Reporte, así que puede correr justo
-// después del PASO 6 del pipeline sin gastar nada adicional en la API.
-//
-// Colores: SÍ = limpio (verde). SÍ con matiz = tachado leve en magenta
-// claro (decisión del 17 jul — reemplaza el dorado del diseño viejo). NO =
-// tachado completo en rojo. Ver decisiones del 20 jul en el comentario de
-// normalizarComponentes() para qué cuenta como "componente".
 const COLOR_GRAFO = {
   SI:       { fill: '#E8F5E9', stroke: '#2E7D32', texto: '#1B5E20', edge: '#2E7D32' },
   SI_MATIZ: { fill: '#FCE4EC', stroke: '#AD1457', texto: '#880E4F', edge: '#AD1457' },
@@ -1088,9 +926,6 @@ function ordenComponente(label) {
 }
 
 function generarSVGGrafoComponentes(datos, titulo) {
-  // Las 7 categorías (I-VII) cubren rangos ascendentes de criterio
-  // (CRITERIO_A_CATEGORIA), así que aplanarlas en orden da directamente
-  // la secuencia C-01..C-28.
   const criterios = datos.categorias.flatMap(cat => cat.criterios);
 
   const componentesPorCriterio = criterios.map(c => normalizarComponentes(c.articulos));
@@ -1122,10 +957,6 @@ function generarSVGGrafoComponentes(datos, titulo) {
     yCrit += CRIT_H + CRIT_GAP;
   });
 
-  // Los componentes se distribuyen a lo largo de TODO el alto que ocupan
-  // los criterios (no apretados arriba con su propio espaciado fijo) —
-  // si no, con menos componentes que criterios (y cajas más chicas), la
-  // columna izquierda queda corta y deja un vacío grande abajo.
   const posComponente = {};
   const espacioDisponible = (yCrit - CRIT_GAP) - TITULO_H;
   const espacioComponente = componentes.length > 0 ? espacioDisponible / componentes.length : 0;
@@ -1206,11 +1037,6 @@ function generarSVGGrafoComponentes(datos, titulo) {
 </svg>`;
 }
 
-// SUPERADA (20 jul 2026, misma sesión) — Moisés prefirió reorganizar el
-// grafo en 3 áreas horizontales (En Contra / Neutral / A Favor, formato
-// landscape) en vez de este diseño de dos columnas verticales. Ver
-// generarGrafoPorHorizonte() más abajo, que la reemplaza. Se deja el
-// código intacto por si hace falta comparar, no se borra.
 async function generarGrafoComponentes(datos, titulo, rutaSalida, auditoria_id) {
   console.log(`   [${auditoria_id}] Generando grafo componentes→criterios...`);
   const svg = generarSVGGrafoComponentes(datos, titulo);
@@ -1218,30 +1044,6 @@ async function generarGrafoComponentes(datos, titulo, rutaSalida, auditoria_id) 
   console.log(`   [${auditoria_id}] Grafo generado: ${rutaSalida}`);
 }
 
-// ── Grafo por horizonte — 3 áreas landscape (20 jul 2026) ───────────────────
-// Reemplaza generarGrafoComponentes() (dos columnas) por pedido explícito
-// de Moisés: reorganiza el mismo grafo en 3 áreas de izquierda a derecha
-// — En Contra / Neutral / A Favor (H1/H2/H3 de la convención de Tres
-// Horizontes, nunca nombrados así al lector) — cada una con sus propios
-// nodos de artículo (abajo, pegados a la línea base) y de criterio
-// (arriba), con las líneas de impacto en el espacio intermedio. El ancho
-// de cada área es proporcional a su peso (criterios + componentes) — el
-// mismo principio que ya rige la barra H1/H2/H3 de la lámina de síntesis.
-//
-// Un componente que respalda criterios en más de un horizonte aparece
-// como nodo aparte en cada área donde corresponde (no se fusiona entre
-// áreas) — dentro de una misma área, sí es un solo nodo aunque respalde
-// varios criterios ahí.
-//
-// Etiquetas cortas ("A-63", "A-64F", "A-64T"): usan el número real del
-// artículo (autoexplicativo) y solo agregan una letra cuando hace falta
-// desambiguar dos artículos que comparten número por vivir en secciones
-// distintas (F=Disposiciones Finales, T=Disposiciones Transitorias) — ver
-// la nota sobre "Artículo 64" en normalizarComponentes() más arriba.
-//
-// Los criterios NA quedan fuera del grafo — no aplican al documento, no
-// representan impacto en ningún sentido, no encajan en ninguna de las 3
-// áreas.
 function etiquetaCortaComponente(componente) {
   const m = /^Art\.\s+(\d+)(?:\s+\(Disposiciones (Transitorias|Finales)\))?$/.exec(componente);
   if (!m) return componente.slice(0, 6);
@@ -1418,13 +1220,6 @@ async function generarGrafoPorHorizonte(datos, titulo, rutaSalida, auditoria_id)
   console.log(`   [${auditoria_id}] Grafo por horizonte generado: ${rutaSalida}`);
 }
 
-// SUPERADA (20 jul 2026) — el diseño de hub-and-spoke radial de abajo
-// (centro con % + categorías alrededor) queda reemplazado por
-// generarGrafoComponentes() de arriba, por decisión explícita de Moisés:
-// ni la idea original de usar el mapa mental nativo de NotebookLM, ni este
-// diseño radial del 17 jul, siguen vigentes. Se deja el código intacto
-// (no se borra) hasta confirmar que el reemplazo queda funcionando en el
-// pipeline real — no reactivar esta versión mientras tanto.
 async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
   console.log(`   [${auditoria_id}] Generando mapa mental SVG...`);
   const ANCHO = 2400, ALTO = 2400;
@@ -1494,15 +1289,11 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.26', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.27', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
-// completada cuyo Paso 6.5 falló (ej. error 529 "Overloaded" de Claude,
-// transitorio, no bloqueante por diseño). No repite el análisis de los 28
-// criterios — solo re-descarga el PDF original (para titular los
-// artículos citados) y usa el reporte_texto que ya está guardado. Segura
-// de reintentar las veces que haga falta.
+// completada cuyo Paso 6.5 falló.
 //
 // En el navegador:
 //   https://acl-worker-production.up.railway.app/regenerar-grafo?secret=TU_SECRETO_NUEVO&auditoria_id=ID_AQUI
@@ -1540,7 +1331,11 @@ app.get('/regenerar-grafo', async (req, res) => {
     await descargarPDF(drive, pdf_drive_id, rutaPDF);
     const textoPDF = await extraerTextoPDF(rutaPDF);
 
-    const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id);
+    // 4 ago 2026: se lee el prompt personalizado de "mapa_articulos" antes
+    // de llamar a generarGrafoConClaude() — si no hay ninguno guardado
+    // todavía, promptGrafo llega null y la función usa su propio respaldo.
+    const promptGrafo = await obtenerPromptProducto('mapa_articulos');
+    const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id, promptGrafo);
     const grafoDatos = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id);
     await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatos), auditoria_id]);
 
@@ -1557,11 +1352,6 @@ app.get('/regenerar-grafo', async (req, res) => {
 
 // ENDPOINT DE RECUPERACIÓN — regenera solo la Presentación de una
 // auditoría ya completada, sin repetir el análisis de los 28 criterios.
-// Sube el PDF nuevo a la MISMA carpeta de Drive de la auditoría (no una
-// carpeta de pruebas) y actualiza link_presentacion, así el botón de la
-// biblioteca ya apunta al más reciente. Nota: esto SUBE un archivo
-// nuevo — no borra el anterior de Drive, si lo corres varias veces
-// quedan varias copias ahí (solo la más reciente queda enlazada).
 //
 // En el navegador:
 //   https://acl-worker-production.up.railway.app/regenerar-presentacion?secret=TU_SECRETO_NUEVO&auditoria_id=ID_AQUI
@@ -1594,6 +1384,10 @@ app.get('/regenerar-presentacion', async (req, res) => {
     const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, pesosCriterios);
     const rutaPDF = path.join(dir, 'presentacion.pdf');
 
+    // 4 ago 2026: contactos reales de contactos_apoyo — si la tabla está
+    // vacía, generarPresentacionPDF.js cae solo al respaldo DUMMY.
+    const contactosApoyo = await obtenerContactosApoyoActivos();
+
     console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
     await generarPresentacionPDF(
       datosReporte,
@@ -1605,7 +1399,8 @@ app.get('/regenerar-presentacion', async (req, res) => {
       rutaPDF,
       auditoria_id,
       grafo_datos,
-      pesosCriterios
+      pesosCriterios,
+      contactosApoyo
     );
 
     const driveAuth = autenticarDrive();
@@ -1627,16 +1422,7 @@ app.get('/regenerar-presentacion', async (req, res) => {
 });
 
 // ENDPOINT DE RECUPERACIÓN — regenera solo el Podcast de una auditoría ya
-// completada, sin repetir el análisis de los 28 criterios. Sube el mp3
-// nuevo a la MISMA carpeta de Drive de la auditoría y actualiza
-// link_podcast. Reemplaza a /regenerar-audio + /completar-audio (27 jul
-// 2026): esa pareja de endpoints creaba un notebook en NotebookLM
-// Enterprise y dejaba la auditoría en 'parcialmente_completada' esperando
-// que un editor generara y subiera el audio a mano — flujo superado desde
-// que el podcast se genera solo con Claude + ElevenLabs (PASO 6.6 de
-// procesarAuditoria). Mismo criterio que /regenerar-grafo y
-// /regenerar-presentacion: nunca deja la auditoría en un estado
-// intermedio, solo actualiza link_podcast cuando termina.
+// completada, sin repetir el análisis de los 28 criterios.
 //
 // En el navegador:
 //   https://acl-worker-production.up.railway.app/regenerar-podcast?secret=TU_SECRETO_NUEVO&auditoria_id=ID_AQUI
@@ -1667,8 +1453,22 @@ app.get('/regenerar-podcast', async (req, res) => {
 
     const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, await obtenerPesosCriterios());
 
+    // 4 ago 2026: los 3 textos de estilo del podcast (voces, reglas del
+    // generador, criterios del revisor) — si prompts_productos no tiene
+    // todavía alguna de las 3 claves, generarYRevisarGuion() usa su
+    // propio respaldo para esa pieza específica.
+    const [textoVoces, textoReglas, textoCriteriosRevisor] = await Promise.all([
+      obtenerPromptProducto('podcast_generador_voces'),
+      obtenerPromptProducto('podcast_generador_reglas'),
+      obtenerPromptProducto('podcast_revisor_criterios'),
+    ]);
+
     console.log(`   [REGENERAR-PODCAST] Generando guion y audio para: ${titulo_documento}`);
-    const resultadoGuion = await generarYRevisarGuion(datosReporte, { titulo: titulo_documento, pais: pais || '' });
+    const resultadoGuion = await generarYRevisarGuion(
+      datosReporte,
+      { titulo: titulo_documento, pais: pais || '' },
+      textoVoces, textoReglas, textoCriteriosRevisor
+    );
     const rutaMp3 = path.join(dir, 'podcast.mp3');
     const fraseDinamica = `Hoy nos ocupamos de: ${titulo_documento}.`;
     await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica });
@@ -1692,22 +1492,6 @@ app.get('/regenerar-podcast', async (req, res) => {
 });
 
 // ── Piezas fijas del podcast (cortina/cierre) — movido a Admin (2 ago 2026) ──
-// FIX: /generar-pieza-fija y /subir-musica-fija vivían fuera de /admin/*,
-// protegidas con un ?secret= pegado en la URL del navegador — quedaba
-// expuesto en el historial y en logs de acceso. Cerradas ambas. Todo lo
-// que hacían sigue existiendo, pero ahora vive detrás de sesión real
-// (exigirSuperadmin) y se llama desde /admin/podcast, no desde una URL
-// suelta. El texto de cada pieza ahora se lee de configuracion_podcast
-// (requiere migracion-configuracion-podcast.sql) en vez de estar fijo en
-// el código — así el formulario de Admin puede editarlo de verdad.
-//
-// Lo que NO cambia: el resultado sigue siendo un mp3 que se descarga al
-// navegador — subirlo a acl-worker/assets/ y desplegar sigue siendo
-// manual, porque las piezas fijas son archivos del repositorio, no algo
-// guardado en la base de datos (a diferencia del Manual y el Test).
-//
-// /mezclar-musica-pieza-fija (música desde Drive por fileId) cerrada en
-// v3.26 — ver POST /podcast/mezclar-musica-drive más abajo.
 
 async function obtenerTextosPodcast() {
   try {
@@ -1718,15 +1502,9 @@ async function obtenerTextosPodcast() {
   } catch (err) {
     console.warn('   [obtenerTextosPodcast] No se pudo leer configuracion_podcast, se usa el texto fijo del código:', err.message);
   }
-  // Respaldo: si la migración todavía no corrió, o la tabla está vacía,
-  // se usa exactamente el mismo texto que tenía el código antes de este
-  // cambio — comportamiento idéntico al de siempre, nunca se rompe por
-  // esto.
   return { texto_cortina: TEXTO_CORTINA_FIJA, texto_cierre: TEXTO_CIERRE_FIJO };
 }
 
-// GET /podcast/textos-fijos — disponible para cualquier admin (Superadmin
-// o Editor); es de solo lectura, no una acción que modifique nada.
 app.get('/podcast/textos-fijos', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -1739,9 +1517,6 @@ app.get('/podcast/textos-fijos', async (req, res) => {
   }
 });
 
-// POST /podcast/textos-fijos/actualizar — Superadmin. Guarda el texto
-// nuevo. No genera ningún audio por sí solo — solo actualiza qué texto va
-// a usar la próxima vez que alguien le dé "Generar audio".
 app.post('/podcast/textos-fijos/actualizar', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
   const { texto_cortina, texto_cierre } = req.body || {};
@@ -1761,9 +1536,6 @@ app.post('/podcast/textos-fijos/actualizar', async (req, res) => {
   }
 });
 
-// POST /podcast/generar-pieza — Superadmin. Reemplaza /generar-pieza-fija.
-// Genera la voz (ElevenLabs) con el texto guardado en configuracion_podcast
-// y devuelve el mp3 como descarga directa — solo voz, sin música todavía.
 app.post('/podcast/generar-pieza', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
   const { pieza } = req.body || {};
@@ -1788,10 +1560,6 @@ app.post('/podcast/generar-pieza', async (req, res) => {
   }
 });
 
-// POST /podcast/subir-musica-fija — Superadmin. Reemplaza el POST
-// /subir-musica-fija viejo. Mezcla el mp3 de música que suba el admin con
-// la pieza de voz (intro o cierre) que ya exista en assets/, y devuelve
-// el resultado como descarga directa.
 app.post('/podcast/subir-musica-fija', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
 
@@ -1833,16 +1601,7 @@ app.post('/podcast/subir-musica-fija', async (req, res) => {
     fs.rmSync(dirTemp, { recursive: true, force: true });
   }
 });
-// POST /podcast/mezclar-musica-drive — Superadmin. Reemplaza
-// /mezclar-musica-pieza-fija (cerrado, mismo motivo que las otras dos
-// rutas viejas de esta sección: ?secret= expuesto en la URL). Descarga la
-// pista de música desde Drive por su fileId (en vez de subirla directo,
-// que es lo que hace /podcast/subir-musica-fija) y la mezcla con la pieza
-// de voz correspondiente — no toca ElevenLabs, mismo ffmpeg local.
-//
-// Requisito: subir la pista a Drive primero (cualquier carpeta), obtener
-// su fileId (clic derecho → Compartir → copiar el ID de la URL), y
-// confirmar que su licencia permite uso comercial antes de usarla.
+
 app.post('/podcast/mezclar-musica-drive', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
 
@@ -1868,7 +1627,7 @@ app.post('/podcast/mezclar-musica-drive', async (req, res) => {
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
     const rutaMusica = path.join(dirTemp, 'musica.mp3');
-    await descargarPDF(drive, musica_drive_id, rutaMusica); // sirve para cualquier archivo, no solo PDF
+    await descargarPDF(drive, musica_drive_id, rutaMusica);
 
     const inicioSegundos = parsearTiempoASegundos(inicio_musica);
     console.log(`   [podcast/mezclar-musica-drive] Mezclando con ${rutaVoz} (música desde el segundo ${inicioSegundos})...`);
@@ -1902,10 +1661,6 @@ app.post('/procesar', async (req, res) => {
   });
 });
 
-// Revierte un rechazo automático del filtro de admisibilidad — el admin
-// decide que fue un falso positivo. Marca la auditoría como admitida y
-// reprocesa el pipeline completo desde cero, esta vez saltándose el filtro
-// (parámetro saltarFiltro=true de procesarAuditoria).
 app.post('/reintentar-rechazada', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -1948,12 +1703,6 @@ app.post('/reintentar-rechazada', async (req, res) => {
   }
 });
 
-// FIX (2 ago 2026): acepta un pdf_base64 opcional, guardado tal cual en la
-// columna archivo_pdf (requiere migracion-test-libertad-pdf.sql) — mismo
-// patrón que ya usa /manual/subir-version. Antes de este cambio no existía
-// ninguna forma de adjuntar un PDF a una versión del Test de Libertad; el
-// botón "Descargar el PDF del Test" de la landing apuntaba a un archivo
-// fijo en el repo del frontend, sin relación con la versión activa.
 app.post('/prompts/subir-version', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
   const { version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, fuentes_activas, basado_en_manual_version, pdf_base64 } = req.body;
@@ -1998,15 +1747,6 @@ app.get('/prompts/versiones', async (req, res) => {
   }
 });
 
-// POST /prompts/activar — activa una versión del Test de Libertad y
-// desactiva las demás en una transacción (evita que dos versiones queden
-// activas si algo falla a mitad). Mismo patrón exacto que /manual/activar.
-//
-// FIX (2 ago 2026): este endpoint NO EXISTÍA. El botón "Activar" de
-// /admin/prompts llevaba tiempo llamando a esta ruta sin que nadie la
-// hubiera construido — cada clic devolvía un 404. No se detectó antes
-// porque, mientras solo hubo una versión activa desde el principio, nadie
-// necesitó activar una distinta.
 app.post('/prompts/activar', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
 
@@ -2040,11 +1780,6 @@ app.post('/prompts/activar', async (req, res) => {
   }
 });
 
-// GET /prompts/activo/pdf — sirve el PDF de la versión activa del Test de
-// Libertad. SIN autenticación a propósito, igual que /manual/activo/pdf,
-// /reporte-temp/:id y /presentacion-temp/:id: lo llama directo el botón
-// de la landing pública (<a href="...">), que no puede mandar el header
-// x-worker-secret.
 app.get('/prompts/activo/pdf', async (req, res) => {
   try {
     const { rows } = await db.query(`
@@ -2075,19 +1810,9 @@ app.get('/prompts/activo/pdf', async (req, res) => {
   }
 });
 
-// GET /prompts/:id — devuelve el contenido completo (los 4 prompts) de
-// una versión específica. Necesario porque /prompts/versiones solo manda
-// una vista previa de 200 caracteres de prompt_analisis y nada de los
-// otros 3 prompts — no alcanza para prellenar el formulario de
-// "+ Nueva versión" con el contenido de la versión activa (2 ago 2026,
-// a pedido de Moisés: el formulario aparecía en blanco y no había forma
-// de partir de lo que ya existía). NO devuelve archivo_pdf — el PDF no
-// se arrastra solo de una versión a otra, hay que volver a adjuntarlo
-// cada vez, a propósito.
-//
 // IMPORTANTE: esta ruta debe quedar registrada DESPUÉS de todas las
-// demás rutas /prompts/* (arriba) — Express prueba las rutas en el orden
-// en que se registran, y ':id' como comodín intentaría interceptar
+// demás rutas /prompts/* — Express prueba las rutas en el orden en que
+// se registran, y ':id' como comodín intentaría interceptar
 // '/prompts/versiones', '/prompts/activo', etc. si quedara antes.
 app.get('/prompts/:id', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
@@ -2107,18 +1832,17 @@ app.get('/prompts/:id', async (req, res) => {
   }
 });
 
-// ── Prompts de Productos Comunicacionales (2 ago 2026) ────────────────────
+// ── Prompts de Productos Comunicacionales (2 ago 2026, conectado 4 ago) ───
 // Tabla aparte de configuracion_doctrinal, a propósito: estos prompts
 // (podcast, presentación, mapa mental) NO forman parte del Test de
 // Libertad — editarlos no debe crear una "versión" nueva del Test ni
 // exigir "Activar". Guardado inmediato, Superadmin-only.
 //
-// PENDIENTE, IMPORTANTE: estos endpoints ya guardan/leen datos reales en
-// prompts_productos, pero TODAVÍA NADA en el pipeline los lee —
-// generarYRevisarGuion() (generarGuionPresentacion.js),
-// generarPresentacionPDF.js y generarDatosGrafo.js siguen usando sus
-// strings fijos en el código. Conectar eso es el siguiente paso, una vez
-// se identifique el prompt real dentro de cada archivo.
+// DESDE v3.27 (4 ago 2026): ya están conectados al pipeline real —
+// obtenerPromptProducto() (ver "Funciones auxiliares" más abajo) los lee
+// en PASO 6.5, PASO 6.6, /regenerar-grafo y /regenerar-podcast.
+// generarPresentacionPDF.js todavía no consume ningún prompt de esta
+// tabla (no lo necesita — es puro formateo, sin llamados a Claude propios).
 
 app.get('/prompts-productos', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
@@ -2135,11 +1859,6 @@ app.get('/prompts-productos', async (req, res) => {
   }
 });
 
-// POST /prompts-productos/guardar — Superadmin. Crea o actualiza (upsert)
-// un prompt por su "clave" — a diferencia de /prompts/subir-version, esto
-// NO versiona: guarda directo sobre la fila existente. Requiere que
-// "clave" tenga una restricción UNIQUE en la tabla (ya la tiene, es la
-// PRIMARY KEY según el diseño que se creó).
 app.post('/prompts-productos/guardar', async (req, res) => {
   const payload = exigirSuperadmin(req, res);
   if (!payload) return;
@@ -2164,31 +1883,142 @@ app.post('/prompts-productos/guardar', async (req, res) => {
   }
 });
 
+// ── Contactos de Apoyo (lámina de contacto de la Presentación) ───────────
+// Nuevo 4 ago 2026. Reemplaza los datos DUMMY fijos de
+// obtenerContactosApoyo() (generarActivismo.js) — real, editable, curado a
+// mano desde /admin/contactos-apoyo. TODA mutación exige Superadmin (más
+// estricto que /fuentes/*, a propósito: un contacto equivocado podría
+// usarse en una situación real y urgente).
+
+app.get('/contactos-apoyo/lista-admin', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const result = await db.query(
+      `SELECT id, nombre, contacto, descripcion, orden, activo, creado_en
+       FROM contactos_apoyo ORDER BY orden ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('❌ Error listando contactos de apoyo:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/contactos-apoyo/crear', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+  const { nombre, contacto, descripcion } = req.body;
+  if (!nombre?.trim() || !contacto?.trim()) {
+    return res.status(400).json({ error: 'Faltan campos requeridos (nombre, contacto)' });
+  }
+  try {
+    const ordenResult = await db.query(`SELECT COALESCE(MAX(orden), 0) + 1 AS siguiente FROM contactos_apoyo`);
+    const siguienteOrden = ordenResult.rows[0].siguiente;
+    const result = await db.query(
+      `INSERT INTO contactos_apoyo (nombre, contacto, descripcion, orden, activo, creado_en, actualizado_en)
+       VALUES ($1, $2, $3, $4, true, NOW(), NOW())
+       RETURNING id, nombre`,
+      [nombre.trim(), contacto.trim(), descripcion?.trim() || null, siguienteOrden]
+    );
+    console.log(`   [contactos-apoyo/crear] ✅ "${result.rows[0].nombre}" creado`);
+    res.json({ ok: true, id: result.rows[0].id });
+  } catch (error) {
+    console.error('❌ Error creando contacto de apoyo:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/contactos-apoyo/editar', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+  const { id, nombre, contacto, descripcion } = req.body;
+  if (!id || !nombre?.trim() || !contacto?.trim()) {
+    return res.status(400).json({ error: 'Faltan campos requeridos (id, nombre, contacto)' });
+  }
+  try {
+    const result = await db.query(
+      `UPDATE contactos_apoyo
+       SET nombre = $1, contacto = $2, descripcion = $3, actualizado_en = NOW()
+       WHERE id = $4 RETURNING id`,
+      [nombre.trim(), contacto.trim(), descripcion?.trim() || null, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
+    console.log(`   [contactos-apoyo/editar] ✅ ${id} actualizado`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error editando contacto de apoyo:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/contactos-apoyo/toggle-visible', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'Falta id' });
+  try {
+    const result = await db.query(
+      `UPDATE contactos_apoyo SET activo = NOT activo, actualizado_en = NOW() WHERE id = $1 RETURNING activo`,
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
+    res.json({ ok: true, activo: result.rows[0].activo });
+  } catch (error) {
+    console.error('❌ Error cambiando visibilidad de contacto de apoyo:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/contactos-apoyo/reordenar', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+  const { id, direccion } = req.body;
+  if (!id || !['subir', 'bajar'].includes(direccion)) {
+    return res.status(400).json({ error: 'Faltan campos válidos (id, direccion)' });
+  }
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const actual = await client.query(`SELECT orden FROM contactos_apoyo WHERE id = $1`, [id]);
+    if (actual.rows.length === 0) throw new Error('No encontrado');
+    const ordenActual = actual.rows[0].orden;
+
+    const vecino = direccion === 'subir'
+      ? await client.query(`SELECT id, orden FROM contactos_apoyo WHERE orden < $1 ORDER BY orden DESC LIMIT 1`, [ordenActual])
+      : await client.query(`SELECT id, orden FROM contactos_apoyo WHERE orden > $1 ORDER BY orden ASC LIMIT 1`, [ordenActual]);
+
+    if (vecino.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.json({ ok: true, sinCambios: true });
+    }
+
+    await client.query(`UPDATE contactos_apoyo SET orden = $1 WHERE id = $2`, [vecino.rows[0].orden, id]);
+    await client.query(`UPDATE contactos_apoyo SET orden = $1 WHERE id = $2`, [ordenActual, vecino.rows[0].id]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('❌ Error reordenando contactos de apoyo:', error.message);
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/contactos-apoyo/eliminar', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'Falta id' });
+  try {
+    const result = await db.query(`DELETE FROM contactos_apoyo WHERE id = $1 RETURNING nombre`, [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado' });
+    console.log(`   [contactos-apoyo/eliminar] Contacto eliminado: "${result.rows[0].nombre}"`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error eliminando contacto de apoyo:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Pesos de criterios (31 jul 2026) — jerarquía y ponderación ────────────
-// pesos_criterios vive en la misma fila activa de configuracion_doctrinal,
-// SIN versionado propio (a diferencia de los prompts): se edita en el
-// momento. Estructura por criterio: { peso: 1.5, descalificador: false }
-// (o, por compatibilidad con lo que ya hubiera quedado guardado antes de
-// este cambio, un número simple — se trata como {peso: numero,
-// descalificador: false}). Cualquier criterio ausente se trata como
-// {peso: 1, descalificador: false}, así que mientras nadie toque nada
-// desde /admin/pesos, el resultado es idéntico al de hoy. Requiere la
-// migración migracion-pesos-criterios.sql (columna JSONB nueva).
-//
-// FIX (31 jul 2026): ni la LISTA de los 28 criterios ni el TEXTO de cada
-// pregunta deben depender de ninguna auditoría — encontrado por Moisés en
-// dos rondas de prueba de esta pantalla. La lista de ids/categorías ya
-// salía del mapa fijo CRITERIO_A_CATEGORIA desde la primera corrección.
-// Ahora el TEXTO de cada pregunta también deja de tomarse prestado de la
-// auditoría más reciente (podía no coincidir, o simplemente no citar
-// todos los criterios) — se extrae directo del Test de Libertad activo
-// (configuracion_doctrinal.prompt_analisis, el mismo texto que se edita en
-// /admin/prompts), con un llamado breve a Claude (Structured Outputs) que
-// lee ese prompt y devuelve {id, pregunta} para cada criterio que
-// encuentre — mismo patrón que ya usa el proyecto en otros lugares para
-// convertir texto libre en datos estructurados (ver generarTitulosArticulos()
-// en generarDatosGrafo.js), en vez de intentarlo con regex sobre un texto
-// que puede variar de redacción entre versiones.
 const SCHEMA_CRITERIOS_TEST = {
   type: 'object',
   properties: {
@@ -2266,10 +2096,6 @@ app.get('/pesos', async (req, res) => {
       };
     }
 
-    // El texto de cada pregunta sale SIEMPRE del Test de Libertad activo,
-    // nunca de una auditoría. Si la extracción falla (ej. Claude no
-    // disponible en ese momento), la lista de los 28 criterios se muestra
-    // igual — solo se pierde el texto de la pregunta, con un aviso.
     let preguntaPorCriterio = {};
     let errorExtraccion = null;
     try {
@@ -2330,22 +2156,6 @@ app.post('/pesos/actualizar', async (req, res) => {
 });
 
 // ── Métricas (2 ago 2026) ─────────────────────────────────────────────────
-// FIX: este endpoint NO EXISTÍA — /admin/metricas llevaba tiempo pidiendo
-// GET /metricas/resumen sin que nadie lo hubiera construido nunca. Por eso
-// el error que vio Sarah (primera cuenta Editor real probando la pantalla)
-// era "<!DOCTYPE ... is not valid JSON": Express devuelve su página de 404
-// en HTML para cualquier ruta que no existe, no un error JSON — y el
-// frontend, al intentar parsear esa página como JSON, truena.
-//
-// Disponible para cualquier admin autenticado (Superadmin o Editor) — es
-// un panel de solo lectura, no una acción que modifique nada, así que no
-// pasa por exigirSuperadmin().
-//
-// Cada consulta corre en su propio try/catch (consultaSegura) — si una
-// tabla o columna no coincide exactamente con lo que este endpoint asume
-// (ver nota sobre clicks_auditoria más abajo), esa sección específica
-// queda vacía con un aviso en el log, en vez de tumbar toda la pantalla
-// de métricas por un solo problema puntual.
 app.get('/metricas/resumen', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -2386,14 +2196,6 @@ app.get('/metricas/resumen', async (req, res) => {
          FROM auditorias WHERE pais IS NOT NULL GROUP BY pais ORDER BY total DESC`,
         [], []
       ),
-      // NOTA: se asume que clicks_auditoria tiene una columna "tipo_link"
-      // con valores reporte/podcast/presentacion/mapa/original — es lo
-      // único consistente con lo que ya espera app/admin/metricas/page.js
-      // (LABELS_CLICK), pero no tengo la migración que creó esta tabla
-      // para confirmar el nombre exacto de la columna. Si el nombre real
-      // es otro, esta sección queda vacía (con aviso en el log) sin
-      // tumbar el resto — avísame si "Consumo por tipo de producto" sale
-      // siempre vacío y reviso el nombre real de la columna.
       consultaSegura(
         `SELECT tipo_link, COUNT(*)::int AS total FROM clicks_auditoria GROUP BY tipo_link ORDER BY total DESC`,
         [], []
@@ -2464,19 +2266,12 @@ app.post('/fuentes/subir', async (req, res) => {
   }
 });
 
-// Helper: obtiene un token de acceso válido para llamar a la API de Drive directamente
 async function obtenerTokenDrive() {
   const auth = autenticarDrive();
   const { token } = await auth.getAccessToken();
   return token;
 }
 
-// Genera un token de acceso temporal de Drive para que el navegador suba
-// el archivo directo, de principio a fin, sin pasar por el worker. Esto
-// reemplaza a /fuentes/iniciar-subida-media: Drive exige que la sesión de
-// subida se inicie desde el MISMO origen que hace la subida real — si el
-// worker inicia la sesión, Drive la rechaza por CORS cuando el navegador
-// intenta usarla después, porque el origen no coincide.
 app.post('/fuentes/token-subida-directa', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -2493,9 +2288,6 @@ app.post('/fuentes/token-subida-directa', async (req, res) => {
   }
 });
 
-// Paso 2: una vez que el navegador ya subió el archivo directo a Drive,
-// esto solo guarda los metadatos en la base de datos. Rápido, sin archivo
-// de por medio.
 app.post('/fuentes/completar-subida-media', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -2637,8 +2429,6 @@ app.post('/fuentes/eliminar', async (req, res) => {
   }
 });
 
-// Edita el título, autor, descripción y categoría de un documento ya
-// subido. No toca el archivo en Drive — solo los campos de texto.
 app.post('/fuentes/editar', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -2664,28 +2454,6 @@ app.post('/fuentes/editar', async (req, res) => {
   }
 });
 
-// ── Registro de clics (2 ago 2026) ────────────────────────────────────────
-// FIX: la tabla clicks_auditoria y su lectura (/metricas/resumen) existían
-// desde antes, pero nada la alimentaba — ningún endpoint escribía en ella,
-// y ningún link de la biblioteca pública disparaba nada al hacer clic. Por
-// eso "Consumo por tipo de producto" en Métricas siempre iba a salir
-// vacío, no por falta de uso real sino porque nadie estaba registrando
-// nada.
-//
-// SIN autenticación a propósito — lo llama cualquier visitante de la
-// landing pública al abrir un Reporte, Podcast, Presentación, Mapa Mental
-// u Original, no un admin logueado (mismo criterio que /manual/activo/pdf
-// y /prompts/activo/pdf: rutas públicas, sin secreto).
-//
-// Diseñado para NUNCA bloquear la descarga real: el frontend dispara este
-// POST sin esperar su respuesta (fire-and-forget) al mismo tiempo que el
-// link ya se está abriendo — si esto falla, el visitante igual recibe su
-// archivo, solo se pierde el dato de la métrica.
-//
-// ciudadano_id y pais quedan NULL a propósito: hoy no hay ningún mecanismo
-// para saber qué ciudadano (si acaso) está navegando la biblioteca pública
-// sin haber iniciado sesión — no se inventa un valor falso solo para
-// llenar la columna.
 app.post('/registrar-clic', async (req, res) => {
   const { auditoria_id, tipo_link } = req.body || {};
   const TIPOS_VALIDOS = ['reporte', 'podcast', 'presentacion', 'mapa', 'original'];
@@ -2699,19 +2467,11 @@ app.post('/registrar-clic', async (req, res) => {
     );
     res.json({ ok: true });
   } catch (error) {
-    // No bloqueante por diseño — ver nota arriba. El frontend ni siquiera
-    // espera esta respuesta, pero igual queda registrado en el log para
-    // poder diagnosticar si algo como ciudadano_id/pais resultan NOT NULL.
     console.error('❌ Error registrando clic (no bloqueante):', error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Elimina una auditoría por completo: la fila en la base de datos y su
-// carpeta en Google Drive (con todos los archivos dentro). Acción
-// IRREVERSIBLE — pensada para que el admin limpie pruebas, duplicados o
-// auditorías con error. No bloquea el borrado si Drive o NotebookLM
-// fallan (por ejemplo, si la carpeta ya no existe).
 app.post('/eliminar-auditoria', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -2758,16 +2518,7 @@ app.post('/eliminar-auditoria', async (req, res) => {
 });
 
 // ── Módulo: Manual Cívico Liberal (documento vivo, versionado) ──────────────
-// Agregado 15 jun 2026. Requiere la migración 002_manual_liberalismo.sql.
-// El manual se sube desde el dashboard admin, queda inactivo hasta que se
-// activa explícitamente, y solo una versión puede estar activa a la vez
-// (el índice único de la migración lo garantiza a nivel de base de datos).
 
-// GET /manual/versiones — lista versiones con metadatos (sin el texto completo)
-// FIX (1 ago 2026): agregado `tiene_pdf` — así se ve en /admin/manual, sin
-// adivinar, cuáles versiones (probablemente las viejas, subidas antes de
-// este cambio, o las que se subieron pegando texto en vez de un PDF) no
-// tienen el archivo que necesita el botón dinámico de la landing.
 app.get('/manual/versiones', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -2787,20 +2538,6 @@ app.get('/manual/versiones', async (req, res) => {
   }
 });
 
-// POST /manual/subir-version — sube texto pegado o un PDF en base64 (se extrae
-// el texto con pdf-parse, ya usado en extraerTextoPDF). Queda inactiva hasta
-// que se active con POST /manual/activar.
-// Body: { version, notas_version, contenido_texto } o { version, notas_version, pdf_base64 }
-//
-// FIX (1 ago 2026): además de extraer el texto, ahora se guarda también el
-// PDF original tal cual (columna archivo_pdf, base64 — ver
-// migracion-manual-pdf.sql) cuando la subida vino como pdf_base64. Antes
-// solo se guardaba el texto extraído, así que el botón "Descargar PDF del
-// Manual" de la landing no tenía de dónde sacar un archivo real y quedaba
-// apuntando a un PDF fijo en el repo del frontend, sin relación con la
-// versión activa en la base de datos. Si la versión se sube pegando texto
-// (sin pdf_base64), archivo_pdf queda NULL — no hay PDF que guardar, y
-// GET /manual/activo/pdf lo informa en vez de fallar en silencio.
 app.post('/manual/subir-version', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
 
@@ -2830,8 +2567,6 @@ app.post('/manual/subir-version', async (req, res) => {
       });
     }
 
-    // Solo se guarda archivo_pdf si la subida vino como PDF — si vino como
-    // texto pegado, no hay ningún PDF real que archivar.
     const archivoPdf = pdf_base64 || null;
 
     const { rows } = await db.query(`
@@ -2849,12 +2584,6 @@ app.post('/manual/subir-version', async (req, res) => {
   }
 });
 
-// GET /manual/activo/pdf — sirve el PDF de la versión activa del Manual.
-// SIN autenticación a propósito (a diferencia de todo el resto de /manual/*):
-// este endpoint lo llama directo el botón de la landing pública
-// (<a href="...">), que no puede mandar el header x-worker-secret — mismo
-// criterio que ya usan /reporte-temp/:id y /presentacion-temp/:id, los
-// otros dos endpoints públicos sin secreto de este archivo.
 app.get('/manual/activo/pdf', async (req, res) => {
   try {
     const { rows } = await db.query(`
@@ -2884,9 +2613,6 @@ app.get('/manual/activo/pdf', async (req, res) => {
   }
 });
 
-// POST /manual/activar — activa una versión y desactiva las demás en una
-// transacción (evita que dos versiones queden activas si algo falla a mitad).
-// Body: { id }
 app.post('/manual/activar', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
 
@@ -2929,8 +2655,6 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
   const rutaTXT        = path.join(dir, 'original.txt');
   const rutaReporte    = path.join(dir, 'reporte.txt');
   const rutaReportePDF = path.join(dir, 'reporte.pdf');
-  // const rutaSlides  = path.join(dir, 'presentacion.pptx'); // desactivado — ver nota en PASO 6
-  // const rutaMapa    = path.join(dir, 'mapa.png');          // desactivado — ver nota en PASO 6
   fs.mkdirSync(dir, { recursive: true });
   try {
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando PDF...`);
@@ -3014,22 +2738,18 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`✅ [${auditoria_id}] PDF del reporte generado — alineación: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'}`);
 
     console.log(`🕸️  [${auditoria_id}] PASO 6.5: Generando datos del grafo (artículos + citas con Claude)...`);
-    // grafoDatosCompartido se declara AFUERA del try (31 jul 2026) para que
-    // el PASO 6.7 (Presentación), más abajo, pueda reutilizar el mismo
-    // grafo real en vez de recalcular uno vacío por su cuenta — ver el fix
-    // completo documentado en generarPresentacionPDF.js v2.5.
     let grafoDatosCompartido = null;
     try {
-      const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id);
+      // 4 ago 2026: se lee el prompt personalizado de "mapa_articulos"
+      // antes de llamar a generarGrafoConClaude() — si prompts_productos
+      // todavía no tiene esa clave, promptGrafo llega null y la función
+      // usa PROMPT_GRAFO_RESPALDO (comportamiento idéntico al de antes).
+      const promptGrafo = await obtenerPromptProducto('mapa_articulos');
+      const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id, promptGrafo);
       grafoDatosCompartido = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id);
       await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatosCompartido), auditoria_id]);
       console.log(`✅ [${auditoria_id}] Datos del grafo guardados (${grafoDatosCompartido.nodos.length} nodos, ${grafoDatosCompartido.enlaces.length} enlaces)`);
     } catch (errorGrafo) {
-      // No bloqueante a propósito: si esto falla, la auditoría sigue su
-      // curso normal (Reporte, Drive, email) — el grafo simplemente queda
-      // sin datos (grafo_datos = NULL) hasta que se reintente a mano, y
-      // grafoDatosCompartido queda en null (la Presentación lo maneja con
-      // su propio aviso, no truena por esto).
       console.error(`⚠️  [${auditoria_id}] No se pudieron generar los datos del grafo (no bloqueante):`, errorGrafo.message);
     }
 
@@ -3040,7 +2760,20 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	    console.log(`🎙️  [${auditoria_id}] PASO 6.6: Generando guion y audio del podcast...`);
 	    let linkPodcast = null;
 	    try {
-	      const resultadoGuion = await generarYRevisarGuion(datosReporte, { titulo: metadatos.titulo, pais: metadatos.pais || '' });
+	      // 4 ago 2026: los 3 textos de estilo del podcast — si alguna
+	      // clave todavía no existe en prompts_productos, esa pieza
+	      // específica usa su propio respaldo dentro de
+	      // generarGuionPresentacion.js, el resto sigue igual.
+	      const [textoVoces, textoReglas, textoCriteriosRevisor] = await Promise.all([
+	        obtenerPromptProducto('podcast_generador_voces'),
+	        obtenerPromptProducto('podcast_generador_reglas'),
+	        obtenerPromptProducto('podcast_revisor_criterios'),
+	      ]);
+	      const resultadoGuion = await generarYRevisarGuion(
+	        datosReporte,
+	        { titulo: metadatos.titulo, pais: metadatos.pais || '' },
+	        textoVoces, textoReglas, textoCriteriosRevisor
+	      );
 	      const rutaMp3 = path.join(dir, 'podcast.mp3');
 	      const fraseDinamica = `Hoy nos ocupamos de: ${metadatos.titulo}.`;
 	      await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica });
@@ -3054,6 +2787,11 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	    let linkPresentacion = null;
 	    try {
 	      const rutaPresentacionPDF = path.join(dir, 'presentacion.pdf');
+	      // 4 ago 2026: contactos reales de contactos_apoyo — si la tabla
+	      // está vacía, generarPresentacionPDF.js cae solo al respaldo
+	      // DUMMY de generarActivismo.js (con aviso en el log y en la
+	      // propia lámina).
+	      const contactosApoyo = await obtenerContactosApoyoActivos();
 	      await generarPresentacionPDF(
 	        datosReporte,
 	        {
@@ -3064,20 +2802,14 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	        rutaPresentacionPDF,
 	        auditoria_id,
 	        grafoDatosCompartido,
-	        pesosCriterios
+	        pesosCriterios,
+	        contactosApoyo
 	      );
 	      linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 	      console.log(`✅ [${auditoria_id}] Presentación generada y subida`);
 	    } catch (errorPresentacion) {
 	      console.error(`⚠️  [${auditoria_id}] No se pudo generar la Presentación (no bloqueante):`, errorPresentacion.message);
     }
-
-    // ── PASOS TEMPORALMENTE DESACTIVADOS (3 jul 2026) ──────────────────────
-    // NotebookLM (audio), PPTX y mapa mental quedan en pausa mientras se
-    // define el nuevo camino para el audio (Google Vertex AI+TTS o
-    // ElevenLabs) y se revisa el diseño de PPTX/mapa. Las funciones
-    // dispararNotebookLM(), generarPresentacion() y generarMapaMental()
-    // siguen definidas más abajo — reactivar aquí cuando corresponda.
 
     console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo original y reporte a Drive...`);
 	    const linkOriginal = await subirArchivo(drive, rutaPDF, `${identificadorLimpio}_original.pdf`, 'application/pdf', carpetaId);
@@ -3160,10 +2892,6 @@ async function obtenerConfigDoctrinal() {
   return result.rows[0];
 }
 
-// Obtiene la versión activa del Manual Cívico Liberal, si existe.
-// Devuelve null (no lanza error) si aún no se ha subido/activado ninguna —
-// así el pipeline de análisis sigue funcionando con solo configuracion_doctrinal
-// mientras el manual versionado se termina de poblar.
 async function obtenerManualActivo() {
   const { rows } = await db.query(`
     SELECT id, version, contenido_texto
@@ -3174,17 +2902,36 @@ async function obtenerManualActivo() {
   return rows[0] || null;
 }
 
-// Lee los pesos de criterios guardados en la versión activa de
-// configuracion_doctrinal (columna pesos_criterios, JSONB — ver
-// migracion-pesos-criterios.sql). Devuelve un objeto vacío si no hay
-// ninguno guardado — normalizarDatosEstructurados() ya trata "sin peso
-// para este id" como peso 1, así que un objeto vacío es exactamente
-// equivalente al comportamiento de antes de este cambio (31 jul 2026).
 async function obtenerPesosCriterios() {
   const { rows } = await db.query(
     `SELECT pesos_criterios FROM configuracion_doctrinal WHERE activo = true ORDER BY version DESC LIMIT 1`
   );
   return rows[0]?.pesos_criterios || {};
+}
+
+// Lee un prompt editable de productos comunicacionales (podcast, mapa
+// mental) por su clave. Devuelve null si no existe todavía — cada
+// llamador decide su propio texto de respaldo (mismo patrón que
+// prompt_admisibilidad / PROMPT_ADMISIBILIDAD_RESPALDO). Nuevo 4 ago 2026.
+async function obtenerPromptProducto(clave) {
+  const { rows } = await db.query(
+    `SELECT texto FROM prompts_productos WHERE clave = $1`,
+    [clave]
+  );
+  return rows[0]?.texto || null;
+}
+
+// Lee la lista real y activa de contactos de apoyo, en orden — usada por
+// el pipeline (PASO 6.7 y /regenerar-presentacion), nunca por el admin
+// (que usa /contactos-apoyo/lista-admin, con los inactivos también
+// visibles). Arreglo vacío si todavía no hay ningún contacto activo —
+// generarPresentacionPDF.js decide caer al respaldo DUMMY en ese caso.
+// Nuevo 4 ago 2026.
+async function obtenerContactosApoyoActivos() {
+  const { rows } = await db.query(
+    `SELECT nombre, contacto, descripcion FROM contactos_apoyo WHERE activo = true ORDER BY orden ASC`
+  );
+  return rows;
 }
 
 async function extraerTextoPDF(rutaPDF) {
@@ -3221,18 +2968,7 @@ Fragmento:\n${muestra}`,
   }
 }
 
-// SALIDA ESTRUCTURADA (16 jul 2026): reemplaza el bloque FORMATO_RESPUESTA
-// que le pedía a Claude en texto plano que no usara tablas, que agrupara
-// bajo encabezados de categoría reconocibles, etc. — esa instrucción era
-// una petición, no una garantía, y Claude la incumplió en más de una
-// corrida real (tabla markdown el 7 jul, conteo de categorías erróneo el
-// 16 jul). output_config.format fuerza la estructura a nivel de la API: la
-// respuesta SIEMPRE es JSON válido según SCHEMA_ANALISIS_AUDITORIA
-// (definido en generarReportePDF.js), exactamente 7 categorías, sin
-// importar cómo redacte Claude ese día.
 async function analizarConClaude(textoPDF, config, manualActivo = null) {
-  // Si hay una versión activa del manual, se agrega al final del system prompt
-  // ya configurado en configuracion_doctrinal — no lo reemplaza, lo complementa.
   const systemFinal = manualActivo
     ? `${config.prompt_sistema}\n\n---\n\nMANUAL CÍVICO LIBERAL (versión ${manualActivo.version}) — fuente doctrinal completa para este análisis:\n\n${manualActivo.contenido_texto}`
     : config.prompt_sistema;
@@ -3260,11 +2996,6 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
     throw new Error('analizarConClaude: Claude rehusó generar el análisis para este documento (stop_reason: refusal).');
   }
 
-  // extraerTextoRespuesta() sigue haciendo falta: el pensamiento adaptativo
-  // sigue anteponiendo un bloque 'thinking' antes del bloque de texto final
-  // incluso con output_config activo — la gramática de Structured Outputs
-  // solo restringe el bloque de texto, no el thinking. El texto devuelto es
-  // JSON garantizado, listo para JSON.parse() en normalizarDatosEstructurados().
   return extraerTextoRespuesta(response);
 }
 
@@ -3352,17 +3083,7 @@ async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links) {
   console.log(`   ✅ Email final enviado a ${email}`);
 }
 
-// Email distinto para cuando el filtro de admisibilidad rechaza un
-// documento. Mismo patrón (fetch directo a Resend) que enviarEmailFinal.
-// Mensaje específico si no es pertinente; genérico si es intento de
-// manipulación (para no darle pistas a quien intente manipular el filtro
-// sobre qué detectamos exactamente).
 async function enviarEmailRechazo(email, motivo) {
-  // 3 mensajes distintos (31 jul 2026, se agrega fuera_de_alcance_geografico):
-  // no_pertinente y fuera_de_alcance_geografico son específicos y amables
-  // (le dicen a la persona exactamente qué pasó); intento_manipulacion sigue
-  // siendo deliberadamente genérico, para no darle pistas a quien intente
-  // manipular el filtro sobre qué detectamos exactamente.
   const cuerpos = {
     no_pertinente: `<p>Hola,</p>
        <p>Revisamos el documento que subiste a Auditoría Cívica Liberal, y no pudimos admitirlo para el análisis: no parece tratarse de una ley, decreto, reglamento o política pública — que es justamente lo que audita nuestra plataforma.</p>
@@ -3396,10 +3117,6 @@ async function enviarEmailRechazo(email, motivo) {
   console.log(`   ✅ Email de rechazo enviado a ${email}`);
 }
 
-// Email al ciudadano cuando la auditoría falla por un error técnico
-// genuino (no un rechazo del filtro — eso ya tiene su propio correo).
-// Nunca incluye el mensaje de error crudo: solo tranquiliza y avisa que
-// el equipo ya está al tanto.
 async function enviarEmailErrorCiudadano(email, titulo) {
   const cuerpo = `<p>Hola,</p>
        <p>Tuvimos un problema técnico procesando ${titulo ? `<strong>${titulo}</strong>` : 'el documento que subiste'} a Auditoría Cívica Liberal. Nuestro equipo ya fue notificado y lo está revisando.</p>
@@ -3421,11 +3138,6 @@ async function enviarEmailErrorCiudadano(email, titulo) {
   console.log(`   ✅ Email de error (ciudadano) enviado a ${email}`);
 }
 
-// Alerta interna al equipo. Lee los destinatarios de la tabla
-// configuracion_alertas (tipo = 'error_procesamiento') — así se puede
-// cambiar a quién le llega sin tocar código. Si esa tabla está vacía
-// (nunca se configuró), cae en un correo de respaldo fijo para que la
-// alerta nunca se pierda por accidente.
 async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
   let destinatarios = [];
   try {
@@ -3469,16 +3181,18 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.26 corriendo en puerto ${PORT}`);
-  console.log(`   ROLES: exigirSuperadmin() protege /manual y /prompts (subir-version, activar) y`);
-  console.log(`   /pesos/actualizar — requiere ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
+  console.log(`\n⚙️  ACL Worker v3.27 corriendo en puerto ${PORT}`);
+  console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
+  console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
+  console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
   console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
-  console.log(`   FIX 31 jul: la Presentación ya usa el grafo REAL (antes siempre daba RECHAZO TOTAL)`);
+  console.log(`   NUEVO 4 ago: prompts_productos conectado al pipeline real (mapa_articulos en PASO 6.5,`);
+  console.log(`   podcast_generador_voces/reglas + podcast_revisor_criterios en PASO 6.6)`);
+  console.log(`   NUEVO 4 ago: contactos_apoyo conectado a la Presentación (PASO 6.7) — cae a DUMMY solo`);
+  console.log(`   si la tabla está vacía, con aviso explícito en el log y en la propia lámina`);
   console.log(`   Manual: GET /manual/activo/pdf sirve el PDF real de la versión activa (público, sin secreto)`);
-  console.log(`   Test de Libertad: GET /prompts/activo/pdf, mismo patrón — requiere volver a subir PDF`);
-  console.log(`   FIX 2 ago: POST /prompts/activar ya existe — el botón "Activar" de /admin/prompts llevaba`);
-  console.log(`   tiempo dando 404 en cada clic`);
+  console.log(`   Test de Libertad: GET /prompts/activo/pdf, mismo patrón`);
   console.log(`   /pesos: ids del mapa fijo del Test de Libertad, preguntas extraídas de prompt_analisis`);
   console.log(`   activo con Claude — nada de esto depende ya de ninguna auditoría en particular`);
   console.log(`   Descalificadores ("Indispensable" en la UI): un NO ahí fuerza 0% / rechazo total`);
@@ -3488,6 +3202,7 @@ app.listen(PORT, () => {
   console.log(`   Filtro de admisibilidad ahora también rechaza documentos legítimos de otro país`);
   console.log(`   (fuera_de_alcance_geografico) — instrucción agregada en código, no en el prompt guardado`);
   console.log(`   Recuperación puntual: /regenerar-grafo, /regenerar-presentacion, /regenerar-podcast`);
+  console.log(`   (los 3 ya leen prompts_productos y/o contactos_apoyo antes de regenerar)`);
   console.log(`   Estados posibles: pendiente → admitida → completada | fallida (o rechazada por el filtro)`);
   console.log(`   Fuentes Doctrinales: campo 'categoria' activo en subir/completar-subida-media/lista-admin/editar`);
   console.log(`   Pesos de criterios: GET /pesos, POST /pesos/actualizar — conectados al Reporte Y a la Presentación`);
