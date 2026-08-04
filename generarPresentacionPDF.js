@@ -490,7 +490,14 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // respaldo DUMMY de generarActivismo.js, con aviso explícito en el log Y
 // en la propia lámina (el banner amarillo solo aparece cuando de verdad
 // son datos de prueba).
-async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}, contactosApoyo = null) {
+// v2.8 (4 ago 2026) — ESTILO DE ACTIVISMO EDITABLE: octavo parámetro
+// opcional `promptsActivismo` — objeto { estiloPersona, reglasGeneracion }
+// que worker.js arma leyendo prompts_productos ("presentacion_activismo_estilo"
+// y "presentacion_activismo_reglas") y pasa tal cual a
+// generarIdeasActivismoTotal(). Si no llega (objeto vacío por defecto),
+// generarActivismo.js usa sus propios textos de respaldo — comportamiento
+// idéntico al de antes de este cambio.
+async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}, contactosApoyo = null, promptsActivismo = {}) {
   console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.7`);
 
   let enlaces;
@@ -516,7 +523,10 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
   let ideasActivismoTotal = null;
   if (veredicto.modo !== 'hibrido') {
     console.log(`   [${auditoria_id}] Generando ideas de activismo (${veredicto.modo})...`);
-    ideasActivismoTotal = await generarIdeasActivismoTotal(datos, metadatos, veredicto, auditoria_id);
+    ideasActivismoTotal = await generarIdeasActivismoTotal(
+      datos, metadatos, veredicto, auditoria_id,
+      promptsActivismo.estiloPersona, promptsActivismo.reglasGeneracion
+    );
     console.log(`   [${auditoria_id}] ${ideasActivismoTotal.length} ideas generadas`);
   }
 

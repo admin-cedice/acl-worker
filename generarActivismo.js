@@ -33,6 +33,22 @@
 // documento. Esta función en sí nunca tuvo el bug — solo recibía datos
 // vacíos de su llamador.
 //
+// v5 (4 ago 2026) — ESTILO EDITABLE DESDE ADMIN, DATOS Y SEGURIDAD
+// PROTEGIDOS: generarIdeasActivismoTotal() ahora acepta estiloPersona y
+// reglasGeneracion opcionales (worker.js los lee de prompts_productos,
+// claves "presentacion_activismo_estilo" y "presentacion_activismo_reglas").
+// Solo se expusieron dos fragmentos genuinamente de estilo, sin dato y sin
+// riesgo — la frase de apertura y las reglas de generación no relacionadas
+// con seguridad. A propósito NO se expusieron: el menú de 14 tácticas
+// (MENU_TACTICAS_ACTIVISMO, acoplado al enum de CATEGORIAS_ACTIVISMO en el
+// schema — editarlo sin tocar el código desincronizaría ambos), ni las dos
+// reglas de seguridad de contenido (no violencia, no testimonios
+// fabricados) — esas siguen siempre fijas, en la misma posición, sin
+// importar qué haya guardado en la base de datos. Mismo patrón de
+// TEXTO_..._RESPALDO que ya usan generarDatosGrafo.js y
+// generarGuionPresentacion.js.
+//
+
 // v4 (4 ago 2026) — obtenerContactosApoyo() PASA A SER RESPALDO, NO FUENTE
 // PRINCIPAL: la lista real y curada ahora vive en la tabla contactos_apoyo
 // (worker.js: /contactos-apoyo/*, pantalla /admin/contactos-apoyo).
@@ -154,8 +170,24 @@ const SCHEMA_IDEAS_ACTIVISMO_TOTAL = {
   additionalProperties: false,
 };
 
-async function generarIdeasActivismoTotal(datos, metadatos, veredicto, auditoria_id = 'N/A') {
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// ── Bloques de ESTILO — editables desde /admin/productos-comunicacionales ──
+// Texto de respaldo idéntico al que ya vivía fijo en el prompt. A propósito
+// NO se exponen aquí: el menú de tácticas (MENU_TACTICAS_ACTIVISMO, acoplado
+// al enum del schema vía CATEGORIAS_ACTIVISMO) ni las dos reglas de
+// seguridad de contenido (no violencia, no testimonios fabricados) — esas
+// se quedan siempre fijas en construirPromptIdeasActivismo(), sin
+// excepción, sin importar qué se guarde en prompts_productos.
+const TEXTO_PERSONA_ACTIVISMO_RESPALDO = `Eres un asistente de activismo cívico no violento para liberalmente.app, una plataforma de auditoría ciudadana de leyes y políticas públicas desde una perspectiva liberal.`;
+
+const TEXTO_REGLAS_ACTIVISMO_RESPALDO = `Basa cada idea en una o más tácticas concretas del menú de arriba, adaptadas específicamente a este documento (referenciando su tema, artículos o país cuando ayude a que no suene genérica) — no un consejo que serviría igual para cualquier ley. Usa categorías variadas entre las ideas (evita repetir la misma categoría más de una vez salvo que el contexto realmente lo amerite) — cada categoría tiene su propia ilustración, y la variedad hace la presentación más rica visualmente.`;
+
+// Construye el prompt completo. estiloPersona / reglasGeneracion: opcionales
+// — si vienen null o vacíos, se usa el texto de respaldo de arriba.
+// worker.js los lee de prompts_productos antes de llamar a
+// generarIdeasActivismoTotal(). El resto del prompt —datos reales, menú de
+// tácticas, reglas de seguridad— siempre se arma igual, en código, en la
+// misma posición exacta que ya tenía.
+function construirPromptIdeasActivismo(datos, metadatos, veredicto, estiloPersona = null, reglasGeneracion = null) {
   const esRechazo = veredicto.modo === 'rechazo_total';
 
   const criterios = datos.categorias.flatMap(cat => cat.criterios).filter(c => c.resultado !== 'NA');
@@ -163,7 +195,10 @@ async function generarIdeasActivismoTotal(datos, metadatos, veredicto, auditoria
     .map(c => `- ${c.id} [${c.resultado}]: ${c.analisis}`)
     .join('\n');
 
-  const prompt = `Eres un asistente de activismo cívico no violento para liberalmente.app, una plataforma de auditoría ciudadana de leyes y políticas públicas desde una perspectiva liberal.
+  const persona = (estiloPersona && estiloPersona.trim()) ? estiloPersona.trim() : TEXTO_PERSONA_ACTIVISMO_RESPALDO;
+  const reglas  = (reglasGeneracion && reglasGeneracion.trim()) ? reglasGeneracion.trim() : TEXTO_REGLAS_ACTIVISMO_RESPALDO;
+
+  return `${persona}
 
 Este instrumento normativo obtuvo ${veredicto.alineacionPorcentaje}% de impacto liberal, lo cual amerita una recomendación de ${esRechazo ? 'RECHAZO TOTAL' : 'PROMOCIÓN TOTAL'}.
 
@@ -175,7 +210,14 @@ ${listaCriterios}
 MENÚ DE TÁCTICAS DE ACTIVISMO (catálogo curado, en la tradición de Gene Sharp adaptada al contexto actual — elige de aquí, no inventes tácticas fuera de este menú):
 ${MENU_TACTICAS_ACTIVISMO}
 
-Genera de 3 a 5 ideas concretas de activismo cívico no violento para que un ciudadano actúe sobre este veredicto — ${esRechazo ? 'orientadas a rechazar y frenar este instrumento' : 'orientadas a promover y defender este instrumento'}. Basa cada idea en una o más tácticas concretas del menú de arriba, adaptadas específicamente a este documento (referenciando su tema, artículos o país cuando ayude a que no suene genérica) — no un consejo que serviría igual para cualquier ley. Usa categorías variadas entre las ideas (evita repetir la misma categoría más de una vez salvo que el contexto realmente lo amerite) — cada categoría tiene su propia ilustración, y la variedad hace la presentación más rica visualmente. Nunca sugieras violencia, daño a personas o propiedad, ni acciones ilegales. Nunca sugieras fabricar testimonios, relatos personales o citas atribuidas a personas que no sean reales y presentarlos como si lo fueran — el contenido debe ser siempre veraz y transparente sobre su origen, aunque se use IA para producirlo (videos explicativos, infografías o resúmenes son apropiados; testimonios inventados o "compuestos" presentados como reales no lo son).`;
+Genera de 3 a 5 ideas concretas de activismo cívico no violento para que un ciudadano actúe sobre este veredicto — ${esRechazo ? 'orientadas a rechazar y frenar este instrumento' : 'orientadas a promover y defender este instrumento'}. ${reglas}
+
+Nunca sugieras violencia, daño a personas o propiedad, ni acciones ilegales. Nunca sugieras fabricar testimonios, relatos personales o citas atribuidas a personas que no sean reales y presentarlos como si lo fueran — el contenido debe ser siempre veraz y transparente sobre su origen, aunque se use IA para producirlo (videos explicativos, infografías o resúmenes son apropiados; testimonios inventados o "compuestos" presentados como reales no lo son).`;
+}
+
+async function generarIdeasActivismoTotal(datos, metadatos, veredicto, auditoria_id = 'N/A', estiloPersona = null, reglasGeneracion = null) {
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const prompt = construirPromptIdeasActivismo(datos, metadatos, veredicto, estiloPersona, reglasGeneracion);
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
@@ -226,6 +268,7 @@ function obtenerContactosApoyo() {
 
 module.exports = {
   calcularVeredictoActivismo,
+  construirPromptIdeasActivismo,
   generarIdeasActivismoTotal,
   obtenerContactosApoyo,
 };
