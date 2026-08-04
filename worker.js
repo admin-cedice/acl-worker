@@ -2107,6 +2107,63 @@ app.get('/prompts/:id', async (req, res) => {
   }
 });
 
+// ── Prompts de Productos Comunicacionales (2 ago 2026) ────────────────────
+// Tabla aparte de configuracion_doctrinal, a propósito: estos prompts
+// (podcast, presentación, mapa mental) NO forman parte del Test de
+// Libertad — editarlos no debe crear una "versión" nueva del Test ni
+// exigir "Activar". Guardado inmediato, Superadmin-only.
+//
+// PENDIENTE, IMPORTANTE: estos endpoints ya guardan/leen datos reales en
+// prompts_productos, pero TODAVÍA NADA en el pipeline los lee —
+// generarYRevisarGuion() (generarGuionPresentacion.js),
+// generarPresentacionPDF.js y generarDatosGrafo.js siguen usando sus
+// strings fijos en el código. Conectar eso es el siguiente paso, una vez
+// se identifique el prompt real dentro de cada archivo.
+
+app.get('/prompts-productos', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const { rows } = await db.query(
+      `SELECT clave, etiqueta, texto, actualizado_en FROM prompts_productos ORDER BY clave ASC`
+    );
+    res.json({ ok: true, prompts: rows });
+  } catch (error) {
+    console.error('❌ Error listando prompts de productos:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /prompts-productos/guardar — Superadmin. Crea o actualiza (upsert)
+// un prompt por su "clave" — a diferencia de /prompts/subir-version, esto
+// NO versiona: guarda directo sobre la fila existente. Requiere que
+// "clave" tenga una restricción UNIQUE en la tabla (ya la tiene, es la
+// PRIMARY KEY según el diseño que se creó).
+app.post('/prompts-productos/guardar', async (req, res) => {
+  const payload = exigirSuperadmin(req, res);
+  if (!payload) return;
+  const { clave, etiqueta, texto } = req.body || {};
+  if (!clave?.trim() || !etiqueta?.trim() || !texto?.trim()) {
+    return res.status(400).json({ error: 'Faltan campos requeridos (clave, etiqueta, texto)' });
+  }
+  try {
+    await db.query(
+      `INSERT INTO prompts_productos (clave, etiqueta, texto, actualizado_en, actualizado_por)
+       VALUES ($1, $2, $3, NOW(), $4)
+       ON CONFLICT (clave) DO UPDATE
+       SET etiqueta = EXCLUDED.etiqueta, texto = EXCLUDED.texto,
+           actualizado_en = NOW(), actualizado_por = EXCLUDED.actualizado_por`,
+      [clave.trim(), etiqueta.trim(), texto.trim(), payload.id || null]
+    );
+    console.log(`   [prompts-productos/guardar] ✅ "${clave}" guardado por ${payload.email || payload.id}`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error guardando prompt de producto:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Pesos de criterios (31 jul 2026) — jerarquía y ponderación ────────────
 // pesos_criterios vive en la misma fila activa de configuracion_doctrinal,
 // SIN versionado propio (a diferencia de los prompts): se edita en el
