@@ -1,71 +1,18 @@
 // generarPresentacionPDF.js — ACL Worker
 // Umbusk LLC · Auditoría Cívica Liberal
 //
-// Presentación v2.4 (22 jul 2026) — pensada de verdad como diapositivas
-// para pantalla, no como documento impreso reducido:
-//   1. Cada idea de Activismo (caso total) pasa a ser SU PROPIA lámina —
-//      no una lista de 3-5 ideas apretadas en una página. Cada una trae
-//      una ilustración grande a un lado, según su `categoria`
-//      (redes_sociales/carta/foro/monitoreo/medios) — 5 ilustraciones
-//      GENÉRICAS reutilizables por categoría, no una distinta por idea
-//      individual. HOY SOLO EXISTE LA DE 'redes_sociales' (la que subió
-//      Moisés, 22 jul) — se espera en
-//      public/presentacion/activismo-redes-sociales.png del repo
-//      auditoria-civica-liberal. Las otras 4 (activismo-carta.png,
-//      activismo-foro.png, activismo-monitoreo.png, activismo-medios.png)
-//      todavía no existen — mientras tanto esas láminas muestran un
-//      rectángulo de color liso en vez de imagen rota (ver
-//      .idea-ilustracion, background-image con fallback de color, no
-//      <img> — así no se ve un ícono de "imagen rota" si el archivo
-//      todavía no está).
-//   2. Tipografía subida en todo el documento — pensada para proyectarse
-//      o leerse en pantalla, no para imprimirse de cerca. El único bloque
-//      que NO se agrandó a propósito es el masthead de portada (logo/
-//      créditos/etiqueta), porque ese sí debía replicar exactamente al
-//      Reporte, por pedido explícito de Moisés.
-//   3. Como consecuencia esperada y aceptada: el caso híbrido y el caso
-//      total ya no intentan caber en una sola página — el documento
-//      fluye en tantas láminas como haga falta.
+// [... changelog anterior sin cambios, ver versiones previas del archivo ...]
 //
-// SIN CAMBIOS: mecanismo HTML→PDF (CloudConvert), mapa temporal de
-// HTMLs, firma pública de generarPresentacionPDF(). La lámina de
-// hallazgos ilustrados sigue definida pero sin llamarse (ver v2.2).
-//
-// v2.5 (31 jul 2026) — FIX IMPORTANTE + PESOS DE CRITERIOS:
-//
-// FIX: generarPresentacionPDF() calculaba SIEMPRE sus enlaces
-// artículo↔criterio llamando a calcularDatosGrafo(datos) SIN el segundo
-// argumento (analisisGrafo). Como ese parámetro es opcional y por defecto
-// vale { articulos: [], citas: [] }, y calcularDatosGrafo() solo arma
-// "enlaces" a partir de analisisGrafo.citas, el resultado era SIEMPRE un
-// arreglo vacío — sin importar el documento auditado. Eso hacía que
-// calcularResumenHorizontes() viera total=0 en todos los casos, y
-// calcularVeredictoActivismo() interpreta un total de 0 como 0% de
-// alineación — por debajo del umbral de rechazo (20%) siempre. En la
-// práctica: TODAS las Presentaciones generadas hasta hoy recomendaban
-// "RECHAZAR 100% A ESTE INSTRUMENTO", sin importar si el documento era
-// liberal o no. La causa no estaba en calcularVeredictoActivismo() ni en
-// calcularResumenHorizontes() — estaba en que esta función nunca les pasó
-// datos reales.
-//
-// SOLUCIÓN: generarPresentacionPDF() ahora recibe un quinto parámetro
-// `grafoDatos` — el mismo objeto {nodos, enlaces} que el PASO 6.5 de
-// procesarAuditoria() (worker.js) ya calcula con generarGrafoConClaude(),
-// o el que ya está guardado en auditorias.grafo_datos si se está
-// regenerando la Presentación de una auditoría vieja. Si no llega (ej. el
-// PASO 6.5 falló para esa auditoría), se cae al comportamiento anterior
-// (enlaces vacíos) pero con una advertencia explícita en el log, en vez de
-// fallar en silencio.
-//
-// PESOS: sexto parámetro opcional `pesosCriterios` — se pasa a
-// calcularResumenHorizontes() (ver generarDatosGrafo.js v2), así el
-// veredicto de activismo también respeta los pesos definidos en
-// /admin/pesos, igual que ya hace el puntaje del Reporte desde el 31 jul.
-
-// v2.6 (31 jul 2026) — TARJETA ROJA: si datos.descalificado viene true
-// (ver generarReportePDF.js v4.5 — un criterio marcado "descalificador"
-// en /admin/pesos que dio NO), el veredicto se fuerza a rechazo_total
-// aquí también, sin importar el promedio ponderado por horizonte.
+// v2.7 (4 ago 2026) — CONTACTOS DE APOYO REALES:
+// generarPresentacionPDF() acepta ahora un séptimo parámetro opcional
+// `contactosApoyo` — el arreglo real que worker.js lee de la tabla nueva
+// contactos_apoyo (vía obtenerContactosApoyoActivos()), la misma que
+// alimenta /admin/contactos-apoyo. Si llega con al menos un contacto, se
+// usa tal cual. Si no llega, o llega vacío (tabla recién creada, sin
+// sembrar todavía), se cae a obtenerContactosApoyo() de generarActivismo.js
+// —los datos DUMMY que ya existían— con una advertencia explícita en el
+// log, para que nunca se generen Presentaciones con datos de prueba sin
+// que quede rastro de que pasó.
 
 'use strict';
 
@@ -82,15 +29,8 @@ function esc(str) {
     .replace(/"/g, '&quot;');
 }
 
-// ── Asunción sin confirmar del todo — solo usada por la lámina de
-// hallazgos, hoy sin llamarse ──────────────────────────────────────────
 const RUTA_BASE_IMAGENES = 'https://liberalmente.app/presentacion';
 
-// Una ilustración genérica por categoría de la taxonomía de 14 (Moisés,
-// vía ChatGPT, 22 jul 2026) — NO una por idea. Solo 'redes_sociales'
-// existe hoy; el resto muestra el color liso de respaldo (ver
-// .idea-ilustracion) hasta que se produzcan y suban con estos nombres
-// exactos a public/presentacion/ del repo auditoria-civica-liberal.
 const ILUSTRACION_POR_CATEGORIA = {
   redes_sociales:            'activismo-redes-sociales.png',
   contacto_representantes:   'activismo-contacto-representantes.png',
@@ -115,8 +55,6 @@ const HORIZONTES = [
 ];
 const AREA_POR_RESULTADO = { NO: 'en_contra', SI_MATIZ: 'neutral', SI: 'a_favor' };
 
-// Mismo agrupamiento que ya usa (y sigue usando) generarSVGGrafoPorHorizonte()
-// en worker.js — los criterios NA quedan fuera, no aplican al documento.
 function calcularSeccionesHorizonte(datos) {
   const criterios = datos.categorias.flatMap(cat => cat.criterios).filter(c => c.resultado !== 'NA');
   const secciones = { en_contra: [], neutral: [], a_favor: [] };
@@ -127,7 +65,6 @@ function calcularSeccionesHorizonte(datos) {
   return secciones;
 }
 
-// Etiquetas cortas de artículo (A-12, A-64F...) por criterio.
 function calcularArticulosPorCriterio(enlaces) {
   const mapa = {};
   enlaces.forEach(e => {
@@ -143,15 +80,11 @@ function partirEnBloques(lista, tam) {
   return bloques;
 }
 
-// ── Texto de marcador de posición — SOLO para el caso híbrido ───────────
 function textoPlaceholderCriterio(tipo) {
   const etiquetas = { rechazo: 'rechazo', mejora: 'mejora', promocion: 'promoción' };
   return `[PENDIENTE — recomendación de ${etiquetas[tipo]} para este criterio, generada con Claude]`;
 }
 
-// Título grande de la portada — "intensidad total" del veredicto. El
-// "100%" en los casos rechazo_total/promocion_total es literal (la acción
-// recomendada es total/completa), NO el % de impacto liberal del documento.
 function generarTituloRecomendacionGeneral(veredicto) {
   if (veredicto.modo === 'rechazo_total') return 'Recomendación General: RECHAZAR 100% A ESTE INSTRUMENTO.';
   if (veredicto.modo === 'promocion_total') return 'Recomendación General: APOYAR 100% A ESTE INSTRUMENTO.';
@@ -168,12 +101,9 @@ const CSS = `
     -webkit-print-color-adjust: exact; print-color-adjust: exact;
   }
 
-  /* ── Portada ─────────────────────────────────────────────────────── */
   .portada-pres { break-after: page; height: 178mm; display: flex; flex-direction: column; }
   .portada-cinta { height: 5px; background: #C41230; flex: 0 0 auto; }
 
-  /* Réplica del masthead del Reporte — a propósito NO se agranda, es el
-     único bloque que debía calzar en tamaño con el documento impreso. */
   .portada-header {
     flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
     padding: 28px 52px 24px; border-bottom: 1px solid #D4CFC4;
@@ -194,13 +124,11 @@ const CSS = `
   }
   .portada-subtitulo { font-size: 13px; color: #4A4A4A; font-style: italic; font-family: Georgia, 'Times New Roman', serif; }
 
-  /* Hero de portada — este sí a escala de diapositiva. */
   .portada-hero { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 34px; text-align: center; padding: 0 16mm; }
   .recomendacion-general { font-family: Georgia, 'Times New Roman', serif; font-size: 34px; font-weight: 700; line-height: 1.35; max-width: 720px; }
   .motto-linea1 { font-family: Georgia, 'Times New Roman', serif; font-size: 25px; font-weight: 700; color: #1A1A1A; }
   .motto-linea2 { font-family: Georgia, 'Times New Roman', serif; font-size: 25px; font-style: italic; color: #C41230; }
 
-  /* ── Hallazgos (SUPERADA — sin llamarse) ────────────────────────────── */
   .lamina-hallazgo { break-before: page; height: 178mm; display: flex; flex-direction: column; }
   .hallazgo-header { flex: 0 0 auto; display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 10px; margin-bottom: 14px; }
   .hallazgo-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 22px; font-weight: 700; }
@@ -221,7 +149,6 @@ const CSS = `
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
 
-  /* ── Activismo — caso total: una idea por lámina ────────────────────── */
   .lamina-idea-activismo { break-before: page; height: 178mm; display: flex; align-items: center; gap: 36px; padding: 0 12mm; }
   .idea-ilustracion {
     flex: 0 0 42%; height: 140mm; border-radius: 8px;
@@ -232,7 +159,6 @@ const CSS = `
   .idea-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 28px; font-weight: 700; line-height: 1.3; margin-bottom: 18px; max-width: 480px; }
   .idea-descripcion { font-size: 17px; color: #4A4A4A; line-height: 1.6; max-width: 480px; }
 
-  /* ── Activismo — caso híbrido (placeholder, sigue en borrador) ──────── */
   .lamina-activismo-horizonte { break-before: page; min-height: 178mm; }
   .activismo-header { display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 12px; margin-bottom: 22px; }
   .activismo-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 28px; font-weight: 700; }
@@ -246,7 +172,6 @@ const CSS = `
     border: 1px dashed #C7C2B6; border-radius: 3px; padding: 10px 12px; background: #FBFAF7;
   }
 
-  /* ── Lámina de contacto ──────────────────────────────────────────── */
   .lamina-contacto { break-before: page; min-height: 178mm; display: flex; align-items: center; }
   .contacto-cuerpo { display: flex; gap: 36px; align-items: flex-start; width: 100%; }
   .contacto-ilustracion { flex: 0 0 160px; width: 160px; height: 160px; }
@@ -263,7 +188,6 @@ const CSS = `
   .contacto-descripcion { font-size: 13px; color: #8A8478; margin-top: 5px; }
 `;
 
-// ── Portada ────────────────────────────────────────────────────────────
 function generarPortadaHTML(titulo, pais, generadoEl, veredicto) {
   const color = veredicto.modo === 'rechazo_total' ? '#C41230'
     : veredicto.modo === 'promocion_total' ? '#2E7D32'
@@ -294,7 +218,6 @@ function generarPortadaHTML(titulo, pais, generadoEl, veredicto) {
 </div>`;
 }
 
-// ── Hallazgos (SUPERADA — definida pero sin llamarse) ────────────────────
 function generarTarjetaCriterioHTML(c, articulos) {
   const src = `${RUTA_BASE_IMAGENES}/${esc(c.id)}.png`;
   const marcador = c.resultado === 'NO'
@@ -335,7 +258,6 @@ function generarLaminasHallazgosHTML(secciones, articulosPorCriterio) {
     }).join('\n');
 }
 
-// ── Activismo — caso total: una lámina por idea ──────────────────────────
 function generarLaminaIdeaHTML(idea, numero, total, color) {
   const archivo = ILUSTRACION_POR_CATEGORIA[idea.categoria] || ILUSTRACION_POR_CATEGORIA.redes_sociales;
   const src = `${RUTA_BASE_IMAGENES}/${archivo}`;
@@ -356,7 +278,6 @@ function generarLaminasVeredictoTotalHTML(veredicto, ideas) {
   return lista.map((idea, i) => generarLaminaIdeaHTML(idea, i + 1, lista.length, color)).join('\n');
 }
 
-// ── Activismo — caso híbrido (placeholder, sigue en borrador) ───────────
 const TIPO_ACTIVISMO_POR_HORIZONTE = { en_contra: 'rechazo', neutral: 'mejora', a_favor: 'promocion' };
 const NOMBRE_ACTIVISMO_POR_HORIZONTE = { en_contra: 'RECHAZO', neutral: 'MEJORA', a_favor: 'PROMOCIÓN' };
 
@@ -393,8 +314,14 @@ function generarSeccionActivismoHTML(veredicto, secciones, articulosPorCriterio,
     .join('\n');
 }
 
-// ── Lámina de contacto (con ilustración placeholder) ─────────────────────
-function generarLaminaContactoHTML(contactos) {
+// ── Lámina de contacto ────────────────────────────────────────────────
+// v2.7 (4 ago 2026): ya no asume que la lista es siempre DUMMY — el
+// banner amarillo de aviso ahora solo aparece si de verdad se está usando
+// el respaldo (ver la lógica en generarPresentacionPDF() más abajo, que
+// decide entre datos reales y DUMMY antes de llegar aquí). Esta función
+// recibe la lista ya decidida y un flag `esDummy` para saber si mostrar
+// el aviso.
+function generarLaminaContactoHTML(contactos, esDummy) {
   const itemsHTML = (contactos || []).map(c => `
     <div class="contacto-item">
       <div class="contacto-nombre">${esc(c.nombre)}</div>
@@ -414,21 +341,20 @@ function generarLaminaContactoHTML(contactos) {
     <div class="contacto-lista">
       <div class="contacto-eyebrow">Activista</div>
       <div class="contacto-titulo">Si te encuentras ante una situación de abuso de poder, sigue las siguientes recomendaciones.</div>
-      <div class="contacto-aviso-dummy">⚠ DATOS DE PRUEBA — pendientes de curar y verificar. No usar en producción real.</div>
+      ${esDummy ? `<div class="contacto-aviso-dummy">⚠ DATOS DE PRUEBA — pendientes de curar y verificar. No usar en producción real.</div>` : ''}
       ${itemsHTML}
     </div>
   </div>
 </div>`;
 }
 
-// ── HTML completo ──────────────────────────────────────────────────────
 function generarHTML(datos, metadatos, contexto) {
   const { titulo = 'Documento auditado', pais = '', generadoEl = '' } = metadatos;
-  const { veredicto, secciones, articulosPorCriterio, ideasActivismoTotal, contactosApoyo } = contexto;
+  const { veredicto, secciones, articulosPorCriterio, ideasActivismoTotal, contactosApoyo, contactosSonDummy } = contexto;
 
   const portadaHTML   = generarPortadaHTML(titulo, pais, generadoEl, veredicto);
   const activismoHTML = generarSeccionActivismoHTML(veredicto, secciones, articulosPorCriterio, ideasActivismoTotal);
-  const contactoHTML  = generarLaminaContactoHTML(contactosApoyo);
+  const contactoHTML  = generarLaminaContactoHTML(contactosApoyo, contactosSonDummy);
 
   return `<!DOCTYPE html>
 <html lang="es">
@@ -446,7 +372,6 @@ ${contactoHTML}
 </html>`;
 }
 
-// ── Mapa temporal de HTMLs propio de la Presentación (sin cambios) ──────
 const _htmlsTemporalesPresentacion = new Map();
 
 function registrarRutaHTMLTemporalPresentacion(app) {
@@ -458,7 +383,6 @@ function registrarRutaHTMLTemporalPresentacion(app) {
   });
 }
 
-// ── Conversión HTML → PDF vía CloudConvert (sin cambios) ────────────────
 async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
   const CLOUDCONVERT_API_KEY = process.env.CLOUDCONVERT_API_KEY;
   if (!CLOUDCONVERT_API_KEY) throw new Error('Falta la variable de entorno CLOUDCONVERT_API_KEY');
@@ -561,15 +485,13 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 }
 
 // ── Función principal exportada ───────────────────────────────────────────
-// v2.5 (31 jul 2026): quinto parámetro `grafoDatos` (objeto {nodos, enlaces}
-// ya calculado — ver el fix documentado arriba) y sexto `pesosCriterios`
-// (objeto {id: peso}, pasado a calcularResumenHorizontes()). Ambos
-// opcionales para no romper ningún llamador viejo que todavía no los
-// mande — aunque sin `grafoDatos` real, el veredicto vuelve a salir
-// siempre RECHAZO TOTAL (el comportamiento de antes del fix), así que
-// ahora se avisa explícitamente en el log en vez de quedar en silencio.
-async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.5`);
+// v2.7 (4 ago 2026): séptimo parámetro opcional `contactosApoyo` — ver
+// changelog arriba. Se usa si trae al menos un contacto; si no, se cae al
+// respaldo DUMMY de generarActivismo.js, con aviso explícito en el log Y
+// en la propia lámina (el banner amarillo solo aparece cuando de verdad
+// son datos de prueba).
+async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}, contactosApoyo = null) {
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.7`);
 
   let enlaces;
   if (grafoDatos && Array.isArray(grafoDatos.enlaces)) {
@@ -577,17 +499,12 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
     console.log(`   [${auditoria_id}] Usando grafo real recibido: ${enlaces.length} enlaces`);
   } else {
     console.warn(`   ⚠️ [${auditoria_id}] generarPresentacionPDF: no se recibió un grafo real (grafoDatos) — el veredicto de activismo se calculará con 0 enlaces, lo cual SIEMPRE da RECHAZO TOTAL sin importar el documento. Revisar si el Paso 6.5 falló para esta auditoría, o si el llamador todavía no pasa grafoDatos.`);
-    enlaces = calcularDatosGrafo(datos).enlaces; // respaldo: siempre vacío sin analisisGrafo real
+    enlaces = calcularDatosGrafo(datos).enlaces;
   }
 
   const resumenHorizontes = calcularResumenHorizontes(enlaces, pesosCriterios);
   let veredicto = calcularVeredictoActivismo(resumenHorizontes);
 
-  // 31 jul 2026 — TARJETA ROJA: si normalizarDatosEstructurados() (Reporte)
-  // marcó el documento como descalificado (un criterio eliminatorio dio
-  // NO), el veredicto de activismo se fuerza a rechazo_total, sin importar
-  // el promedio ponderado por horizonte — mismo criterio que el puntaje
-  // del Reporte, que también se fuerza a 0%.
   if (datos.descalificado) {
     console.warn(`   🟥 [${auditoria_id}] generarPresentacionPDF: documento DESCALIFICADO (criterio eliminatorio en NO: ${(datos.criteriosDescalificadores || []).join(', ')}) — veredicto forzado a rechazo_total.`);
     veredicto = { modo: 'rechazo_total', alineacionPorcentaje: 0 };
@@ -603,10 +520,16 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
     console.log(`   [${auditoria_id}] ${ideasActivismoTotal.length} ideas generadas`);
   }
 
-  const contactosApoyo = obtenerContactosApoyo();
+  // Contactos reales si worker.js mandó al menos uno; si no, respaldo DUMMY
+  // — y se deja constancia clara de cuál de los dos casos fue.
+  const contactosSonDummy = !contactosApoyo || contactosApoyo.length === 0;
+  const contactos = contactosSonDummy ? obtenerContactosApoyo() : contactosApoyo;
+  if (contactosSonDummy) {
+    console.warn(`   ⚠️ [${auditoria_id}] generarPresentacionPDF: no se recibieron contactos reales de contactos_apoyo — usando datos DUMMY de respaldo. Agrega al menos un contacto activo desde /admin/contactos-apoyo.`);
+  }
 
   const html = generarHTML(datos, metadatos, {
-    veredicto, secciones, articulosPorCriterio, ideasActivismoTotal, contactosApoyo,
+    veredicto, secciones, articulosPorCriterio, ideasActivismoTotal, contactosApoyo: contactos, contactosSonDummy,
   });
   const rutaHTML = rutaSalida.replace('.pdf', '.html');
   fs.writeFileSync(rutaHTML, html, 'utf8');

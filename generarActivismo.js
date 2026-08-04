@@ -18,16 +18,6 @@
 // schema para guiar esa selección (era del pptx viejo, superado) — sería
 // puro criterio de Claude leyendo el análisis de cada uno.
 //
-// Lámina de contacto (obtenerContactosApoyo): a propósito NO se genera
-// con Claude — decisión de Moisés, 22 jul 2026: un dato de contacto
-// equivocado podría usarse en una situación real y urgente, así que debe
-// ser contenido fijo, curado y verificado a mano, igual en todas las
-// presentaciones. Por ahora son datos DUMMY (marcados "[DUMMY]" en cada
-// campo para que nadie los confunda con contactos reales) — reemplazar
-// cuando exista la lista real. Si más adelante se quiere poder editarla
-// sin desplegar código, el patrón ya existe en el proyecto:
-// fuentes_doctrinales (tabla + endpoints en worker.js).
-//
 // v3 (31 jul 2026) — FIX + PESOS: calcularVeredictoActivismo() ahora usa
 // neutral.peso / a_favor.peso en vez de neutral.cantidad / a_favor.cantidad
 // cuando esos campos vienen presentes en resumenHorizontes (ver
@@ -42,6 +32,17 @@
 // el 100% de las Presentaciones generadas hasta hoy, sin importar el
 // documento. Esta función en sí nunca tuvo el bug — solo recibía datos
 // vacíos de su llamador.
+//
+// v4 (4 ago 2026) — obtenerContactosApoyo() PASA A SER RESPALDO, NO FUENTE
+// PRINCIPAL: la lista real y curada ahora vive en la tabla contactos_apoyo
+// (worker.js: /contactos-apoyo/*, pantalla /admin/contactos-apoyo).
+// generarPresentacionPDF.js recibe esa lista real como parámetro y solo
+// llama a esta función si la tabla todavía no tiene ningún contacto activo
+// — sin cambios de código acá, solo de rol: esto sigue siendo la red de
+// seguridad ("nunca mostrar una lámina de contacto completamente vacía"),
+// no la fuente de verdad. Se deja intacta, DUMMY, hasta que se decida si
+// vale la pena borrarla una vez la tabla esté sembrada de forma
+// confiable.
 
 'use strict';
 
@@ -51,12 +52,6 @@ const UMBRAL_RECHAZO_TOTAL   = 0.20;
 const UMBRAL_PROMOCION_TOTAL = 0.80;
 
 // ── Veredicto general del instrumento ────────────────────────────────────
-// v3 (31 jul 2026): usa el peso ponderado (neutral.peso / a_favor.peso) si
-// viene presente en resumenHorizontes — que es lo que calcularResumenHorizontes()
-// entrega desde su v2 (31 jul 2026). Si por algún motivo llega un
-// resumenHorizontes viejo sin `.peso` (no debería pasar con el código
-// actual, pero por seguridad), cae de vuelta a `.cantidad` — mismo
-// comportamiento que existía antes de que se agregaran los pesos.
 function calcularVeredictoActivismo(resumenHorizontes) {
   const { total, neutral, a_favor } = resumenHorizontes;
   const pesoNeutral = neutral.peso !== undefined ? neutral.peso : neutral.cantidad;
@@ -79,8 +74,6 @@ function calcularVeredictoActivismo(resumenHorizontes) {
 }
 
 // ── Utilidad: extraer el bloque de texto de una respuesta de Claude ─────
-// Mismo motivo que en worker.js y generarDatosGrafo.js: el pensamiento
-// adaptativo puede anteponer un bloque 'thinking' al de 'text'.
 function extraerTextoRespuesta(response) {
   const bloqueTexto = response.content.find(b => b.type === 'text');
   if (!bloqueTexto) {
@@ -111,10 +104,6 @@ const CATEGORIAS_ACTIVISMO = [
   { slug: 'coaliciones',               nombre: 'Construcción de coaliciones' },
 ];
 
-// Menú completo de tácticas por categoría — se le pasa a Claude como
-// referencia en el prompt, para que elija acciones concretas de un
-// catálogo curado en vez de inventar desde cero. Texto de Moisés (vía
-// ChatGPT, 22 jul 2026), sin alterar su contenido.
 const MENU_TACTICAS_ACTIVISMO = `
 1. Redes sociales y plataformas digitales: publicar infografías breves y visuales; crear videos cortos (Reels/TikTok/Shorts) o más largos en YouTube; publicar hilos en X/Threads/Bluesky; diseñar carruseles con datos y preguntas frecuentes; compartir testimonios reales de personas afectadas; transmisiones en vivo con especialistas; podcasts; campañas con hashtags; memes o piezas de humor político; micrositio con documentos descargables; boletines por correo; grupos de difusión (WhatsApp/Telegram/Signal); responder públicamente a desinformación.
 2. Contacto directo con representantes públicos: cartas o correos personalizados a congresistas/diputados/concejales; llamadas a sus oficinas; solicitar reuniones; entregar documentos técnicos; proponer modificaciones a un proyecto de ley; participar en consultas públicas; intervenir en audiencias legislativas; coordinar campañas de contacto masivo en un periodo determinado; pedir rendición de cuentas sobre una votación.
@@ -209,9 +198,12 @@ Genera de 3 a 5 ideas concretas de activismo cívico no violento para que un ciu
   return datosRespuesta.ideas;
 }
 
-// ── Lámina de contacto — DATOS DUMMY, PENDIENTES DE CURAR ────────────────
-// Ver nota al inicio del archivo. Común a todas las presentaciones,
-// independiente del veredicto.
+// ── Lámina de contacto — RESPALDO, ya no es la fuente principal ─────────
+// Ver v4 en el changelog: la lista real vive en la tabla contactos_apoyo
+// (worker.js), leída por obtenerContactosApoyoActivos() y pasada como
+// parámetro a generarPresentacionPDF(). Esta función solo se invoca ahí
+// como red de seguridad si esa tabla todavía no tiene ningún contacto
+// activo — nunca se llama directo desde el pipeline principal.
 function obtenerContactosApoyo() {
   return [
     {

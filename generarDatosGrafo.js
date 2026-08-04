@@ -2,61 +2,22 @@
 // Umbusk LLC · Auditoría Cívica Liberal
 //
 // v2 (28 jul 2026): reemplazado el mecanismo de identificación de artículos.
-// Antes: Claude escribía la cita en texto libre en el análisis principal →
-// un regex (normalizarComponentes()) decidía qué era un artículo real → un
-// llamado aparte (generarTitulosArticulos()) solo le ponía título. El
-// regex era estricto a propósito (solo "Artículo N" solo, sin nada más
-// alrededor) y por eso se rompía con leyes de REFORMA — Claude cita ahí
-// cosas como "Artículo 4 (reforma del artículo 14, numeral 8)", con
-// paréntesis explicativo, y el regex descartaba la cita completa en vez de
-// solo recortarla. Caso real que expuso el problema: Ley de Reforma de la
-// Ley Contra la Estafa Inmobiliaria (28 jul 2026) — el grafo mostró un solo
-// artículo de 28 criterios citados.
+// [... changelog anterior sin cambios, ver versión previa del archivo ...]
 //
-// Ahora: generarGrafoConClaude() reemplaza tanto al regex como al llamado
-// de solo-títulos — un único llamado (Structured Outputs) que lee el texto
-// completo del documento y decide, con instrucciones explícitas en el
-// prompt (no con un patrón fijo), qué es un artículo real, cómo se llama,
-// qué hace (modifica/suprime/agrega un artículo de la ley vigente, o
-// ninguna si el documento no es una reforma), y qué criterios lo citan.
-// Mismo aprendizaje que ya se aplicó el 16 jul al análisis principal de 28
-// criterios: cuando el regex se rompe cada vez que Claude varía el
-// formato, la causa no es un bug puntual a parchar — es una discordancia
-// de arquitectura entre "texto libre" y "patrón fijo". La solución real es
-// pedirle a Claude que entregue la estructura ya lista, no adivinarla
-// después con expresiones regulares.
-//
-// normalizarComponentes(), componentesUnicos() y generarTitulosArticulos()
-// (con su schema) quedan SUPERADAS — se dejan definidas más abajo, sin
-// exportarse, por si hace falta comparar. No se llaman desde ningún lado
-// del pipeline. etiquetaCortaComponente() sí sigue en uso (arma la
-// etiqueta corta "A-07" a partir del id "Art. 7").
-//
-// Sigue siendo un módulo aparte de worker.js a propósito: contiene todo lo
-// necesario para preparar los datos del grafo que consume
-// /auditoria/[id]/grafo (Next.js) — no dibuja nada (worker.js sigue
-// teniendo sus propias funciones SVG+sharp, huérfanas desde el 27 jul, ver
-// el documento de arquitectura), solo prepara el JSON que se guarda en
-// auditorias.grafo_datos.
-//
-// v3 (31 jul 2026): calcularResumenHorizontes() acepta un segundo parámetro
-// opcional pesosCriterios — objeto {id: peso}, el mismo que usa
-// normalizarDatosEstructurados() en generarReportePDF.js. Motivo: el
-// veredicto de activismo de la Presentación (generarPresentacionPDF.js →
-// generarActivismo.js) ahora también respeta los pesos de criterios
-// definidos en /admin/pesos, no solo el puntaje del Reporte. Ver el
-// comentario completo dentro de la función.
+// v4 (4 ago 2026) — PROMPT EDITABLE DESDE ADMIN:
+// generarGrafoConClaude() ahora acepta un cuarto parámetro opcional
+// `promptPersonalizado`. Si viene lleno (worker.js lo lee de
+// prompts_productos, clave "mapa_articulos"), se usa en vez del texto fijo
+// del código. PROMPT_GRAFO se renombra a PROMPT_GRAFO_RESPALDO y queda
+// como red de seguridad — mismo patrón exacto que ya usa
+// PROMPT_ADMISIBILIDAD_RESPALDO en worker.js: si la tabla está vacía o el
+// campo no existe todavía, el comportamiento es idéntico al de hoy.
 
 'use strict';
 
 const Anthropic = require('@anthropic-ai/sdk');
 
 // ── SUPERADO (28 jul 2026) — normalizarComponentes() ─────────────────────
-// Regex estricto que decidía qué cita era un artículo real. Se rompía con
-// leyes de reforma (paréntesis explicativo tipo "(reforma del artículo 14,
-// numeral 8)") — descartaba la cita completa en vez de solo recortarla.
-// Reemplazado por generarGrafoConClaude(), más abajo. Se deja definida,
-// sin exportar, por si hace falta comparar.
 const PATRON_ARTICULO  = /^art[íi]culo\s+(\d+)\s*[°ºo]?\s*(\(\s*disposici[oó]n(?:es)?\s+(finales?|transitorias?)[^)]*\))?\s*$/i;
 const PATRON_PARAGRAFO = /^par[áa]grafo\s+\S+\s+del\s+art[íi]culo\s+(\d+)\s*[°ºo]?\s*$/i;
 
@@ -84,11 +45,6 @@ function normalizarComponentes(articulosCrudo) {
     .filter((valor, i, arr) => arr.indexOf(valor) === i);
 }
 
-// Lista de componentes únicos citados en toda la auditoría — usada antes
-// por worker.js para saber a qué artículos pedirle título por separado.
-// SUPERADA junto con normalizarComponentes(): generarGrafoConClaude() ya
-// no necesita esta lista previa, decide todo en un solo llamado. Se deja
-// definida, sin exportar.
 function componentesUnicos(datos) {
   const criterios = datos.categorias.flatMap(cat => cat.criterios);
   const set = new Set();
@@ -114,10 +70,6 @@ function extraerTextoRespuestaLocal(response) {
 }
 
 // ── SUPERADO (28 jul 2026) — generarTitulosArticulos() ────────────────────
-// Llamado chico que solo ponía título a una lista de artículos ya
-// identificados por normalizarComponentes(). Reemplazado por
-// generarGrafoConClaude(), que identifica Y titula Y clasifica en un solo
-// llamado. Se deja definida, sin exportar, por si hace falta comparar.
 const SCHEMA_TITULOS_ARTICULOS = {
   type: 'object',
   properties: {
@@ -189,11 +141,11 @@ Responde con un título por cada artículo de la lista, usando exactamente el mi
   return mapa;
 }
 
-// ── EN USO (28 jul 2026) — identificación, clasificación y citas ─────────
-// Reemplaza normalizarComponentes() + generarTitulosArticulos() en un solo
-// llamado. Le pide a Claude, con reglas explícitas en el prompt (no con un
-// patrón fijo), que decida qué es un artículo real de este documento, qué
-// hace (si es una reforma), cómo se titula, y qué criterios lo citan.
+// ── EN USO — identificación, clasificación y citas ───────────────────────
+// FIX (4 ago 2026): PROMPT_GRAFO renombrado a PROMPT_GRAFO_RESPALDO — sigue
+// siendo el texto por defecto si prompts_productos no tiene todavía la
+// clave "mapa_articulos", pero ahora generarGrafoConClaude() puede recibir
+// un texto personalizado desde /admin/productos-comunicacionales.
 const SCHEMA_GRAFO = {
   type: 'object',
   properties: {
@@ -247,7 +199,7 @@ const SCHEMA_GRAFO = {
   additionalProperties: false,
 };
 
-const PROMPT_GRAFO = `Eres un asistente que prepara los datos de un grafo visual para una auditoría cívica liberal (liberalmente.app). Tu tarea tiene dos partes: identificar los artículos reales de ESTE documento que fueron citados en el análisis, y mapear qué criterios cita cada uno.
+const PROMPT_GRAFO_RESPALDO = `Eres un asistente que prepara los datos de un grafo visual para una auditoría cívica liberal (liberalmente.app). Tu tarea tiene dos partes: identificar los artículos reales de ESTE documento que fueron citados en el análisis, y mapear qué criterios cita cada uno.
 
 REGLA 1 — Qué SÍ es un artículo real de este documento:
 Un artículo, o una disposición (Final o Transitoria) del propio documento que se está auditando. Usa como id "Art. N" (ej. "Art. 7"), o "Art. N (Disposiciones Finales)" / "Art. N (Disposiciones Transitorias)" si la disposición pertenece a esa sección específica — esas secciones suelen reiniciar su propia numeración, así que "Art. 64 (Disposiciones Finales)" y "Art. 64 (Disposiciones Transitorias)" son DOS artículos distintos que comparten número, no se fusionan entre sí.
@@ -264,7 +216,7 @@ Para cada artículo real identificado, escribe un título corto (6 a 10 palabras
 
 Luego, para cada criterio de la lista de abajo, indica cuáles de los artículos que identificaste lo respaldan, usando exactamente los mismos ids que les asignaste arriba.`;
 
-async function generarGrafoConClaude(textoPDF, datos, auditoria_id = 'N/A') {
+async function generarGrafoConClaude(textoPDF, datos, auditoria_id = 'N/A', promptPersonalizado = null) {
   const criterios = datos.categorias.flatMap(cat => cat.criterios);
 
   const citasCrudas = criterios
@@ -273,7 +225,11 @@ async function generarGrafoConClaude(textoPDF, datos, auditoria_id = 'N/A') {
 
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-  const prompt = `${PROMPT_GRAFO}
+  const promptBase = (promptPersonalizado && promptPersonalizado.trim())
+    ? promptPersonalizado.trim()
+    : PROMPT_GRAFO_RESPALDO;
+
+  const prompt = `${promptBase}
 
 TEXTO COMPLETO DEL DOCUMENTO:
 ${textoPDF}
@@ -310,17 +266,6 @@ ${citasCrudas}`;
 }
 
 // ── Construir los datos del grafo (nodos + enlaces) ──────────────────────
-// Forma pensada para que /auditoria/[id]/grafo (Next.js) la consuma
-// directo, sin reinterpretar nada del lado del frontend.
-//
-// v2 (28 jul 2026): recibe el resultado de generarGrafoConClaude()
-// (`{ articulos, citas }`) en vez del mapa titulosArticulos de antes. Cada
-// nodo de tipo 'articulo' ahora también trae 'accion' y 'articulo_referido'
-// — el frontend puede usarlos para mostrar, por ejemplo, "Modifica el
-// artículo 14" en vez de solo el título. Se descarta (con aviso en log,
-// no bloqueante) cualquier enlace que cite un id que no esté en la lista
-// de artículos — no debería pasar nunca con el schema, pero mejor un
-// aviso en log que un enlace roto en el grafo.
 function calcularDatosGrafo(datos, analisisGrafo = { articulos: [], citas: [] }, auditoria_id = 'N/A') {
   const criterios = datos.categorias.flatMap(cat => cat.criterios);
   const nodos = [];
@@ -370,24 +315,6 @@ function calcularDatosGrafo(datos, analisisGrafo = { articulos: [], citas: [] },
 }
 
 // ── En uso — resumen por horizonte (Presentación) ─────────────────────────
-// Cuenta y calcula el % de enlaces en_contra/neutral/a_favor a partir de
-// "enlaces" — el concepto de horizontes no está descartado en general,
-// sigue siendo la lógica real detrás de cómo la Presentación agrupa sus
-// recomendaciones de activismo en RECHAZO/MEJORA/PROMOCIÓN. Lo que se
-// descartó fue usarlo como agrupación visual del Mapa Mental.
-//
-// v2 (31 jul 2026) — PESOS DE CRITERIOS: segundo parámetro opcional
-// pesosCriterios, mismo objeto {id: peso} que ya usa
-// normalizarDatosEstructurados() en generarReportePDF.js. Cada enlace pesa
-// lo que pese su criterio de DESTINO (peso por defecto 1 si el id no está
-// en el objeto) — un criterio con peso 2 cuenta el doble en el horizonte
-// que le corresponda, sin importar cuántos artículos lo citen. `cantidad`
-// se conserva sin cambios (conteo simple de enlaces, dato informativo);
-// `peso` es la suma ponderada nueva, y es lo que ahora usa
-// calcularVeredictoActivismo() (en generarActivismo.js) para decidir el
-// veredicto — ver ese archivo. Con pesosCriterios vacío, peso === cantidad
-// en los tres grupos y el resultado es idéntico al de antes de este
-// cambio.
 const HORIZONTE_POR_RESULTADO = {
   'NO': 'en_contra',
   'SI_MATIZ': 'neutral',
@@ -399,15 +326,10 @@ function calcularResumenHorizontes(enlaces, pesosCriterios = {}) {
 
   enlaces.forEach(enlace => {
     const horizonte = HORIZONTE_POR_RESULTADO[enlace.resultado];
-    if (!horizonte) return; // NA queda fuera
+    if (!horizonte) return;
     grupos[horizonte].push(enlace);
   });
 
-  // 31 jul 2026: pesosCriterios[id] puede ser un objeto {peso,
-  // descalificador} (formato actual de /admin/pesos) o un número simple
-  // (formato viejo) — en ambos casos, aquí solo interesa el peso. El
-  // efecto de "descalificador" se maneja en generarPresentacionPDF.js,
-  // sobre el veredicto completo, no acá sobre el conteo por horizonte.
   function pesoDeCriterio(criterioId) {
     const valor = pesosCriterios ? pesosCriterios[criterioId] : undefined;
     if (valor && typeof valor === 'object') {

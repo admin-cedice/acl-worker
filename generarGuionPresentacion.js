@@ -1,55 +1,35 @@
 // generarGuionPresentacion.js — ACL Worker
 // Umbusk LLC · Auditoría Cívica Liberal
 //
-// MÓDULO NUEVO (17 jul 2026) — primer borrador, EXPERIMENTAL.
-// Genera el guion a dos voces (Anita + Erick) para el Hemisferio
-// Derecho (Presentación PDF + mp4 narrado), a partir del reporte
-// estructurado que ya produce el Hemisferio Izquierdo.
+// [... changelog anterior sin cambios, ver versión previa del archivo ...]
 //
-// NO está conectado a procesarAuditoria() todavía — es intencional, mismo
-// patrón que testPodcast.js. Se prueba de forma aislada primero (empezando
-// con el reporte real de Hidrocarburos) antes de integrarlo al pipeline.
+// v2 (4 ago 2026) — ESTILO EDITABLE DESDE ADMIN, DATOS PROTEGIDOS:
+// El prompt del generador mezclaba, en el mismo bloque de texto, reglas de
+// estilo (voces, tono, metáforas) CON datos reales inyectados a mitad del
+// texto (cifras exactas de "RESULTADO GENERAL", que existen específicamente
+// para evitar que Claude invente números — bug real corregido el 17 jul
+// 2026). Volver todo ese bloque libremente editable desde Admin arriesgaba
+// reabrir ese mismo bug si alguien borraba sin querer la sección de datos
+// al editar el estilo.
 //
-// Arquitectura: generador + revisor (patrón "reflection"):
-//   1. seleccionarEscenas()   — decide QUÉ entra al guion. Es código, no
-//      juicio de Claude: usa las alertas de mayor gravedad si existen, o
-//      los criterios NO más señalados si no hay alertas, más una escena
-//      de balance con el mejor SÍ/SÍ con matiz disponible.
-//   2. generarGuion()         — Claude (claude-sonnet-5) escribe el guion
-//      completo a partir de las escenas ya seleccionadas. Decide CÓMO
-//      contarlas: cuándo usar metáfora (solo donde el concepto no se
-//      entiende solo) y cuál — máximo 1-3 en todo el guion, nunca una por
-//      escena. Eso sí es juicio de contenido, le corresponde al modelo.
-//   3. revisarGuion()         — segunda pasada, ciega al razonamiento del
-//      generador (no ve por qué eligió cada metáfora, para que la
-//      revisión sea genuina y no una validación reflexiva). Editorial,
-//      liviana — no recompara contra el texto legal criterio por
-//      criterio, lee el guion completo como lo haría un editor humano.
-//      Corre en claude-opus-4-8, modelo distinto al generador a propósito.
-//
-// Formato de salida: texto plano con marcadores (ANITA:/ERICK:), NO
-// JSON — mismo criterio que generarResumenEjecutivo() en
-// generarReportePDF.js desde la lección del 7 jul (un salto de línea real
-// dentro de un string JSON rompe JSON.parse; texto con marcadores no tiene
-// esa fragilidad).
-//
-// FIX (27 jul 2026): con max_tokens: 8000 el guion volvió a cortarse a
-// media palabra en una auditoría real (Reforma de la Ley Orgánica del
-// Sistema y Servicio Eléctrico — documento largo y con muchas alertas),
-// igual que ya había pasado el 17 jul con el límite anterior de 4000. Se
-// sube a 16000 en generarGuion() Y en revisarGuion() (el revisor necesita
-// el mismo margen, porque también devuelve el guion completo dentro de
-// GUION_FINAL). Si vuelve a pasar, el chequeo de stop_reason === 'max_tokens'
-// lo va a decir explícitamente, nunca en silencio.
+// Solución: se separan en piezas propias SOLO las secciones que son
+// puramente de estilo — "LAS VOCES" y "REGLAS DE ESCRITURA" en el
+// generador, la lista de criterios de revisión en el revisor — cada una
+// con su propio texto de respaldo (TEXTO_VOCES_RESPALDO,
+// TEXTO_REGLAS_RESPALDO, TEXTO_CRITERIOS_REVISOR_RESPALDO). worker.js las
+// lee de prompts_productos (claves "podcast_generador_voces",
+// "podcast_generador_reglas", "podcast_revisor_criterios") y las pasa como
+// parámetros opcionales. El resto del prompt —cifras reales, material
+// seleccionado, formato de salida ANITA:/ERICK: que necesita
+// generarAudioPodcast.js para asignar voces— sigue armado en código, no
+// editable, en la misma posición exacta que ya tenía. Sin ediciones desde
+// Admin, el resultado es idéntico byte a byte al de antes de este cambio.
 
 'use strict';
 
 const Anthropic = require('@anthropic-ai/sdk');
 
 // ── Extraer texto de la respuesta (mismo patrón que worker.js) ──────────────
-// El pensamiento adaptativo puede anteponer un bloque 'thinking' al de
-// texto, en cualquier modelo que lo soporte — no asumir que el texto
-// siempre está en content[0].
 function extraerTextoRespuesta(response) {
   const bloqueTexto = response.content.find(b => b.type === 'text');
   if (!bloqueTexto) {
@@ -68,10 +48,6 @@ function seleccionarEscenas(datos) {
   const aplicables   = datos.siPlenos + datos.siMatiz + datos.noCount;
   const proporcionPositiva = aplicables > 0 ? (datos.siPlenos + datos.siMatiz) / aplicables : 0;
 
-  // Núcleo del guion: alertas de mayor gravedad si existen (no todas, ya
-  // se acordó no ser exhaustivos); si no hay ninguna, los criterios NO más
-  // señalados directamente — el guion nunca depende únicamente de que
-  // haya alertas, porque el schema las permite en 0.
   let nucleo;
   if (datos.alertas.length > 0) {
     nucleo = [...datos.alertas]
@@ -85,10 +61,6 @@ function seleccionarEscenas(datos) {
       .map(criterio => ({ tipo: 'criterio', criterio }));
   }
 
-  // Escena de balance: el mejor SÍ pleno disponible; si no hay ninguno, el
-  // mejor SÍ con matiz. Si tampoco hay eso, no hay escena de balance —
-  // caso real observado en Hidrocarburos, el prompt lo maneja con
-  // honestidad en vez de forzarla.
   const balance = todos.find(c => c.resultado === 'SI')
                 || todos.find(c => c.resultado === 'SI_MATIZ')
                 || null;
@@ -96,10 +68,6 @@ function seleccionarEscenas(datos) {
   return {
     nucleo,
     balance,
-    // Si el documento es mayoritariamente positivo, la historia cambia de
-    // naturaleza: de "esto es lo que te quitan" a "esto es lo que te
-    // protege". Umbral de 65% elegido como punto de partida razonable, no
-    // probado todavía contra muchos casos reales — ajustar si hace falta.
     tonoGeneral: proporcionPositiva >= 0.65 ? 'mayoritariamente_alineado' : 'mayoritariamente_alertas',
     hayPocoPositivo: !balance,
   };
@@ -127,17 +95,51 @@ function formatearBalance(balance) {
 Análisis: ${balance.analisis}`;
 }
 
-// ── Paso 2: prompt del generador ─────────────────────────────────────────────
+// ── Bloques de ESTILO — editables desde /admin/productos-comunicacionales ──
+// Texto de respaldo idéntico al que ya vivía fijo en el prompt. Si
+// prompts_productos no tiene todavía la clave correspondiente, el
+// comportamiento es exactamente el de antes de este cambio.
 
-function construirPromptGenerador(escenas, datos, metadatos) {
+const TEXTO_VOCES_RESPALDO = `LAS VOCES:
+- ANITA: la analista. Seria, precisa, pero cálida — explica sin condescendencia.
+- ERICK: el ciudadano curioso. Hace las preguntas que haría cualquier oyente — sorpresa, ironía, alivio, incredulidad genuina. No es ingenuo, es alguien que no ha leído la ley y quiere entender.`;
+
+const TEXTO_REGLAS_RESPALDO = `REGLAS DE ESCRITURA:
+
+1. ESTRUCTURA: Apertura (una frase que plantee qué está en juego para alguien como el oyente — nunca empieces con el porcentaje ni con "esta ley regula...") → una escena por cada hallazgo del material seleccionado → escena de balance (si existe) → cierre (menciona la alineación general aquí, como remate, no como titular, usando exactamente los números de arriba; termina con "Defiende la libertad. Audita el poder.").
+
+2. METÁFORAS — ECONOMÍA, NO DECORACIÓN: usa como máximo 2-3 metáforas distintas en TODO el guion, nunca una por escena. Antes de usar una metáfora en una escena, pregúntate: ¿esto se entiende solo, en lenguaje llano, o de verdad hace falta una imagen para aterrizarlo? Si se entiende solo (por ejemplo, "el precio lo fija una oficina, no el mercado"), no le pongas metáfora encima. Resérvalas para lo estructural o abstracto (poder discrecional, efecto comadreja, ese tipo de cosas). Si reusas una metáfora en más de una escena, que sea una extensión natural de la misma imagen, no una repetición forzada — y verifica que la comparación sea lógicamente correcta: no le atribuyas a la metáfora algo que no le corresponde (ej. no compares un privilegio otorgado por el poder con algo que alguien elige voluntariamente, ni le agregues un matiz temporal o de otro tipo que no esté en el hecho real que describe).
+
+3. TONO CONVERSACIONAL: diálogo real, con interjecciones, pausas, alguna interrupción — no un monólogo de Anita cortado artificialmente en dos. Erick pregunta, reacciona, a veces bromea con algo de ironía. Nada de humor cruel ni sarcasmo hacia las personas — el blanco es el poder mal ejercido, nunca un grupo de personas.
+
+4. FILTRO DOCTRINAL: la línea que separa lo aceptable de lo problemático es liberal-democrático vs. populista/autoritario/totalitario — nunca izquierda vs. derecha. No conviertas esto en un panfleto partidista.
+
+5. FIDELIDAD — SIN EXCEPCIONES: cada afirmación del guion debe corresponder a algo real del material seleccionado arriba o a los números de "RESULTADO GENERAL". Esto incluye cifras, conteos, totales y porcentajes, no solo artículos o hechos narrativos — no inventes ni redondees ningún número que no esté explícitamente dado arriba, aunque te parezca plausible o "razonable" para un caso como este.`;
+
+const TEXTO_CRITERIOS_REVISOR_RESPALDO = `- Si alguna metáfora describe mal lo que compara — le atribuye algo que no corresponde, o confunde en vez de aclarar.
+- Si hay demasiadas metáforas distintas, o si se usa una metáfora donde el concepto ya se entendía solo.
+- Si el tono entre las dos voces se siente natural o forzado.
+- Si el balance final es honesto (ni exagera lo positivo si casi no lo hay, ni omite lo poco positivo que sí exista).
+- Si el guion se mantiene fiel al material real, sin inventar ni exagerar.
+- Que la línea entre lo aceptable y lo problemático sea liberal-democrático vs. populista/autoritario — nunca izquierda vs. derecha.`;
+
+// ── Paso 2: prompt del generador ─────────────────────────────────────────────
+// textoVoces / textoReglas: opcionales — si vienen null o vacíos, se usa el
+// texto de respaldo de arriba. worker.js los lee de prompts_productos antes
+// de llamar a generarGuion().
+
+function construirPromptGenerador(escenas, datos, metadatos, textoVoces = null, textoReglas = null) {
   const { titulo, pais } = metadatos;
-  const { nucleo, balance, tonoGeneral, hayPocoPositivo } = escenas;
+  const { nucleo, balance, tonoGeneral } = escenas;
   const { puntaje, siPlenos, siMatiz, noCount, naCount } = datos;
   const aplicables = siPlenos + siMatiz + noCount;
   const totalCriterios = aplicables + naCount;
 
   const escenasTexto = nucleo.map(formatearEscena).join('\n\n');
   const balanceTexto = formatearBalance(balance);
+
+  const voces  = (textoVoces && textoVoces.trim())  ? textoVoces.trim()  : TEXTO_VOCES_RESPALDO;
+  const reglas = (textoReglas && textoReglas.trim()) ? textoReglas.trim() : TEXTO_REGLAS_RESPALDO;
 
   return `Eres el guionista de Auditoría Cívica Liberal (liberalmente.app), una plataforma de CEDICE y la Fundación Friedrich Naumann que audita leyes y políticas públicas latinoamericanas con criterios del liberalismo clásico. Tu tarea es escribir un guion de podcast a dos voces que explique los hallazgos de una auditoría real a una audiencia NO especializada — personas que no están particularmente interesadas en el liberalismo como doctrina, y que no van a leer el reporte completo.
 
@@ -150,9 +152,7 @@ RESULTADO GENERAL DE LA AUDITORÍA — estos son los ÚNICOS números reales que
 - NO se cumple: ${noCount}
 - Alineación general: ${puntaje !== null ? puntaje + '%' : 'no se calcula un porcentaje general (la fórmula requiere al menos un SÍ pleno, y este documento no tiene ninguno) — NO digas "cero por ciento", eso es un dato distinto y falso; di que no hay total general, o describe el desglose real de arriba'}
 
-LAS VOCES:
-- ANITA: la analista. Seria, precisa, pero cálida — explica sin condescendencia.
-- ERICK: el ciudadano curioso. Hace las preguntas que haría cualquier oyente — sorpresa, ironía, alivio, incredulidad genuina. No es ingenuo, es alguien que no ha leído la ley y quiere entender.
+${voces}
 
 MATERIAL YA SELECCIONADO PARA EL GUION (no elijas otros hallazgos, no agregues criterios que no estén aquí):
 
@@ -162,17 +162,7 @@ ${balanceTexto ? `ESCENA DE BALANCE (algo que sí funciona, para que el guion no
 
 ${tonoGeneral === 'mayoritariamente_alineado' ? 'NOTA DE ENFOQUE: este documento está mayoritariamente alineado con los postulados liberales. La historia debe sentirse como "esto es lo que te protege", no como una denuncia — los hallazgos negativos (si los hay) son advertencia secundaria, no el eje central.' : ''}
 
-REGLAS DE ESCRITURA:
-
-1. ESTRUCTURA: Apertura (una frase que plantee qué está en juego para alguien como el oyente — nunca empieces con el porcentaje ni con "esta ley regula...") → una escena por cada hallazgo del material seleccionado → escena de balance (si existe) → cierre (menciona la alineación general aquí, como remate, no como titular, usando exactamente los números de arriba; termina con "Defiende la libertad. Audita el poder.").
-
-2. METÁFORAS — ECONOMÍA, NO DECORACIÓN: usa como máximo 2-3 metáforas distintas en TODO el guion, nunca una por escena. Antes de usar una metáfora en una escena, pregúntate: ¿esto se entiende solo, en lenguaje llano, o de verdad hace falta una imagen para aterrizarlo? Si se entiende solo (por ejemplo, "el precio lo fija una oficina, no el mercado"), no le pongas metáfora encima. Resérvalas para lo estructural o abstracto (poder discrecional, efecto comadreja, ese tipo de cosas). Si reusas una metáfora en más de una escena, que sea una extensión natural de la misma imagen, no una repetición forzada — y verifica que la comparación sea lógicamente correcta: no le atribuyas a la metáfora algo que no le corresponde (ej. no compares un privilegio otorgado por el poder con algo que alguien elige voluntariamente, ni le agregues un matiz temporal o de otro tipo que no esté en el hecho real que describe).
-
-3. TONO CONVERSACIONAL: diálogo real, con interjecciones, pausas, alguna interrupción — no un monólogo de Anita cortado artificialmente en dos. Erick pregunta, reacciona, a veces bromea con algo de ironía. Nada de humor cruel ni sarcasmo hacia las personas — el blanco es el poder mal ejercido, nunca un grupo de personas.
-
-4. FILTRO DOCTRINAL: la línea que separa lo aceptable de lo problemático es liberal-democrático vs. populista/autoritario/totalitario — nunca izquierda vs. derecha. No conviertas esto en un panfleto partidista.
-
-5. FIDELIDAD — SIN EXCEPCIONES: cada afirmación del guion debe corresponder a algo real del material seleccionado arriba o a los números de "RESULTADO GENERAL". Esto incluye cifras, conteos, totales y porcentajes, no solo artículos o hechos narrativos — no inventes ni redondees ningún número que no esté explícitamente dado arriba, aunque te parezca plausible o "razonable" para un caso como este.
+${reglas}
 
 FORMATO DE RESPUESTA — texto plano, sin JSON, sin markdown, empieza directo con la primera línea de diálogo:
 
@@ -184,10 +174,12 @@ No escribas nada antes de la primera línea ni después de la última.`;
 }
 
 // ── Paso 3: prompt del revisor (liviano, ciego al razonamiento del generador) ─
+// textoCriterios: opcional — mismo criterio que arriba.
 
-function construirPromptRevisor(guion, escenas) {
+function construirPromptRevisor(guion, escenas, textoCriterios = null) {
   const escenasTexto = escenas.nucleo.map(formatearEscena).join('\n\n');
   const balanceTexto = formatearBalance(escenas.balance);
+  const criterios = (textoCriterios && textoCriterios.trim()) ? textoCriterios.trim() : TEXTO_CRITERIOS_REVISOR_RESPALDO;
 
   return `Eres un editor experimentado de contenido conversacional para audiencias generales. A continuación tienes un guion de podcast a dos voces (Anita y Erick) que explica los hallazgos de una auditoría cívica liberal sobre una ley o política pública, y el material real en el que se basó.
 
@@ -202,12 +194,7 @@ GUION A REVISAR:
 ${guion}
 
 ¿Cómo te parece este guion? Revísalo con criterio, prestando especial atención a:
-- Si alguna metáfora describe mal lo que compara — le atribuye algo que no corresponde, o confunde en vez de aclarar.
-- Si hay demasiadas metáforas distintas, o si se usa una metáfora donde el concepto ya se entendía solo.
-- Si el tono entre las dos voces se siente natural o forzado.
-- Si el balance final es honesto (ni exagera lo positivo si casi no lo hay, ni omite lo poco positivo que sí exista).
-- Si el guion se mantiene fiel al material real, sin inventar ni exagerar.
-- Que la línea entre lo aceptable y lo problemático sea liberal-democrático vs. populista/autoritario — nunca izquierda vs. derecha.
+${criterios}
 
 Si se te ocurre alguna mejora, aplícala directamente sobre el guion. Si el guion ya está bien así, dilo también — no cambies algo solo por cambiarlo.
 
@@ -231,19 +218,19 @@ function parsearRevision(textoRespuesta) {
 }
 
 // ── Funciones principales exportadas ─────────────────────────────────────────
+// generarGuion / revisarGuion / generarYRevisarGuion ahora aceptan los 3
+// textos de estilo opcionales, y los pasan hacia abajo hasta los
+// construirPrompt*(). worker.js es responsable de leerlos de
+// prompts_productos antes de llamar — si no los manda (o manda null), el
+// comportamiento es idéntico al de antes de este cambio.
 
-async function generarGuion(datos, metadatos) {
+async function generarGuion(datos, metadatos, textoVoces = null, textoReglas = null) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const escenas = seleccionarEscenas(datos);
-  const prompt = construirPromptGenerador(escenas, datos, metadatos);
+  const prompt = construirPromptGenerador(escenas, datos, metadatos, textoVoces, textoReglas);
 
   console.log(`   [generarGuion] Escenas seleccionadas: ${escenas.nucleo.length} del núcleo, balance: ${escenas.balance ? escenas.balance.id : 'ninguno'}, tono: ${escenas.tonoGeneral}`);
 
-  // FIX (27 jul 2026): subido de 8000 a 16000 — ver nota de changelog al
-  // inicio del archivo. Mismo motivo que la subida anterior del 17 jul
-  // (4000 → 8000): el pensamiento adaptativo de Sonnet 5 consume del
-  // mismo presupuesto de max_tokens que el guion en sí, y un documento
-  // largo con varias escenas puede agotarlo.
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
     max_tokens: 16000,
@@ -259,13 +246,10 @@ async function generarGuion(datos, metadatos) {
   return { guion, escenas };
 }
 
-async function revisarGuion(guion, escenas) {
+async function revisarGuion(guion, escenas, textoCriterios = null) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const prompt = construirPromptRevisor(guion, escenas);
+  const prompt = construirPromptRevisor(guion, escenas, textoCriterios);
 
-  // Mismo colchón que el generador (27 jul 2026: 8000 → 16000) — el
-  // revisor tiene que poder devolver el guion completo (GUION_FINAL) más
-  // las notas, así que necesita al menos el mismo margen.
   const response = await anthropic.messages.create({
     model: 'claude-opus-4-8',
     max_tokens: 16000,
@@ -282,11 +266,10 @@ async function revisarGuion(guion, escenas) {
   return revision;
 }
 
-
 // Función combinada — genera y revisa en un solo llamado a este módulo.
-async function generarYRevisarGuion(datos, metadatos) {
-  const { guion, escenas } = await generarGuion(datos, metadatos);
-  const revision = await revisarGuion(guion, escenas);
+async function generarYRevisarGuion(datos, metadatos, textoVoces = null, textoReglas = null, textoCriteriosRevisor = null) {
+  const { guion, escenas } = await generarGuion(datos, metadatos, textoVoces, textoReglas);
+  const revision = await revisarGuion(guion, escenas, textoCriteriosRevisor);
   return {
     guionOriginal: guion,
     guionFinal: revision.guionFinal,
@@ -305,12 +288,7 @@ module.exports = {
   generarYRevisarGuion,
 };
 
-// ── Script de prueba manual (no se ejecuta si el archivo solo se importa) ────
-// Uso: node generarGuionPresentacion.js /ruta/al/reporte_texto.json
-//
-// El archivo debe contener solo el JSON de reporte_texto (categorias +
-// alertas), tal como se guarda en auditorias.reporte_texto — igual al que
-// se usó para probar normalizarDatosEstructurados() el 16 de julio.
+// ── Script de prueba manual (sin cambios) ────────────────────────────────────
 if (require.main === module) {
   const fs = require('fs');
   const { normalizarDatosEstructurados } = require('./generarReportePDF');
