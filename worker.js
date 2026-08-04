@@ -1,4 +1,4 @@
-// worker.js — ACL Worker v3.27
+// worker.js — ACL Worker v3.28
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
 //
@@ -1289,7 +1289,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.27', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.28', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1388,6 +1388,14 @@ app.get('/regenerar-presentacion', async (req, res) => {
     // vacía, generarPresentacionPDF.js cae solo al respaldo DUMMY.
     const contactosApoyo = await obtenerContactosApoyoActivos();
 
+    // 4 ago 2026: estilo de las ideas de activismo — si alguna clave todavía
+    // no existe en prompts_productos, generarActivismo.js usa su propio
+    // respaldo para esa pieza específica.
+    const [estiloPersonaActivismo, reglasGeneracionActivismo] = await Promise.all([
+      obtenerPromptProducto('presentacion_activismo_estilo'),
+      obtenerPromptProducto('presentacion_activismo_reglas'),
+    ]);
+
     console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
     await generarPresentacionPDF(
       datosReporte,
@@ -1400,7 +1408,8 @@ app.get('/regenerar-presentacion', async (req, res) => {
       auditoria_id,
       grafo_datos,
       pesosCriterios,
-      contactosApoyo
+      contactosApoyo,
+      { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo }
     );
 
     const driveAuth = autenticarDrive();
@@ -1838,11 +1847,16 @@ app.get('/prompts/:id', async (req, res) => {
 // Libertad — editarlos no debe crear una "versión" nueva del Test ni
 // exigir "Activar". Guardado inmediato, Superadmin-only.
 //
-// DESDE v3.27 (4 ago 2026): ya están conectados al pipeline real —
-// obtenerPromptProducto() (ver "Funciones auxiliares" más abajo) los lee
-// en PASO 6.5, PASO 6.6, /regenerar-grafo y /regenerar-podcast.
-// generarPresentacionPDF.js todavía no consume ningún prompt de esta
-// tabla (no lo necesita — es puro formateo, sin llamados a Claude propios).
+// DESDE v3.27 (4 ago 2026): Mapa Mental y Podcast conectados al pipeline
+// real — obtenerPromptProducto() (ver "Funciones auxiliares" más abajo)
+// los lee en PASO 6.5, PASO 6.6, /regenerar-grafo y /regenerar-podcast.
+// DESDE v3.28 (4 ago 2026): Presentación también conectada — claves
+// "presentacion_activismo_estilo" y "presentacion_activismo_reglas",
+// leídas en PASO 6.7 y /regenerar-presentacion, pasadas a
+// generarPresentacionPDF.js → generarActivismo.js. El menú de tácticas y
+// las reglas de seguridad de contenido (no violencia, no testimonios
+// fabricados) NO son editables desde aquí a propósito — quedan siempre
+// fijas en generarActivismo.js, ver el changelog de ese archivo (v5).
 
 app.get('/prompts-productos', async (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
@@ -2792,6 +2806,13 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	      // DUMMY de generarActivismo.js (con aviso en el log y en la
 	      // propia lámina).
 	      const contactosApoyo = await obtenerContactosApoyoActivos();
+	      // 4 ago 2026: estilo de las ideas de activismo — si alguna clave
+	      // todavía no existe en prompts_productos, generarActivismo.js usa
+	      // su propio respaldo para esa pieza específica.
+	      const [estiloPersonaActivismo, reglasGeneracionActivismo] = await Promise.all([
+	        obtenerPromptProducto('presentacion_activismo_estilo'),
+	        obtenerPromptProducto('presentacion_activismo_reglas'),
+	      ]);
 	      await generarPresentacionPDF(
 	        datosReporte,
 	        {
@@ -2803,7 +2824,8 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	        auditoria_id,
 	        grafoDatosCompartido,
 	        pesosCriterios,
-	        contactosApoyo
+	        contactosApoyo,
+	        { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo }
 	      );
 	      linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 	      console.log(`✅ [${auditoria_id}] Presentación generada y subida`);
@@ -3181,7 +3203,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.27 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.28 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
   console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
