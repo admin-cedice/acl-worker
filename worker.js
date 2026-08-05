@@ -1,6 +1,16 @@
-// worker.js — ACL Worker v3.28
+// worker.js — ACL Worker v3.29
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.29 (5 ago 2026) — CONTENIDO EDITABLE DEL SITIO: nuevos endpoints
+// /contenido-sitio/:clave (público, sin secreto — lo llama directo la
+// landing y la Biblioteca desde el navegador del visitante), /contenido-sitio
+// (admin, lista completa) y /contenido-sitio/guardar (Superadmin). Guardan
+// el texto visible de app/page.js (claves "landing_es"/"landing_en") y
+// app/biblioteca/page.js (clave "biblioteca") en la tabla nueva
+// contenido_sitio — mismo patrón defensivo de siempre: si una clave no
+// existe todavía, la página pública sigue mostrando el texto por defecto
+// que ya vive en el código, sin romperse.
 //
 // v3.27 (4 ago 2026) — CONEXIÓN COMPLETA DE prompts_productos Y
 // contactos_apoyo AL PIPELINE REAL. Hasta esta versión, los endpoints de
@@ -1289,7 +1299,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.28', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.29', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2028,6 +2038,75 @@ app.post('/contactos-apoyo/eliminar', async (req, res) => {
     res.json({ ok: true });
   } catch (error) {
     console.error('❌ Error eliminando contacto de apoyo:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── Contenido editable del sitio (landing pública + Biblioteca) ──────────
+// Nuevo 5 ago 2026. Guarda el texto visible de app/page.js y
+// app/biblioteca/page.js por clave ('landing_es', 'landing_en',
+// 'biblioteca'). Las páginas públicas hacen merge en el cliente: valor
+// guardado > texto por defecto que ya vive en el código — mismo patrón
+// defensivo de siempre (prompt_admisibilidad, PROMPT_GRAFO_RESPALDO, etc.).
+//
+// GET /contenido-sitio/:clave es PÚBLICO (sin secreto) a propósito: lo
+// llaman directo la landing y la Biblioteca desde el navegador del
+// visitante, que nunca tiene sesión de admin. Nunca lanza 401/500 al
+// visitante — si algo falla, responde contenido vacío ({}) y la página
+// sigue mostrando sus textos por defecto sin que el visitante note nada.
+app.get('/contenido-sitio/:clave', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT contenido FROM contenido_sitio WHERE clave = $1`,
+      [req.params.clave]
+    );
+    res.json({ contenido: rows[0]?.contenido || {} });
+  } catch (error) {
+    console.error('❌ Error leyendo contenido del sitio (no bloqueante):', error.message);
+    res.json({ contenido: {} });
+  }
+});
+
+// GET /contenido-sitio — lista completa para /admin/contenido-sitio (con
+// worker-secret, no público — a diferencia del anterior, esta sí necesita
+// devolver TODAS las claves de una vez para prellenar el formulario).
+app.get('/contenido-sitio', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const { rows } = await db.query(
+      `SELECT clave, contenido, actualizado_en FROM contenido_sitio ORDER BY clave ASC`
+    );
+    res.json({ ok: true, secciones: rows });
+  } catch (error) {
+    console.error('❌ Error listando contenido del sitio:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /contenido-sitio/guardar — Superadmin. Guarda el objeto completo de
+// una clave de una sola vez (todos los campos de esa página/idioma juntos)
+// — no campo por campo, para no multiplicar guardados innecesarios.
+app.post('/contenido-sitio/guardar', async (req, res) => {
+  const payload = exigirSuperadmin(req, res);
+  if (!payload) return;
+  const { clave, contenido } = req.body || {};
+  if (!clave?.trim() || !contenido || typeof contenido !== 'object' || Array.isArray(contenido)) {
+    return res.status(400).json({ error: 'Faltan campos requeridos (clave, contenido como objeto)' });
+  }
+  try {
+    await db.query(
+      `INSERT INTO contenido_sitio (clave, contenido, actualizado_en, actualizado_por)
+       VALUES ($1, $2, NOW(), $3)
+       ON CONFLICT (clave) DO UPDATE
+       SET contenido = EXCLUDED.contenido, actualizado_en = NOW(), actualizado_por = EXCLUDED.actualizado_por`,
+      [clave.trim(), JSON.stringify(contenido), payload.id || null]
+    );
+    console.log(`   [contenido-sitio/guardar] ✅ "${clave}" guardado por ${payload.email || payload.id}`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error guardando contenido del sitio:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -3203,7 +3282,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.28 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.29 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
   console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
