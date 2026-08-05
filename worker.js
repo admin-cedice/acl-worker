@@ -1,6 +1,15 @@
-// worker.js — ACL Worker v3.29
+// worker.js — ACL Worker v3.30
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.30 (5 ago 2026) — FUSIÓN RESUMEN + MÉTRICAS: /metricas/resumen ahora
+// también devuelve ciudadanosActivos y auditoriasUltimoMes — las dos
+// consultas que antes vivían solo en app/admin/page.js (Resumen), leídas
+// ahí directo de Postgres desde un Server Component con su propio Pool.
+// Con esto, "Indicadores de uso" (antes Resumen + Métricas, dos pantallas
+// separadas con dos fuentes de datos distintas) puede fusionarse en una
+// sola pantalla con una sola fuente — este endpoint. app/admin/page.js
+// deja de necesitar conexión propia a la base de datos.
 //
 // v3.29 (5 ago 2026) — CONTENIDO EDITABLE DEL SITIO: nuevos endpoints
 // /contenido-sitio/:clave (público, sin secreto — lo llama directo la
@@ -1299,7 +1308,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.29', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.30', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2267,14 +2276,25 @@ app.get('/metricas/resumen', async (req, res) => {
   try {
     const [
       totalCiudadanosRows,
+      ciudadanosActivosRows,
       totalAuditoriasRows,
+      auditoriasUltimoMesRows,
       porEstado,
       porMotivoRechazo,
       porPais,
       porTipoClick,
     ] = await Promise.all([
       consultaSegura(`SELECT COUNT(*)::int AS total FROM ciudadanos`, [], [{ total: 0 }]),
+      // 5 ago 2026: "ciudadanos activos" (activo = true) y "auditorías del
+      // último mes" — las dos consultas que antes vivían solo en
+      // app/admin/page.js (Resumen), leídas ahí directo de Postgres desde
+      // un Server Component. Se traen acá para que /admin (ahora
+      // "Indicadores de uso") pueda fusionar Resumen y Métricas en una
+      // sola pantalla, con una sola fuente de datos — ya no hace falta que
+      // ese archivo tenga su propio Pool de conexión aparte.
+      consultaSegura(`SELECT COUNT(*)::int AS total FROM ciudadanos WHERE activo = true`, [], [{ total: 0 }]),
       consultaSegura(`SELECT COUNT(*)::int AS total FROM auditorias`, [], [{ total: 0 }]),
+      consultaSegura(`SELECT COUNT(*)::int AS total FROM auditorias WHERE creada_en >= now() - interval '30 days'`, [], [{ total: 0 }]),
       consultaSegura(
         `SELECT estado, COUNT(*)::int AS total FROM auditorias GROUP BY estado ORDER BY total DESC`,
         [], []
@@ -2298,7 +2318,9 @@ app.get('/metricas/resumen', async (req, res) => {
     res.json({
       ok: true,
       totalCiudadanos: totalCiudadanosRows[0]?.total || 0,
+      ciudadanosActivos: ciudadanosActivosRows[0]?.total || 0,
       totalAuditorias: totalAuditoriasRows[0]?.total || 0,
+      auditoriasUltimoMes: auditoriasUltimoMesRows[0]?.total || 0,
       porEstado,
       porMotivoRechazo,
       porPais,
@@ -3282,7 +3304,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.29 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.30 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
   console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
