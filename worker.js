@@ -1,6 +1,14 @@
-// worker.js — ACL Worker v3.30
+// worker.js — ACL Worker v3.31
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.31 (5 ago 2026) — PRIMER INDICADOR DE PLATAFORMA: nuevo endpoint
+// GET /metricas/plataforma, que consulta UptimeRobot (GET /v3/monitors,
+// Bearer token) y devuelve el estado real de los 2 monitores existentes
+// (liberalmente.app y el worker de Railway, ruta /health). Requiere
+// UPTIMEROBOT_API_KEY en Railway (llave tipo Read-Only). Separado de
+// /metricas/resumen a propósito — ver el comentario completo junto al
+// endpoint. Todavía no incluye % de uptime histórico (ver esa misma nota).
 //
 // v3.30 (5 ago 2026) — FUSIÓN RESUMEN + MÉTRICAS: /metricas/resumen ahora
 // también devuelve ciudadanosActivos y auditoriasUltimoMes — las dos
@@ -1308,7 +1316,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.30', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.31', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2332,6 +2340,68 @@ app.get('/metricas/resumen', async (req, res) => {
   }
 });
 
+// ── Plataforma — UptimeRobot (5 ago 2026) ──────────────────────────────────
+// Primer indicador de "salud de plataforma", separado a propósito de
+// /metricas/resumen: esta consulta depende de un servicio externo
+// (UptimeRobot), y no quiero que una respuesta lenta o caída de un
+// tercero bloquee las métricas propias, que no dependen de nadie más.
+//
+// Requiere la variable de entorno UPTIMEROBOT_API_KEY en Railway — la
+// llave de tipo "Read-Only" (Integrations & API en el panel de
+// UptimeRobot), nunca la llave principal de cuenta (esa también puede
+// crear/editar/borrar monitores, más permiso del que este endpoint
+// necesita). Si la variable no está configurada, el endpoint responde
+// { configurado: false } en vez de fallar — la pantalla de Admin lo
+// muestra como "todavía sin configurar", no como un error.
+//
+// IMPORTANTE — confirmado con una llamada real (5 ago 2026): la respuesta
+// de GET /v3/monitors NO trae un porcentaje de uptime histórico
+// (lastDayUptimes.histogram viene vacío sin parámetros adicionales que
+// todavía no se han investigado) — solo trae el estado actual (status) y
+// cuánto tiempo lleva en ese estado (currentStateDuration, en segundos).
+// Por ahora solo se expone eso; agregar el % de uptime queda pendiente
+// para cuando se confirme el parámetro correcto de la API.
+async function obtenerEstadoPlataforma() {
+  const apiKey = process.env.UPTIMEROBOT_API_KEY;
+  if (!apiKey) return null;
+
+  const res = await fetch('https://api.uptimerobot.com/v3/monitors', {
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+  });
+  if (!res.ok) {
+    const texto = await res.text().catch(() => '');
+    throw new Error(`UptimeRobot API respondió ${res.status}: ${texto.slice(0, 200)}`);
+  }
+  const data = await res.json();
+
+  return (data.data || []).map(m => ({
+    id: m.id,
+    nombre: m.friendlyName,
+    url: m.url,
+    estado: m.status, // "UP" confirmado; otros valores (ej. "DOWN") sin
+                       // confirmar todavía con un caso real — el frontend
+                       // tiene un respaldo genérico para cualquier valor
+                       // que no reconozca, nunca lo oculta.
+    segundosEnEsteEstado: m.currentStateDuration,
+  }));
+}
+
+app.get('/metricas/plataforma', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  try {
+    const monitores = await obtenerEstadoPlataforma();
+    if (monitores === null) {
+      return res.json({ ok: true, configurado: false, monitores: [] });
+    }
+    res.json({ ok: true, configurado: true, monitores });
+  } catch (error) {
+    console.error('❌ Error en /metricas/plataforma:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const { Readable } = require('stream');
 
 const DRIVE_CARPETA_FUENTES_ID = process.env.DRIVE_CARPETA_FUENTES_ID;
@@ -3304,7 +3374,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.30 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.31 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
   console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
