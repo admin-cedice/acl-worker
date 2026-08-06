@@ -1,6 +1,17 @@
-// worker.js — ACL Worker v3.31
+// worker.js — ACL Worker v3.32
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.32 (5 ago 2026) — 4 MÉTRICAS NUEVAS en /metricas/resumen: tiempo
+// promedio del pipeline (admitida→completada), productos incompletos
+// (auditorías 'completada' a las que les falta podcast/presentación/mapa
+// — los 3 pasos "no bloqueantes" del pipeline pueden fallar en silencio,
+// esto los hace visibles por primera vez), puntaje promedio + distribución
+// por rangos, y ciudadanos con al menos una auditoría (distinto de
+// "ciudadanos activos" = cuenta habilitada, esto mide activación real).
+// Todas son consultas directas a Postgres, ninguna depende de un
+// servicio externo — por eso van dentro del mismo endpoint, no separadas
+// como /metricas/plataforma.
 //
 // v3.31 (5 ago 2026) — PRIMER INDICADOR DE PLATAFORMA: nuevo endpoint
 // GET /metricas/plataforma, que consulta UptimeRobot (GET /v3/monitors,
@@ -1316,7 +1327,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.31', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.32', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2285,12 +2296,17 @@ app.get('/metricas/resumen', async (req, res) => {
     const [
       totalCiudadanosRows,
       ciudadanosActivosRows,
+      ciudadanosConAuditoriasRows,
       totalAuditoriasRows,
       auditoriasUltimoMesRows,
       porEstado,
       porMotivoRechazo,
       porPais,
       porTipoClick,
+      tiempoPipelineRows,
+      productosIncompletos,
+      puntajesRows,
+      sinPuntajeRows,
     ] = await Promise.all([
       consultaSegura(`SELECT COUNT(*)::int AS total FROM ciudadanos`, [], [{ total: 0 }]),
       // 5 ago 2026: "ciudadanos activos" (activo = true) y "auditorías del
@@ -2301,6 +2317,12 @@ app.get('/metricas/resumen', async (req, res) => {
       // sola pantalla, con una sola fuente de datos — ya no hace falta que
       // ese archivo tenga su propio Pool de conexión aparte.
       consultaSegura(`SELECT COUNT(*)::int AS total FROM ciudadanos WHERE activo = true`, [], [{ total: 0 }]),
+      // 5 ago 2026: distinto de "ciudadanos activos" (activo=true, un flag
+      // de cuenta) — esto cuenta cuántos ciudadanos tienen AL MENOS una
+      // fila en auditorias, sin importar el estado. Mide activación real
+      // (¿de los que se registran, cuántos llegan a subir algo?), no solo
+      // si la cuenta está habilitada.
+      consultaSegura(`SELECT COUNT(DISTINCT ciudadano_id)::int AS total FROM auditorias WHERE ciudadano_id IS NOT NULL`, [], [{ total: 0 }]),
       consultaSegura(`SELECT COUNT(*)::int AS total FROM auditorias`, [], [{ total: 0 }]),
       consultaSegura(`SELECT COUNT(*)::int AS total FROM auditorias WHERE creada_en >= now() - interval '30 days'`, [], [{ total: 0 }]),
       consultaSegura(
@@ -2321,18 +2343,89 @@ app.get('/metricas/resumen', async (req, res) => {
         `SELECT tipo_link, COUNT(*)::int AS total FROM clicks_auditoria GROUP BY tipo_link ORDER BY total DESC`,
         [], []
       ),
+      // 5 ago 2026: cuánto tarda el pipeline de verdad, de "admitida" a
+      // "completada" — incluye el paso de espera fija de rate limit
+      // (90s) más los llamados reales a Claude/CloudConvert/ElevenLabs.
+      // Si esto empieza a crecer con el tiempo, es una señal temprana de
+      // algo lento antes de que se vuelva un problema visible.
+      consultaSegura(
+        `SELECT
+           ROUND(AVG(EXTRACT(EPOCH FROM (completada_en - admitida_en))))::int AS promedio,
+           ROUND(MIN(EXTRACT(EPOCH FROM (completada_en - admitida_en))))::int AS minimo,
+           ROUND(MAX(EXTRACT(EPOCH FROM (completada_en - admitida_en))))::int AS maximo
+         FROM auditorias
+         WHERE estado = 'completada' AND admitida_en IS NOT NULL AND completada_en IS NOT NULL`,
+        [], [{ promedio: null, minimo: null, maximo: null }]
+      ),
+      // 5 ago 2026: PASO 6.6/6.7/6.5 (Podcast/Presentación/Mapa) son "no
+      // bloqueantes" a propósito — si cualquiera falla, la auditoría
+      // igual queda 'completada'. Hasta hoy no había ningún lugar donde
+      // ver eso de un vistazo. Trae hasta 20 de las más recientes, con
+      // cuál pieza específica falta cada una.
+      consultaSegura(
+        `SELECT id, titulo_documento,
+           (link_podcast IS NULL) AS falta_podcast,
+           (link_presentacion IS NULL) AS falta_presentacion,
+           (grafo_datos IS NULL) AS falta_mapa
+         FROM auditorias
+         WHERE estado = 'completada'
+           AND (link_podcast IS NULL OR link_presentacion IS NULL OR grafo_datos IS NULL)
+         ORDER BY completada_en DESC
+         LIMIT 20`,
+        [], []
+      ),
+      // 5 ago 2026: puntajes crudos (no el promedio calculado en SQL) —
+      // se bucketiza en JS más abajo, más simple que un CASE WHEN
+      // anidado para armar la distribución 0-20/20-40/.../80-100.
+      consultaSegura(
+        `SELECT puntaje FROM auditorias WHERE estado = 'completada' AND puntaje IS NOT NULL`,
+        [], []
+      ),
+      // Recordatorio: puntaje puede ser NULL en una 'completada' — pasa
+      // cuando el documento no tiene ningún SÍ pleno (la fórmula requiere
+      // al menos uno), no es un error. Se cuenta aparte para no mezclarlo
+      // con el promedio.
+      consultaSegura(
+        `SELECT COUNT(*)::int AS total FROM auditorias WHERE estado = 'completada' AND puntaje IS NULL`,
+        [], [{ total: 0 }]
+      ),
     ]);
+
+    const RANGOS_PUNTAJE = [
+      { rango: '0–20%', min: 0, max: 20 },
+      { rango: '20–40%', min: 20, max: 40 },
+      { rango: '40–60%', min: 40, max: 60 },
+      { rango: '60–80%', min: 60, max: 80 },
+      { rango: '80–100%', min: 80, max: 101 },
+    ];
+    const distribucionPuntaje = RANGOS_PUNTAJE.map(r => ({
+      rango: r.rango,
+      total: puntajesRows.filter(row => row.puntaje >= r.min && row.puntaje < r.max).length,
+    }));
+    const puntajePromedio = puntajesRows.length > 0
+      ? Math.round(puntajesRows.reduce((acc, row) => acc + row.puntaje, 0) / puntajesRows.length)
+      : null;
 
     res.json({
       ok: true,
       totalCiudadanos: totalCiudadanosRows[0]?.total || 0,
       ciudadanosActivos: ciudadanosActivosRows[0]?.total || 0,
+      ciudadanosConAuditorias: ciudadanosConAuditoriasRows[0]?.total || 0,
       totalAuditorias: totalAuditoriasRows[0]?.total || 0,
       auditoriasUltimoMes: auditoriasUltimoMesRows[0]?.total || 0,
       porEstado,
       porMotivoRechazo,
       porPais,
       porTipoClick,
+      pipelineTiempo: {
+        promedioSegundos: tiempoPipelineRows[0]?.promedio ?? null,
+        minimoSegundos: tiempoPipelineRows[0]?.minimo ?? null,
+        maximoSegundos: tiempoPipelineRows[0]?.maximo ?? null,
+      },
+      productosIncompletos,
+      puntajePromedio,
+      puntajeSinCalcular: sinPuntajeRows[0]?.total || 0,
+      distribucionPuntaje,
     });
   } catch (error) {
     console.error('❌ Error en /metricas/resumen:', error.message);
@@ -3374,7 +3467,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.31 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.32 corriendo en puerto ${PORT}`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
   console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
