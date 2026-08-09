@@ -95,6 +95,22 @@
 //      matemáticamente idéntico al de antes de este cambio — no hace
 //      falta que nadie edite nada en /admin/pesos para que el sistema
 //      siga funcionando exactamente igual que hoy.
+//
+// CAMBIOS v4.6 (9 ago 2026) — SE ELIMINAN LOS DESCALIFICADORES:
+//  46. Entre el 31 jul y hoy existió también un campo "Indispensable" por
+//      criterio (tarjeta roja: un NO ahí forzaba el puntaje a 0% sin
+//      importar el resto). Roberto y Moisés acordaron descartarlo junto
+//      con la definición final del Test (40 criterios/12 categorías): la
+//      calificación de una auditoría es, de aquí en adelante, siempre y
+//      únicamente el promedio ponderado de abajo — sin excepciones ni
+//      forzados. Quitados: leerPesoYDescalificador() (reemplazada por
+//      leerPeso(), sin el campo descalificador), las variables
+//      `descalificado`/`criteriosDescalificadores`, y su rama de log. Un
+//      criterio que haya quedado guardado en el formato enriquecido
+//      {peso, descalificador} de esa etapa intermedia sigue leyendo su
+//      peso con normalidad — el campo descalificador, si existe, ya no se
+//      lee ni se usa para nada. generarPresentacionPDF.js (v2.9) recibe el
+//      mismo tratamiento — ver su propio changelog.
 
 'use strict';
 
@@ -855,61 +871,44 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
   //   es matemáticamente idéntico al de antes cuando pesosCriterios está
   //   vacío. Los criterios NA no participan (ni sumaban, ni pesaban,
   //   antes tampoco).
-  // — 31 jul 2026 (v4.5) — FORMATO ENRIQUECIDO + DESCALIFICADORES:
-  //   pesosCriterios[id] ahora puede ser un objeto {peso, descalificador}
-  //   (lo que guarda /admin/pesos desde este cambio), o —por compatibilidad
-  //   con lo que ya hubiera quedado guardado antes— un número simple, que
-  //   se trata como {peso: numero, descalificador: false}. Un criterio
-  //   marcado "descalificador" (tarjeta roja) que resulte en NO fuerza el
-  //   puntaje del documento entero a 0, sin importar cómo haya quedado el
-  //   promedio ponderado del resto — igual que un jugador expulsado saca
-  //   a su equipo del partido sin importar el marcador. Se documenta en
-  //   `descalificado` y `criteriosDescalificadores` para que tanto el
-  //   Reporte como la Presentación puedan reflejarlo.
+  // — 9 ago 2026 (v4.6) — SE ELIMINAN LOS DESCALIFICADORES: entre el 31
+  //   jul y hoy existió también un campo "Indispensable" por criterio
+  //   (tarjeta roja: un NO ahí forzaba 0% sin importar el resto). Roberto
+  //   y Moisés acordaron descartarlo — la calificación de una auditoría
+  //   es, de aquí en adelante, siempre y únicamente el promedio ponderado
+  //   de abajo. pesosCriterios[id] puede seguir llegando en el formato
+  //   enriquecido {peso, descalificador} de esa etapa intermedia (dato ya
+  //   guardado en configuracion_doctrinal de auditorías anteriores) — se
+  //   sigue leyendo el número de peso con normalidad, el campo
+  //   descalificador simplemente ya no se lee ni se usa para nada.
   const PESO_POR_DEFECTO = 1;
-  function leerPesoYDescalificador(id) {
+  function leerPeso(id) {
     const valor = pesosCriterios ? pesosCriterios[id] : undefined;
     if (valor && typeof valor === 'object') {
       const numero = Number(valor.peso);
-      return {
-        peso: (valor.peso !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO,
-        descalificador: !!valor.descalificador,
-      };
+      return (valor.peso !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO;
     }
     const numero = Number(valor);
-    return {
-      peso: (valor !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO,
-      descalificador: false,
-    };
+    return (valor !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO;
   }
 
   let numeradorPonderado = 0;
   let denominadorPonderado = 0;
-  const criteriosDescalificadores = [];
   todos.forEach(c => {
     if (c.resultado === 'NA') return;
-    const { peso, descalificador } = leerPesoYDescalificador(c.id);
+    const peso = leerPeso(c.id);
     denominadorPonderado += peso;
-    if (c.resultado === 'SI')        numeradorPonderado += peso * 1;
+    if (c.resultado === 'SI')            numeradorPonderado += peso * 1;
     else if (c.resultado === 'SI_MATIZ') numeradorPonderado += peso * 0.5;
     // NO suma 0 al numerador, pero sí pesa en el denominador — igual que antes.
-    if (descalificador && c.resultado === 'NO') criteriosDescalificadores.push(c.id);
   });
 
-  const descalificado = criteriosDescalificadores.length > 0;
-
-  const puntajePonderado = (denominadorPonderado > 0 && siPlenos > 0)
+  const puntaje = (denominadorPonderado > 0 && siPlenos > 0)
     ? Math.round((numeradorPonderado / denominadorPonderado) * 100)
     : null;
-  const puntaje = descalificado ? 0 : puntajePonderado;
-
-  if (descalificado) {
-    console.warn(`   🟥 [${auditoria_id}] DESCALIFICADO — criterio(s) eliminatorio(s) en NO: ${criteriosDescalificadores.join(', ')}. Puntaje forzado a 0% sin importar el promedio ponderado (que hubiera sido ${puntajePonderado !== null ? puntajePonderado + '%' : 'sin total general'}).`);
-  }
 
   return {
     puntaje, siPlenos, siMatiz, noCount, naCount,
-    descalificado, criteriosDescalificadores,
     resumenEjecutivo: '', puntosClave: [],
     categorias,
     alertas: resultado.alertas || [],

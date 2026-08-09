@@ -2202,19 +2202,21 @@ app.get('/pesos', async (req, res) => {
     const { version, prompt_analisis, pesos_criterios } = configResult.rows[0];
     const pesosGuardados = pesos_criterios || {};
 
-    function leerPesoYDescalificador(valorGuardado) {
+    // 9 ago 2026 — SE ELIMINAN LOS DESCALIFICADORES: reemplaza a
+    // leerPesoYDescalificador(), que devolvía {peso, descalificador} para
+    // alimentar la casilla "Indispensable" en /admin/pesos. Esa casilla ya
+    // no existe (Roberto y Moisés acordaron descartarla junto con la
+    // definición final del Test), así que ahora solo hace falta el número
+    // de peso. Compatible con lo que ya hubiera quedado guardado en el
+    // formato enriquecido {peso, descalificador} — se ignora ese campo,
+    // no se borra de la base de datos.
+    function leerPeso(valorGuardado) {
       if (valorGuardado && typeof valorGuardado === 'object') {
         const numero = Number(valorGuardado.peso);
-        return {
-          peso: (valorGuardado.peso !== undefined && !Number.isNaN(numero)) ? numero : 1,
-          descalificador: !!valorGuardado.descalificador,
-        };
+        return (valorGuardado.peso !== undefined && !Number.isNaN(numero)) ? numero : 1;
       }
       const numero = Number(valorGuardado);
-      return {
-        peso: (valorGuardado !== undefined && !Number.isNaN(numero)) ? numero : 1,
-        descalificador: false,
-      };
+      return (valorGuardado !== undefined && !Number.isNaN(numero)) ? numero : 1;
     }
 
     let preguntaPorCriterio = {};
@@ -2228,20 +2230,19 @@ app.get('/pesos', async (req, res) => {
 
     const criterios = Object.entries(CRITERIO_A_CATEGORIA)
       .map(([id, categoria]) => {
-        const { peso, descalificador } = leerPesoYDescalificador(pesosGuardados[id]);
+        const peso = leerPeso(pesosGuardados[id]);
         return {
           id,
           categoria,
           categoriaNombre: CATEGORIAS_NOMBRES[categoria],
           pregunta: preguntaPorCriterio[id] || '(no se pudo extraer el texto de este criterio del Test de Libertad activo)',
           peso,
-          descalificador,
         };
       })
       .sort((a, b) => a.id.localeCompare(b.id));
 
     const aviso = errorExtraccion
-      ? `No se pudo leer el texto de las preguntas del Test de Libertad activo ahora mismo (${errorExtraccion}). Los pesos y descalificadores igual se pueden editar y guardar.`
+      ? `No se pudo leer el texto de las preguntas del Test de Libertad activo ahora mismo (${errorExtraccion}). Los pesos igual se pueden editar y guardar.`
       : null;
 
     res.json({ ok: true, criterios, fuente_test: { version }, aviso });
@@ -2877,7 +2878,7 @@ app.get('/manual/activo/pdf', async (req, res) => {
     const { version, archivo_pdf } = rows[0];
     if (!archivo_pdf) {
       return res.status(404).type('text/plain').send(
-        `La versión activa del Manual (${version}) no tiene un PDF asociado — probablemente se subió pegando texto, o antes de este cambio (1 ago 2026). Vuelve a subirla desde /admin/manual con el archivo PDF para que este botón funcione.`
+        `La versión activa del Manual (${version}) no tiene un PDF asociado — probablemente se subió pegando texto, o antes de este cambio (1 ago 2026). Vuelve a subirla desde /admin/manual una vez desplegado esto para que este botón funcione.`
       );
     }
 
@@ -3481,7 +3482,6 @@ app.listen(PORT, () => {
   console.log(`   Test de Libertad: GET /prompts/activo/pdf, mismo patrón`);
   console.log(`   /pesos: ids del mapa fijo del Test de Libertad, preguntas extraídas de prompt_analisis`);
   console.log(`   activo con Claude — nada de esto depende ya de ninguna auditoría en particular`);
-  console.log(`   Descalificadores ("Indispensable" en la UI): un NO ahí fuerza 0% / rechazo total`);
   console.log(`   analizarConClaude() usa Structured Outputs (output_config.format) desde el 16 jul 2026`);
   console.log(`   PASO 6.5 usa generarGrafoConClaude() desde el 28 jul 2026 — sin regex, identifica y`);
   console.log(`   clasifica artículos (incluye leyes de reforma) con instrucciones de prompt`);
@@ -3492,6 +3492,8 @@ app.listen(PORT, () => {
   console.log(`   Estados posibles: pendiente → admitida → completada | fallida (o rechazada por el filtro)`);
   console.log(`   Fuentes Doctrinales: campo 'categoria' activo en subir/completar-subida-media/lista-admin/editar`);
   console.log(`   Pesos de criterios: GET /pesos, POST /pesos/actualizar — conectados al Reporte Y a la Presentación`);
+  console.log(`   9 ago: eliminados los descalificadores ("Indispensable") — el puntaje es siempre el`);
+  console.log(`   promedio ponderado por pesos, sin forzados a 0%/rechazo total`);
   console.log(`   Funciones NotebookLM intactas sin usar (dispararNotebookLM, generarPresentacion viejo,`);
   console.log(`   generarMapaMental viejo) — por si hace falta reactivar o comparar\n`);
 });

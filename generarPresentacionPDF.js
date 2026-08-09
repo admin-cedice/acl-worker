@@ -13,6 +13,15 @@
 // —los datos DUMMY que ya existían— con una advertencia explícita en el
 // log, para que nunca se generen Presentaciones con datos de prueba sin
 // que quede rastro de que pasó.
+//
+// v2.9 (9 ago 2026) — SE ELIMINAN LOS DESCALIFICADORES: quitado el bloque
+// que forzaba `veredicto` a { modo: 'rechazo_total', alineacionPorcentaje: 0 }
+// cuando `datos.descalificado` venía en true (campo que ya no existe en el
+// objeto que devuelve generarReportePDF.js v4.6). El veredicto de esta
+// Presentación ahora sale siempre y únicamente de
+// calcularVeredictoActivismo(resumenHorizontes) — mismo criterio acordado
+// con Roberto y Moisés para el puntaje del Reporte. `veredicto` pasa de
+// `let` a `const`, ya que no vuelve a reasignarse en ningún punto.
 
 'use strict';
 
@@ -497,8 +506,10 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // generarIdeasActivismoTotal(). Si no llega (objeto vacío por defecto),
 // generarActivismo.js usa sus propios textos de respaldo — comportamiento
 // idéntico al de antes de este cambio.
+// v2.9 (9 ago 2026) — ver changelog arriba: ya no se lee `datos.descalificado`
+// en ningún punto de esta función.
 async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}, contactosApoyo = null, promptsActivismo = {}) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.7`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.9`);
 
   let enlaces;
   if (grafoDatos && Array.isArray(grafoDatos.enlaces)) {
@@ -510,12 +521,7 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
   }
 
   const resumenHorizontes = calcularResumenHorizontes(enlaces, pesosCriterios);
-  let veredicto = calcularVeredictoActivismo(resumenHorizontes);
-
-  if (datos.descalificado) {
-    console.warn(`   🟥 [${auditoria_id}] generarPresentacionPDF: documento DESCALIFICADO (criterio eliminatorio en NO: ${(datos.criteriosDescalificadores || []).join(', ')}) — veredicto forzado a rechazo_total.`);
-    veredicto = { modo: 'rechazo_total', alineacionPorcentaje: 0 };
-  }
+  const veredicto = calcularVeredictoActivismo(resumenHorizontes);
 
   const secciones = calcularSeccionesHorizonte(datos);
   const articulosPorCriterio = calcularArticulosPorCriterio(enlaces);
