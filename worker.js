@@ -384,15 +384,20 @@ function verificarJWTAdmin(token) {
   }
 }
 
-// Uso: if (!exigirSuperadmin(req, res)) return;
-function exigirSuperadmin(req, res) {
+// Verifica que la sesión tenga un JWT de admin válido y firmado — sin
+// exigir ningún rol específico todavía. Devuelve el payload decodificado
+// (con .rol adentro) si la sesión es válida, o null (ya habiendo mandado
+// la respuesta de error correspondiente) si no. exigirSuperadmin() y
+// exigirAdminValido() comparten esta misma verificación; solo difieren
+// en si además exigen el rol Superadmin.
+function verificarSesionAdmin(req, res) {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
     res.status(401).json({ error: 'No autorizado' });
     return null;
   }
 
   if (!process.env.ADMIN_JWT_SECRET) {
-    res.status(500).json({ error: 'El worker no tiene configurada la variable ADMIN_JWT_SECRET en Railway. Agrégala y vuelve a desplegar — sin ella, ninguna acción de Superadmin puede verificarse.' });
+    res.status(500).json({ error: 'El worker no tiene configurada la variable ADMIN_JWT_SECRET en Railway. Agrégala y vuelve a desplegar — sin ella, ninguna acción de administración puede verificarse.' });
     return null;
   }
   if (!req.headers['x-admin-token']) {
@@ -404,11 +409,29 @@ function exigirSuperadmin(req, res) {
     res.status(401).json({ error: 'La firma del token no coincide o expiró. Si acabas de configurar ADMIN_JWT_SECRET en Railway, confirma que sea EXACTAMENTE igual (sin espacios de más) a la que usa Netlify, y que el worker se haya vuelto a desplegar después de guardarla.' });
     return null;
   }
+  return payload;
+}
+
+// Uso: if (!exigirSuperadmin(req, res)) return;
+function exigirSuperadmin(req, res) {
+  const payload = verificarSesionAdmin(req, res);
+  if (!payload) return null;
   if (typeof payload.rol !== 'string' || payload.rol.toUpperCase() !== 'SUPERADMIN') {
     res.status(403).json({ error: 'Esta acción requiere el rol Superadmin.' });
     return null;
   }
   return payload;
+}
+
+// Uso: if (!exigirAdminValido(req, res)) return;
+// Cualquier admin con sesión válida — Superadmin o Editor — sin exigir un
+// rol específico. Nuevo 10 ago 2026, para /pesos/actualizar: el Ala
+// Doctrinal (rol Editor) necesita poder ajustar los pesos de criterios
+// directamente. Revierte a propósito la decisión del 2 de agosto que
+// dejaba Pesos como exclusivo de Superadmin — ver el registro de esa
+// fecha si hace falta el contexto completo.
+function exigirAdminValido(req, res) {
+  return verificarSesionAdmin(req, res);
 }
 
 // ── Utilidad: extraer el bloque de texto de una respuesta de Claude ─────────
@@ -2253,7 +2276,7 @@ app.get('/pesos', async (req, res) => {
 });
 
 app.post('/pesos/actualizar', async (req, res) => {
-  if (!exigirSuperadmin(req, res)) return;
+  if (!exigirAdminValido(req, res)) return;
   const { pesos } = req.body;
   if (!pesos || typeof pesos !== 'object') {
     return res.status(400).json({ error: 'Falta el campo "pesos" (objeto {id: peso})' });
