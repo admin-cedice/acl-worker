@@ -59,6 +59,26 @@
 // no la fuente de verdad. Se deja intacta, DUMMY, hasta que se decida si
 // vale la pena borrarla una vez la tabla esté sembrada de forma
 // confiable.
+//
+// v6 (10 ago 2026) — CASO HÍBRIDO, PRIMERA VERSIÓN REAL: la primera
+// auditoría real que cayó en la banda híbrida (20%-80%) expuso el hueco
+// documentado desde julio — la Presentación mostraba un texto de relleno
+// ("[PENDIENTE...]") en vez de una idea real, criterio por criterio.
+// Decisión de Moisés (10 ago 2026): en vez de cubrir los ~24 criterios
+// aplicables típicos de un documento híbrido (demasiado, la Presentación
+// "no debe ser exhaustiva — son solo ideas para impulsar el activismo"),
+// se genera UNA idea real por cada una de las 7 categorías doctrinales
+// (de las 12) con más criterios — dentro de cada una, el criterio de
+// mayor peso entre los que aplican a este documento. El "dato de
+// gravedad/severidad" que faltaba en julio para hacer esta selección ya
+// existe: es el peso de /admin/pesos, agregado esta semana para el
+// tamaño de esferas del Mapa Mental — la misma pieza sirve para las dos
+// cosas. Nuevo: seleccionarCriteriosHibridos() (puro, sin Claude) y
+// generarIdeaActivismoCriterio() (un llamado a Claude por criterio
+// seleccionado, mismo menú de tácticas y mismas reglas de seguridad
+// protegidas que generarIdeasActivismoTotal() — nunca editables). Ver el
+// changelog completo del lado de generarPresentacionPDF.js (v3.0) para
+// cómo se conecta esto a las láminas reales.
 
 'use strict';
 
@@ -170,13 +190,39 @@ const SCHEMA_IDEAS_ACTIVISMO_TOTAL = {
   additionalProperties: false,
 };
 
+// ── Ideas de activismo — caso híbrido, UNA idea por criterio (10 ago 2026) ──
+// Mismas 3 propiedades que el caso total, pero para un solo criterio a la
+// vez — no envueltas en un arreglo, porque cada llamado genera una sola
+// idea (ver generarIdeaActivismoCriterio()).
+const SCHEMA_IDEA_ACTIVISMO_UNICA = {
+  type: 'object',
+  properties: {
+    titulo: {
+      type: 'string',
+      description: 'Nombre corto de la acción, 4 a 8 palabras (ej. "Campaña de etiquetado en redes").',
+    },
+    descripcion: {
+      type: 'string',
+      description: '1 a 3 oraciones concretas y accionables, específicas a este criterio y a este documento.',
+    },
+    categoria: {
+      type: 'string',
+      enum: CATEGORIAS_ACTIVISMO.map(c => c.slug),
+      description: 'La categoría del menú de tácticas de activismo (ver MENÚ DE TÁCTICAS en el prompt) a la que pertenece la acción principal de esta idea.',
+    },
+  },
+  required: ['titulo', 'descripcion', 'categoria'],
+  additionalProperties: false,
+};
+
 // ── Bloques de ESTILO — editables desde /admin/productos-comunicacionales ──
 // Texto de respaldo idéntico al que ya vivía fijo en el prompt. A propósito
 // NO se exponen aquí: el menú de tácticas (MENU_TACTICAS_ACTIVISMO, acoplado
 // al enum del schema vía CATEGORIAS_ACTIVISMO) ni las dos reglas de
 // seguridad de contenido (no violencia, no testimonios fabricados) — esas
-// se quedan siempre fijas en construirPromptIdeasActivismo(), sin
-// excepción, sin importar qué se guarde en prompts_productos.
+// se quedan siempre fijas en construirPromptIdeasActivismo() y
+// construirPromptIdeaActivismoCriterio(), sin excepción, sin importar qué
+// se guarde en prompts_productos.
 const TEXTO_PERSONA_ACTIVISMO_RESPALDO = `Eres un asistente de activismo cívico no violento para liberalmente.app, una plataforma de auditoría ciudadana de leyes y políticas públicas desde una perspectiva liberal.`;
 
 const TEXTO_REGLAS_ACTIVISMO_RESPALDO = `Basa cada idea en una o más tácticas concretas del menú de arriba, adaptadas específicamente a este documento (referenciando su tema, artículos o país cuando ayude a que no suene genérica) — no un consejo que serviría igual para cualquier ley. Usa categorías variadas entre las ideas (evita repetir la misma categoría más de una vez salvo que el contexto realmente lo amerite) — cada categoría tiene su propia ilustración, y la variedad hace la presentación más rica visualmente.`;
@@ -240,6 +286,98 @@ async function generarIdeasActivismoTotal(datos, metadatos, veredicto, auditoria
   return datosRespuesta.ideas;
 }
 
+// ── Caso híbrido — selección de criterios (10 ago 2026) ──────────────────
+// Pura, sin llamar a Claude. Decisión de Moisés: la Presentación de un
+// documento híbrido no debe ser exhaustiva (cubrir los ~24 criterios
+// aplicables típicos sería demasiado) — son solo ideas puntuales para
+// impulsar el activismo. Selecciona hasta 7 criterios: uno por cada una
+// de las 7 categorías doctrinales (de las 12 totales) con más criterios,
+// y dentro de cada una, el de mayor peso entre los que aplican a este
+// documento (resultado !== 'NA'). Una categoría sin ningún criterio
+// aplicable en este documento en particular se omite sin más — nunca se
+// fuerza una selección artificial.
+function pesoDeCriterioActivismo(criterioId, pesosCriterios) {
+  const valor = pesosCriterios ? pesosCriterios[criterioId] : undefined;
+  if (valor && typeof valor === 'object') {
+    const numero = Number(valor.peso);
+    return (valor.peso !== undefined && !Number.isNaN(numero)) ? numero : 1;
+  }
+  const numero = Number(valor);
+  return (valor !== undefined && !Number.isNaN(numero)) ? numero : 1;
+}
+
+function seleccionarCriteriosHibridos(datos, pesosCriterios = {}) {
+  const categoriasOrdenadas = [...datos.categorias]
+    .sort((a, b) => b.criterios.length - a.criterios.length)
+    .slice(0, 7);
+
+  const seleccion = [];
+  categoriasOrdenadas.forEach(cat => {
+    const aplicables = cat.criterios.filter(c => c.resultado !== 'NA');
+    if (aplicables.length === 0) return;
+    const elegido = aplicables.reduce(
+      (mayor, c) => pesoDeCriterioActivismo(c.id, pesosCriterios) > pesoDeCriterioActivismo(mayor.id, pesosCriterios) ? c : mayor,
+      aplicables[0]
+    );
+    seleccion.push({ criterio: elegido, categoriaDoctrinal: { num: cat.num, nombre: cat.nombre } });
+  });
+  return seleccion;
+}
+
+// ── Caso híbrido — generación, UN llamado a Claude por criterio ──────────
+// Mismo menú de tácticas y mismas reglas de seguridad de contenido que
+// generarIdeasActivismoTotal() — nunca editables desde Admin, siempre
+// fijas en código. `tipo` es 'rechazo' | 'mejora' | 'promocion', según el
+// resultado real del criterio (NO / SI_MATIZ / SI) — lo decide el
+// llamador (generarPresentacionPDF.js), que ya tiene ese mapa.
+function construirPromptIdeaActivismoCriterio(criterio, categoriaDoctrinal, metadatos, tipo, estiloPersona = null, reglasGeneracion = null) {
+  const persona = (estiloPersona && estiloPersona.trim()) ? estiloPersona.trim() : TEXTO_PERSONA_ACTIVISMO_RESPALDO;
+  const reglas  = (reglasGeneracion && reglasGeneracion.trim()) ? reglasGeneracion.trim() : TEXTO_REGLAS_ACTIVISMO_RESPALDO;
+  const accionPorTipo = { rechazo: 'rechazar y frenar', mejora: 'exigir que se corrija o aclare', promocion: 'promover y defender' };
+
+  return `${persona}
+
+Este documento obtuvo un resultado mixto en la auditoría — no amerita ni rechazo total ni apoyo total, sino acciones puntuales, criterio por criterio. Te toca generar UNA sola idea de activismo, enfocada exclusivamente en el siguiente criterio.
+
+DOCUMENTO: ${metadatos.titulo}${metadatos.pais ? ` (${metadatos.pais})` : ''}
+
+CRITERIO (Categoría ${categoriaDoctrinal.num} — ${categoriaDoctrinal.nombre}):
+${criterio.id} [${criterio.resultado}]: ${criterio.pregunta}
+Análisis: ${criterio.analisis}
+
+MENÚ DE TÁCTICAS DE ACTIVISMO (catálogo curado, en la tradición de Gene Sharp adaptada al contexto actual — elige de aquí, no inventes tácticas fuera de este menú):
+${MENU_TACTICAS_ACTIVISMO}
+
+Genera UNA idea concreta de activismo cívico no violento para ${accionPorTipo[tipo]} lo que encontró este criterio específico. ${reglas}
+
+Nunca sugieras violencia, daño a personas o propiedad, ni acciones ilegales. Nunca sugieras fabricar testimonios, relatos personales o citas atribuidas a personas que no sean reales y presentarlos como si lo fueran — el contenido debe ser siempre veraz y transparente sobre su origen, aunque se use IA para producirlo (videos explicativos, infografías o resúmenes son apropiados; testimonios inventados o "compuestos" presentados como reales no lo son).`;
+}
+
+async function generarIdeaActivismoCriterio(criterio, categoriaDoctrinal, metadatos, tipo, auditoria_id = 'N/A', estiloPersona = null, reglasGeneracion = null) {
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const prompt = construirPromptIdeaActivismoCriterio(criterio, categoriaDoctrinal, metadatos, tipo, estiloPersona, reglasGeneracion);
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-5',
+    max_tokens: 1000,
+    messages: [{ role: 'user', content: prompt }],
+    output_config: {
+      format: { type: 'json_schema', schema: SCHEMA_IDEA_ACTIVISMO_UNICA },
+    },
+  });
+
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error(`generarIdeaActivismoCriterio [${auditoria_id}] (${criterio.id}): respuesta cortada por max_tokens (1000) — subir el límite.`);
+  }
+  if (response.stop_reason === 'refusal') {
+    throw new Error(`generarIdeaActivismoCriterio [${auditoria_id}] (${criterio.id}): Claude rehusó generar la idea (stop_reason: refusal).`);
+  }
+
+  const texto = extraerTextoRespuesta(response);
+  const idea = JSON.parse(texto);
+  return { criterioId: criterio.id, resultado: criterio.resultado, idea };
+}
+
 // ── Lámina de contacto — RESPALDO, ya no es la fuente principal ─────────
 // Ver v4 en el changelog: la lista real vive en la tabla contactos_apoyo
 // (worker.js), leída por obtenerContactosApoyoActivos() y pasada como
@@ -270,5 +408,7 @@ module.exports = {
   calcularVeredictoActivismo,
   construirPromptIdeasActivismo,
   generarIdeasActivismoTotal,
+  seleccionarCriteriosHibridos,
+  generarIdeaActivismoCriterio,
   obtenerContactosApoyo,
 };

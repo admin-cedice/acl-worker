@@ -27,7 +27,7 @@
 
 const fs = require('fs');
 const { calcularDatosGrafo, calcularResumenHorizontes, etiquetaCortaComponente } = require('./generarDatosGrafo');
-const { calcularVeredictoActivismo, generarIdeasActivismoTotal, obtenerContactosApoyo } = require('./generarActivismo');
+const { calcularVeredictoActivismo, generarIdeasActivismoTotal, seleccionarCriteriosHibridos, generarIdeaActivismoCriterio, obtenerContactosApoyo } = require('./generarActivismo');
 
 function esc(str) {
   if (!str) return '';
@@ -87,11 +87,6 @@ function partirEnBloques(lista, tam) {
   const bloques = [];
   for (let i = 0; i < lista.length; i += tam) bloques.push(lista.slice(i, i + tam));
   return bloques;
-}
-
-function textoPlaceholderCriterio(tipo) {
-  const etiquetas = { rechazo: 'rechazo', mejora: 'mejora', promocion: 'promoción' };
-  return `[PENDIENTE — recomendación de ${etiquetas[tipo]} para este criterio, generada con Claude]`;
 }
 
 function generarTituloRecomendacionGeneral(veredicto) {
@@ -288,39 +283,41 @@ function generarLaminasVeredictoTotalHTML(veredicto, ideas) {
 }
 
 const TIPO_ACTIVISMO_POR_HORIZONTE = { en_contra: 'rechazo', neutral: 'mejora', a_favor: 'promocion' };
-const NOMBRE_ACTIVISMO_POR_HORIZONTE = { en_contra: 'RECHAZO', neutral: 'MEJORA', a_favor: 'PROMOCIÓN' };
 
-function generarLaminaActivismoHorizonteHTML(h, criterios, articulosPorCriterio) {
-  const tipo = TIPO_ACTIVISMO_POR_HORIZONTE[h.key];
-  const items = criterios.map(c => {
-    const articulos = articulosPorCriterio[c.id] || [];
-    return `
-    <div class="activismo-item">
-      <div class="activismo-item-etiquetas">
-        <div class="activismo-item-id">${esc(c.id)}</div>
-        <div class="activismo-item-articulos">${esc(articulos.length ? articulos.join(', ') : '—')}</div>
-      </div>
-      <div class="activismo-item-recomendacion">${esc(textoPlaceholderCriterio(tipo))}</div>
-    </div>`;
-  }).join('');
+// v6.0 (10 ago 2026) — CASO HÍBRIDO CON IDEAS REALES: reemplaza a
+// generarLaminaActivismoHorizonteHTML() (listaba TODOS los criterios
+// aplicables de cada horizonte, con un texto de relleno en vez de una
+// idea real — el hueco documentado desde el 22 de julio). Ahora recibe
+// directamente la lista de ideas ya generadas por criterio (ver
+// seleccionarCriteriosHibridos() y generarIdeaActivismoCriterio() en
+// generarActivismo.js) y reutiliza generarLaminaIdeaHTML() — la misma
+// lámina de una idea por página, con ilustración, que ya usa el caso
+// total — coloreando cada una según el horizonte real de su propio
+// criterio (rojo=rechazo, dorado=mejora, verde=promoción), no un solo
+// color fijo para toda la Presentación como en el caso total. Orden:
+// rechazo primero, mejora, promoción al final — mismo criterio de
+// urgencia que ya usa el resto de la Presentación.
+const COLOR_POR_HORIZONTE = { en_contra: '#C41230', neutral: '#B8860B', a_favor: '#2E7D32' };
+const ORDEN_HORIZONTE = { en_contra: 0, neutral: 1, a_favor: 2 };
 
-  return `
-<div class="lamina-activismo-horizonte">
-  <div class="activismo-header" style="border-color:${h.color}">
-    <span class="activismo-titulo" style="color:${h.color}">${NOMBRE_ACTIVISMO_POR_HORIZONTE[h.key]}</span>
-  </div>
-  ${items}
-</div>`;
+function generarLaminasHibridoHTML(ideasConCriterio) {
+  const lista = ideasConCriterio || [];
+  const ordenadas = [...lista].sort((a, b) => {
+    const ha = AREA_POR_RESULTADO[a.resultado], hb = AREA_POR_RESULTADO[b.resultado];
+    return (ORDEN_HORIZONTE[ha] ?? 9) - (ORDEN_HORIZONTE[hb] ?? 9);
+  });
+  return ordenadas.map((item, i) => {
+    const horizonte = AREA_POR_RESULTADO[item.resultado];
+    const color = COLOR_POR_HORIZONTE[horizonte] || '#8A8478';
+    return generarLaminaIdeaHTML(item.idea, i + 1, ordenadas.length, color);
+  }).join('\n');
 }
 
-function generarSeccionActivismoHTML(veredicto, secciones, articulosPorCriterio, ideasActivismoTotal) {
+function generarSeccionActivismoHTML(veredicto, ideasActivismoTotal, ideasActivismoHibrido) {
   if (veredicto.modo !== 'hibrido') {
     return generarLaminasVeredictoTotalHTML(veredicto, ideasActivismoTotal);
   }
-  return HORIZONTES
-    .filter(h => secciones[h.key].length > 0)
-    .map(h => generarLaminaActivismoHorizonteHTML(h, secciones[h.key], articulosPorCriterio))
-    .join('\n');
+  return generarLaminasHibridoHTML(ideasActivismoHibrido);
 }
 
 // ── Lámina de contacto ────────────────────────────────────────────────
@@ -359,10 +356,10 @@ function generarLaminaContactoHTML(contactos, esDummy) {
 
 function generarHTML(datos, metadatos, contexto) {
   const { titulo = 'Documento auditado', pais = '', generadoEl = '' } = metadatos;
-  const { veredicto, secciones, articulosPorCriterio, ideasActivismoTotal, contactosApoyo, contactosSonDummy } = contexto;
+  const { veredicto, ideasActivismoTotal, ideasActivismoHibrido, contactosApoyo, contactosSonDummy } = contexto;
 
   const portadaHTML   = generarPortadaHTML(titulo, pais, generadoEl, veredicto);
-  const activismoHTML = generarSeccionActivismoHTML(veredicto, secciones, articulosPorCriterio, ideasActivismoTotal);
+  const activismoHTML = generarSeccionActivismoHTML(veredicto, ideasActivismoTotal, ideasActivismoHibrido);
   const contactoHTML  = generarLaminaContactoHTML(contactosApoyo, contactosSonDummy);
 
   return `<!DOCTYPE html>
@@ -508,8 +505,18 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // idéntico al de antes de este cambio.
 // v2.9 (9 ago 2026) — ver changelog arriba: ya no se lee `datos.descalificado`
 // en ningún punto de esta función.
+// v3.0 (10 ago 2026) — CASO HÍBRIDO CON IDEAS REALES: hasta ahora, un
+// documento híbrido (ni rechazo ni apoyo total) mostraba un texto de
+// relleno ("[PENDIENTE...]") por cada criterio aplicable — hueco
+// documentado desde el 22 de julio, expuesto por primera vez hoy con la
+// primera auditoría real que cayó en esa banda. Se genera ahora 1 idea
+// real por criterio, para hasta 7 criterios (1 por cada una de las 7
+// categorías doctrinales con más criterios, el de mayor peso dentro de
+// cada una — decisión de Moisés: "la Presentación no debe ser
+// exhaustiva"). Ver seleccionarCriteriosHibridos() y
+// generarIdeaActivismoCriterio() en generarActivismo.js (v6).
 async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}, contactosApoyo = null, promptsActivismo = {}) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v2.9`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v3.0`);
 
   let enlaces;
   if (grafoDatos && Array.isArray(grafoDatos.enlaces)) {
@@ -523,10 +530,8 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
   const resumenHorizontes = calcularResumenHorizontes(enlaces, pesosCriterios);
   const veredicto = calcularVeredictoActivismo(resumenHorizontes);
 
-  const secciones = calcularSeccionesHorizonte(datos);
-  const articulosPorCriterio = calcularArticulosPorCriterio(enlaces);
-
   let ideasActivismoTotal = null;
+  let ideasActivismoHibrido = null;
   if (veredicto.modo !== 'hibrido') {
     console.log(`   [${auditoria_id}] Generando ideas de activismo (${veredicto.modo})...`);
     ideasActivismoTotal = await generarIdeasActivismoTotal(
@@ -534,6 +539,23 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
       promptsActivismo.estiloPersona, promptsActivismo.reglasGeneracion
     );
     console.log(`   [${auditoria_id}] ${ideasActivismoTotal.length} ideas generadas`);
+  } else {
+    // v6.0 (10 ago 2026): caso híbrido con ideas reales — hasta 7
+    // criterios (1 por cada una de las 7 categorías doctrinales con más
+    // criterios, el de mayor peso dentro de cada una). Ver el changelog
+    // completo en generarActivismo.js.
+    const seleccionados = seleccionarCriteriosHibridos(datos, pesosCriterios);
+    console.log(`   [${auditoria_id}] Caso híbrido: generando ${seleccionados.length} idea(s) puntual(es), 1 por categoría entre las 7 con más criterios...`);
+    ideasActivismoHibrido = await Promise.all(
+      seleccionados.map(({ criterio, categoriaDoctrinal }) => {
+        const tipo = TIPO_ACTIVISMO_POR_HORIZONTE[AREA_POR_RESULTADO[criterio.resultado]];
+        return generarIdeaActivismoCriterio(
+          criterio, categoriaDoctrinal, metadatos, tipo, auditoria_id,
+          promptsActivismo.estiloPersona, promptsActivismo.reglasGeneracion
+        );
+      })
+    );
+    console.log(`   [${auditoria_id}] ${ideasActivismoHibrido.length} idea(s) híbrida(s) generada(s)`);
   }
 
   // Contactos reales si worker.js mandó al menos uno; si no, respaldo DUMMY
@@ -545,7 +567,7 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
   }
 
   const html = generarHTML(datos, metadatos, {
-    veredicto, secciones, articulosPorCriterio, ideasActivismoTotal, contactosApoyo: contactos, contactosSonDummy,
+    veredicto, ideasActivismoTotal, ideasActivismoHibrido, contactosApoyo: contactos, contactosSonDummy,
   });
   const rutaHTML = rutaSalida.replace('.pdf', '.html');
   fs.writeFileSync(rutaHTML, html, 'utf8');
