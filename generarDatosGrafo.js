@@ -22,6 +22,15 @@
 // La función pesoDeCriterio() que antes vivía escondida dentro de
 // calcularResumenHorizontes() se saca a nivel de módulo, para que ambas
 // funciones lean el peso de la misma forma exacta, sin duplicar la lógica.
+//
+// v6 (10 ago 2026) — FIX: primera auditoría real bajo el Test de 40
+// criterios (Ley de Reforma de la Ley Orgánica de Hidrocarburos) falló en
+// este paso con "respuesta cortada por max_tokens (8000)". Con 40
+// criterios en vez de 28, la respuesta que arma el grafo (identificar
+// artículos + mapear qué criterio cita cada uno) necesita más espacio.
+// Subido a 16000 — mismo patrón ya usado antes en analizarConClaude()
+// (worker.js) y generarGuion() (generarGuionPresentacion.js) cuando se
+// toparon con este mismo límite.
 
 'use strict';
 
@@ -249,7 +258,7 @@ ${citasCrudas}`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 8000,
+    max_tokens: 16000,
     messages: [{ role: 'user', content: prompt }],
     output_config: {
       format: { type: 'json_schema', schema: SCHEMA_GRAFO },
@@ -257,7 +266,7 @@ ${citasCrudas}`;
   });
 
   if (response.stop_reason === 'max_tokens') {
-    throw new Error(`generarGrafoConClaude [${auditoria_id}]: respuesta cortada por max_tokens (8000) — subir el límite.`);
+    throw new Error(`generarGrafoConClaude [${auditoria_id}]: respuesta cortada por max_tokens (16000) — subir el límite.`);
   }
   if (response.stop_reason === 'refusal') {
     throw new Error(`generarGrafoConClaude [${auditoria_id}]: Claude rehusó generar el grafo (stop_reason: refusal).`);
