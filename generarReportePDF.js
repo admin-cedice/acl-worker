@@ -244,40 +244,29 @@ function schemaCriterios() {
   };
 }
 
-function schemaCategoriaUnica() {
-  return {
-    type: 'object',
-    properties: {
-      criterios: schemaCriterios(),
-    },
-    required: ['criterios'],
-    additionalProperties: false,
-  };
-}
-
+// v6.0 (10 ago 2026) — FIX CRÍTICO: SCHEMA APLANADO, SIN CATEGORÍAS
+// ANIDADAS. Al activar el Test de 12 categorías, la primera auditoría real
+// falló con un 400 de la API: "The compiled grammar is too large... Simplify
+// your tool schemas". La causa: pedirle a Claude que anidara cada criterio
+// bajo una de 12 claves de categoría (cada una repitiendo la misma
+// estructura completa) infla demasiado la "gramática" que Structured
+// Outputs compila para forzar el formato — funcionaba con 7 categorías,
+// dejó de funcionar con 12.
+//
+// La solución no complica nada — al contrario, simplifica: el código
+// nunca confió en bajo qué categoría anidaba Claude cada criterio (ver
+// CRITERIO_A_CATEGORIA y su changelog, v4.3, 16 jul 2026) — cada uno se
+// reclasifica siempre por su propio id, en código. Es decir, la estructura
+// por categorías del schema no le daba ninguna garantía real que el código
+// no fuera a recalcular de todas formas. Ahora Claude entrega una lista
+// PLANA de los 40 criterios (sin agrupar), y normalizarDatosEstructurados()
+// los reparte en sus 12 categorías exactamente como ya lo hacía. La función
+// schemaCategoriaUnica() (el molde que se repetía 12 veces) queda eliminada
+// por no usarse más.
 const SCHEMA_ANALISIS_AUDITORIA = {
   type: 'object',
   properties: {
-    categorias: {
-      type: 'object',
-      description: 'Las 12 categorías del Test de Libertad — una clave por cada número romano (I a XII), cada una con todos sus criterios evaluados. Las 12 claves son obligatorias.',
-      properties: {
-        I:    schemaCategoriaUnica(),
-        II:   schemaCategoriaUnica(),
-        III:  schemaCategoriaUnica(),
-        IV:   schemaCategoriaUnica(),
-        V:    schemaCategoriaUnica(),
-        VI:   schemaCategoriaUnica(),
-        VII:  schemaCategoriaUnica(),
-        VIII: schemaCategoriaUnica(),
-        IX:   schemaCategoriaUnica(),
-        X:    schemaCategoriaUnica(),
-        XI:   schemaCategoriaUnica(),
-        XII:  schemaCategoriaUnica(),
-      },
-      required: NUMEROS_CATEGORIA,
-      additionalProperties: false,
-    },
+    criterios: schemaCriterios(),
     alertas: {
       type: 'array',
       description: 'Alertas principales del documento. Arreglo vacío si no hay ninguna.',
@@ -294,7 +283,7 @@ const SCHEMA_ANALISIS_AUDITORIA = {
       },
     },
   },
-  required: ['categorias', 'alertas'],
+  required: ['criterios', 'alertas'],
   additionalProperties: false,
 };
 
@@ -822,38 +811,19 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
     );
   }
 
-  // "categorias" llega como objeto { I: {criterios:[...]}, II: {...}, ... }
-  // (ver v4.1 en el schema) — se recorre siempre en el mismo orden fijo
-  // I→VII y se devuelve como arreglo, que es la forma que espera
-  // generarHTML() desde v3.1 y no tuvo que cambiar.
-  const categoriasFaltantes = NUMEROS_CATEGORIA.filter(
-    num => !resultado.categorias || !resultado.categorias[num]
-  );
-  if (categoriasFaltantes.length > 0) {
-    // Con las 7 claves marcadas "required" en el schema esto no debería
-    // poder pasar nunca — si aparece, revisar SCHEMA_ANALISIS_AUDITORIA o
-    // la llamada a la API, no un texto mal escrito.
-    console.warn(`   ⚠️ [${auditoria_id}] Categorías ausentes en la respuesta: ${categoriasFaltantes.join(', ')}.`);
+  // v6.0 (10 ago 2026): "criterios" llega ya como una lista plana (ver el
+  // fix del schema, más arriba) — ya no hace falta revisar si faltó alguna
+  // de las claves de categoría, porque Claude ya no elige ninguna clave.
+  const todosLosCriteriosRecibidos = resultado.criterios || [];
+  if (todosLosCriteriosRecibidos.length === 0) {
+    console.warn(`   ⚠️ [${auditoria_id}] La respuesta no trajo ningún criterio.`);
   }
 
-  // v4.3 (16 jul 2026) — FIX: se detectó en una auditoría real (Ley de
-  // Hidrocarburos) que Claude clasificó C-24/C-25/C-26 dentro de la clave
-  // "V" en vez de "VI", dejando la Categoría VI vacía. Los 28 criterios
-  // estaban completos y bien evaluados — el contenido era correcto — solo
-  // la UBICACIÓN estaba mal. El schema (Structured Outputs) garantiza que
-  // existan las 7 claves y que cada criterio tenga id/pregunta/resultado/
-  // analisis válidos, pero NO puede garantizar que Claude decida bien bajo
-  // cuál de las 7 claves anidar cada uno — eso es una decisión de
-  // contenido, no de forma. Solución: se ignora por completo bajo qué
-  // clave llegó cada criterio. Se aplanan TODOS los criterios recibidos
-  // (sin importar su categoría de origen) y se re-clasifican en código
-  // usando CRITERIO_A_CATEGORIA, que es fijo y no depende de nada que
-  // escriba Claude — mismo principio de toda esta migración, aplicado un
-  // nivel más profundo.
-  const todosLosCriteriosRecibidos = NUMEROS_CATEGORIA.flatMap(
-    num => resultado.categorias?.[num]?.criterios || []
-  );
-
+  // Cada criterio se clasifica en su categoría real usando
+  // CRITERIO_A_CATEGORIA, un mapa fijo que no depende de nada que escriba
+  // Claude — se mantiene esta reclasificación aunque el schema ya no
+  // anide por categoría, como red de seguridad ante un id inesperado
+  // (ver el aviso de sinMapeoConocido más abajo).
   const criteriosPorCategoria = {};
   NUMEROS_CATEGORIA.forEach(num => { criteriosPorCategoria[num] = []; });
 
