@@ -1374,7 +1374,7 @@ app.get('/regenerar-grafo', async (req, res) => {
     // todavía, promptGrafo llega null y la función usa su propio respaldo.
     const promptGrafo = await obtenerPromptProducto('mapa_articulos');
     const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id, promptGrafo);
-    const grafoDatos = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id);
+    const grafoDatos = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id, pesosCriterios);
     await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatos), auditoria_id]);
 
     console.log(`   [REGENERAR-GRAFO] ✅ [${auditoria_id}] grafo_datos actualizado`);
@@ -3025,7 +3025,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
       // usa PROMPT_GRAFO_RESPALDO (comportamiento idéntico al de antes).
       const promptGrafo = await obtenerPromptProducto('mapa_articulos');
       const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id, promptGrafo);
-      grafoDatosCompartido = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id);
+      grafoDatosCompartido = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id, pesosCriterios);
       await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatosCompartido), auditoria_id]);
       console.log(`✅ [${auditoria_id}] Datos del grafo guardados (${grafoDatosCompartido.nodos.length} nodos, ${grafoDatosCompartido.enlaces.length} enlaces)`);
     } catch (errorGrafo) {

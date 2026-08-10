@@ -122,14 +122,27 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const URL_MANUAL = 'https://liberalmente.app/manual-de-liberalismo.pdf';
 
+// v5.0 (9 ago 2026) — TEST DE LIBERTAD DEFINITIVO: 40 criterios en 12
+// categorías (Test v5 Temático, redacción final de Roberto, derivado del
+// Manual Cívico Liberal v5 — un capítulo por categoría). Reemplaza por
+// completo la estructura de desarrollo (28 criterios, 7 categorías) que
+// estuvo en producción desde el 16 de julio. Las auditorías previas hechas
+// bajo esa estructura vieja fueron eliminadas a propósito antes de este
+// cambio (decisión de Moisés, 9 ago 2026) — por eso este archivo no
+// necesita entender ambas estructuras a la vez, solo la nueva.
 const CATEGORIAS_NOMBRES = {
-  'I':   'Dignidad y Autonomía Individual',
-  'II':  'Estado de Derecho e Instituciones',
-  'III': 'Propiedad Privada y Libre Empresa',
-  'IV':  'Competencia y Rechazo al Rentismo',
-  'V':   'Límites al Estado y Subsidiariedad',
-  'VI':  'Igualdad de Oportunidades y Política Social',
-  'VII': 'Integridad Semántica y Soberanía',
+  'I':    'Dignidad y Autonomía Individual',
+  'II':   'Mercado, Propiedad y Función Empresarial',
+  'III':  'Instituciones y Estado de Derecho',
+  'IV':   'Competencia y Rechazo al Rentismo',
+  'V':    'Bienes Comunes, Externalidades y Sostenibilidad',
+  'VI':   'Límites y Función del Estado',
+  'VII':  'Desarrollo y Complejidad Económica',
+  'VIII': 'Pobreza, Desigualdad y Política Social',
+  'IX':   'Educación y Cultura Cívica',
+  'X':    'Democracia, República y Ciudadanía',
+  'XI':   'Soberanía y Orden Internacional',
+  'XII':  'Integridad Semántica',
 };
 
 // ── Schema de Structured Outputs para analizarConClaude() (worker.js) ───────
@@ -141,24 +154,53 @@ const CATEGORIAS_NOMBRES = {
 
 // v4.1 (16 jul 2026): la API rechazó el diseño original con un 400 —
 // "For 'array' type, 'minItems' values other than 0 or 1 are not
-// supported". El minItems:7/maxItems:7 que usaba para garantizar
-// "exactamente 7 categorías" no es una opción real en Structured Outputs.
-// Se logra la misma garantía sin arreglos con longitud forzada: en vez de
-// un ARREGLO de 7 categorías, "categorias" ahora es un OBJETO con una
-// clave fija por cada número romano (I a VII), las 7 marcadas
-// "required" — los objetos con propiedades required sí están soportados
-// sin restricción de este tipo. normalizarDatosEstructurados() se encarga
-// de convertir ese objeto de vuelta a la forma de arreglo que usa
-// generarHTML(), así que nada más en el archivo tuvo que cambiar.
-const NUMEROS_CATEGORIA = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'];
+// supported". El minItems/maxItems que usaba para garantizar "exactamente
+// N categorías" no es una opción real en Structured Outputs. Se logra la
+// misma garantía sin arreglos con longitud forzada: en vez de un ARREGLO
+// de categorías, "categorias" es un OBJETO con una clave fija por cada
+// número romano, todas marcadas "required" — los objetos con propiedades
+// required sí están soportados sin esta restricción.
+// normalizarDatosEstructurados() se encarga de convertir ese objeto de
+// vuelta a la forma de arreglo que usa generarHTML().
+//
+// IMPORTANTE para la próxima vez que cambie la estructura del Test: esta
+// lista, CATEGORIAS_NOMBRES y CRITERIO_A_CATEGORIA son las TRES piezas que
+// hay que actualizar juntas, a mano, en el código — el sistema no lee la
+// estructura de la base de datos (ver el aviso completo más abajo, junto a
+// CRITERIO_A_CATEGORIA).
+const NUMEROS_CATEGORIA = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
 
 // Mapa fijo criterio → categoría, según la estructura real del Test de
-// Libertad (28 criterios, 7 categorías: I=5, II=5, III=5, IV=4, V=4, VI=3,
-// VII=2). Se usa en normalizarDatosEstructurados() para volver a clasificar
-// cada criterio por su propio id, sin confiar en bajo qué clave de
-// categoría lo haya anidado Claude — ver v4.3 en el changelog.
+// Libertad (40 criterios, 12 categorías: I=4, II=5, III=4, IV=3, V=3,
+// VI=7, VII=2, VIII=4, IX=2, X=2, XI=2, XII=2). Se usa en
+// normalizarDatosEstructurados() para volver a clasificar cada criterio
+// por su propio id, sin confiar en bajo qué clave de categoría lo haya
+// anidado Claude — ver v4.3 en el changelog.
+//
+// RECORDATORIO (vigente desde el 2 ago 2026, aplicado hoy 9 ago): el
+// sistema NO lee esta estructura de la base de datos — Structured Outputs
+// necesita que el schema completo esté fijo en el código en el momento
+// exacto de cada llamado a Claude, no se puede armar en vivo. La próxima
+// vez que la doctrina defina una estructura distinta, hay que volver a
+// tocar este archivo a mano (CATEGORIAS_NOMBRES, NUMEROS_CATEGORIA,
+// CRITERIO_A_CATEGORIA, y el bloque schemaCategoriaUnica() de más abajo) —
+// no es un problema de arquitectura abierto, es una actualización acotada
+// y conocida, igual que esta.
 const CRITERIO_A_CATEGORIA = (() => {
-  const rangos = { I: [1, 5], II: [6, 10], III: [11, 15], IV: [16, 19], V: [20, 23], VI: [24, 26], VII: [27, 28] };
+  const rangos = {
+    I:    [1, 4],
+    II:   [5, 9],
+    III:  [10, 13],
+    IV:   [14, 16],
+    V:    [17, 19],
+    VI:   [20, 26],
+    VII:  [27, 28],
+    VIII: [29, 32],
+    IX:   [33, 34],
+    X:    [35, 36],
+    XI:   [37, 38],
+    XII:  [39, 40],
+  };
   const mapa = {};
   for (const [num, [desde, hasta]] of Object.entries(rangos)) {
     for (let n = desde; n <= hasta; n++) {
@@ -176,7 +218,7 @@ function schemaCriterios() {
       properties: {
         id: {
           type: 'string',
-          description: 'Código del criterio, formato "C-01" a "C-28".',
+          description: 'Código del criterio, formato "C-01" a "C-40".',
         },
         pregunta: {
           type: 'string',
@@ -218,15 +260,20 @@ const SCHEMA_ANALISIS_AUDITORIA = {
   properties: {
     categorias: {
       type: 'object',
-      description: 'Las 7 categorías del Test de Libertad — una clave por cada número romano (I a VII), cada una con todos sus criterios evaluados. Las 7 claves son obligatorias.',
+      description: 'Las 12 categorías del Test de Libertad — una clave por cada número romano (I a XII), cada una con todos sus criterios evaluados. Las 12 claves son obligatorias.',
       properties: {
-        I:   schemaCategoriaUnica(),
-        II:  schemaCategoriaUnica(),
-        III: schemaCategoriaUnica(),
-        IV:  schemaCategoriaUnica(),
-        V:   schemaCategoriaUnica(),
-        VI:  schemaCategoriaUnica(),
-        VII: schemaCategoriaUnica(),
+        I:    schemaCategoriaUnica(),
+        II:   schemaCategoriaUnica(),
+        III:  schemaCategoriaUnica(),
+        IV:   schemaCategoriaUnica(),
+        V:    schemaCategoriaUnica(),
+        VI:   schemaCategoriaUnica(),
+        VII:  schemaCategoriaUnica(),
+        VIII: schemaCategoriaUnica(),
+        IX:   schemaCategoriaUnica(),
+        X:    schemaCategoriaUnica(),
+        XI:   schemaCategoriaUnica(),
+        XII:  schemaCategoriaUnica(),
       },
       required: NUMEROS_CATEGORIA,
       additionalProperties: false,
@@ -820,10 +867,10 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
     criteriosPorCategoria[categoriaReal].push(crit);
   }
   if (sinMapeoConocido.length > 0) {
-    // Solo puede pasar si Claude inventa un id fuera de C-01..C-28 —
+    // Solo puede pasar si Claude inventa un id fuera de C-01..C-40 —
     // no debería ocurrir, pero si pasa, mejor que quede visible en el log
     // a que el criterio desaparezca en silencio.
-    console.warn(`   ⚠️ [${auditoria_id}] Criterios con id no reconocido (no mapean a C-01..C-28): ${sinMapeoConocido.join(', ')}`);
+    console.warn(`   ⚠️ [${auditoria_id}] Criterios con id no reconocido (no mapean a C-01..C-40): ${sinMapeoConocido.join(', ')}`);
   }
 
   // Orden interno estable dentro de cada categoría, sin importar el orden
@@ -847,10 +894,10 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
   console.log(`\n   ╔══════════════════════════════════════════════════`);
   console.log(`   ║ DIAGNÓSTICO [${auditoria_id}] (salida estructurada)`);
   console.log(`   ╠══════════════════════════════════════════════════`);
-  console.log(`   ║ Categorías : ${categorias.length} (se esperan 7)`);
-  console.log(`   ║ Criterios  : ${todos.length} (se esperan 28)`);
-  if (todos.length !== 28) {
-    console.warn(`   ⚠️ [${auditoria_id}] Se esperaban 28 criterios en total, llegaron ${todos.length}.`);
+  console.log(`   ║ Categorías : ${categorias.length} (se esperan 12)`);
+  console.log(`   ║ Criterios  : ${todos.length} (se esperan 40)`);
+  if (todos.length !== 40) {
+    console.warn(`   ⚠️ [${auditoria_id}] Se esperaban 40 criterios en total, llegaron ${todos.length}.`);
   }
   categorias.forEach(cat => console.log(`   ║   Cat. ${cat.num.padEnd(3)}: ${cat.criterios.length} criterios`));
   console.log(`   ╠──────────────────────────────────────────────────`);
@@ -1052,7 +1099,7 @@ function generarHTML(datos, metadatos) {
   } = metadatos;
 
   const criteriosParseados  = categorias.reduce((acc, cat) => acc + cat.criterios.length, 0);
-  const totalCriterios      = criteriosParseados || 28;
+  const totalCriterios      = criteriosParseados || 40;
   const criteriosDetectados = criteriosParseados > 0;
 
   const desgloseFicha = criteriosDetectados
@@ -1174,7 +1221,7 @@ function generarHTML(datos, metadatos) {
     const cabecera = idxCat === 0 ? `
   <div class="seccion-cabecera">
     <div class="seccion-label">Análisis por criterio</div>
-    <div class="seccion-referencia">Test de Libertad — ${totalCriterios} criterios · 7 categorías</div>
+    <div class="seccion-referencia">Test de Libertad — ${totalCriterios} criterios · 12 categorías</div>
   </div>
   <div class="seccion-titulo-principal">
     Reporte de Auditoría Cívica Liberal: Análisis por Criterio del Test de Libertad
@@ -1256,7 +1303,7 @@ function generarHTML(datos, metadatos) {
     <tr><td>Marco doctrinal</td><td><a href="${URL_MANUAL}" class="nota-doctrinal">${esc(marcaDoctrinal)}</a></td></tr>
     <tr><td>Auditor</td><td>Auditor Cívico Liberal — liberalmente.app</td></tr>
     <tr><td>Generado el</td><td>${esc(generadoEl)}</td></tr>
-    <tr><td>Criterios aplicados</td><td>${totalCriterios} criterios en 7 categorías del Test de Libertad</td></tr>
+    <tr><td>Criterios aplicados</td><td>${totalCriterios} criterios en 12 categorías del Test de Libertad</td></tr>
     <tr>
       <td>Resultado</td>
       <td>

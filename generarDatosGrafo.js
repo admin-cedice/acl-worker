@@ -12,6 +12,16 @@
 // como red de seguridad — mismo patrón exacto que ya usa
 // PROMPT_ADMISIBILIDAD_RESPALDO en worker.js: si la tabla está vacía o el
 // campo no existe todavía, el comportamiento es idéntico al de hoy.
+//
+// v5 (9 ago 2026) — PESO POR CRITERIO EN EL GRAFO (tamaño de esfera):
+// calcularDatosGrafo() acepta un cuarto parámetro opcional
+// `pesosCriterios` — el mismo objeto {id: peso} que ya usa
+// generarReportePDF.js. Cada nodo tipo "criterio" ahora trae su propio
+// campo `peso` (1 por defecto, igual criterio de siempre) — lo usa
+// app/auditoria/[id]/grafo/page.js para calcular el radio de cada esfera.
+// La función pesoDeCriterio() que antes vivía escondida dentro de
+// calcularResumenHorizontes() se saca a nivel de módulo, para que ambas
+// funciones lean el peso de la misma forma exacta, sin duplicar la lógica.
 
 'use strict';
 
@@ -265,8 +275,31 @@ ${citasCrudas}`;
   return resultado;
 }
 
+// ── Peso de un criterio — compartido entre calcularDatosGrafo() y
+// calcularResumenHorizontes(), para que ambas lo lean exactamente igual.
+// Nuevo 9 ago 2026 (v5) — antes vivía escondida solo dentro de
+// calcularResumenHorizontes(). Acepta también el formato enriquecido
+// {peso, descalificador} de la etapa intermedia (31 jul-9 ago 2026) por
+// compatibilidad con datos ya guardados; el campo descalificador, si
+// existe, se ignora — mismo criterio que generarReportePDF.js v4.6.
+function pesoDeCriterio(criterioId, pesosCriterios) {
+  const valor = pesosCriterios ? pesosCriterios[criterioId] : undefined;
+  if (valor && typeof valor === 'object') {
+    const numero = Number(valor.peso);
+    return (valor.peso !== undefined && !Number.isNaN(numero)) ? numero : 1;
+  }
+  const numero = Number(valor);
+  return (valor !== undefined && !Number.isNaN(numero)) ? numero : 1;
+}
+
 // ── Construir los datos del grafo (nodos + enlaces) ──────────────────────
-function calcularDatosGrafo(datos, analisisGrafo = { articulos: [], citas: [] }, auditoria_id = 'N/A') {
+// v5 (9 ago 2026): cuarto parámetro opcional `pesosCriterios` — el mismo
+// objeto {id: peso} que ya usa generarReportePDF.js. Cada nodo tipo
+// "criterio" ahora trae su propio campo `peso` (1 por defecto), que usa
+// app/auditoria/[id]/grafo/page.js para dibujar esferas de distinto
+// tamaño. Sin pesosCriterios, el resultado es idéntico al de antes de
+// este cambio (todos los criterios quedan con peso 1).
+function calcularDatosGrafo(datos, analisisGrafo = { articulos: [], citas: [] }, auditoria_id = 'N/A', pesosCriterios = {}) {
   const criterios = datos.categorias.flatMap(cat => cat.criterios);
   const nodos = [];
   const enlaces = [];
@@ -278,6 +311,7 @@ function calcularDatosGrafo(datos, analisisGrafo = { articulos: [], citas: [] },
       resultado: c.resultado,
       pregunta: c.pregunta,
       analisis: c.analisis,
+      peso: pesoDeCriterio(c.id, pesosCriterios),
     });
   });
 
@@ -330,16 +364,7 @@ function calcularResumenHorizontes(enlaces, pesosCriterios = {}) {
     grupos[horizonte].push(enlace);
   });
 
-  function pesoDeCriterio(criterioId) {
-    const valor = pesosCriterios ? pesosCriterios[criterioId] : undefined;
-    if (valor && typeof valor === 'object') {
-      const numero = Number(valor.peso);
-      return (valor.peso !== undefined && !Number.isNaN(numero)) ? numero : 1;
-    }
-    const numero = Number(valor);
-    return (valor !== undefined && !Number.isNaN(numero)) ? numero : 1;
-  }
-  const pesoDeLista = lista => lista.reduce((acc, e) => acc + pesoDeCriterio(e.destino), 0);
+  const pesoDeLista = lista => lista.reduce((acc, e) => acc + pesoDeCriterio(e.destino, pesosCriterios), 0);
 
   const pesoTotal = pesoDeLista(grupos.en_contra) + pesoDeLista(grupos.neutral) + pesoDeLista(grupos.a_favor);
 
