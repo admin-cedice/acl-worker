@@ -31,6 +31,16 @@
 // Subido a 16000 — mismo patrón ya usado antes en analizarConClaude()
 // (worker.js) y generarGuion() (generarGuionPresentacion.js) cuando se
 // toparon con este mismo límite.
+//
+// v6.1 (10 ago 2026) — 16000 TAMPOCO ALCANZÓ: el mismo documento
+// (Hidrocarburos — ya conocido en este proyecto como uno de los más
+// exigentes, es una ley de reforma con muchos artículos citados) volvió a
+// cortar la respuesta, esta vez en 16000. Subido directo a 32000 — el
+// mismo tope que ya usa analizarConClaude() para el análisis completo de
+// los 40 criterios, el paso más pesado de todo el pipeline. Se prefirió
+// saltar a ese techo ya probado en vez de subir a un número intermedio
+// que quizás tampoco alcanzara, para no gastar un tercer ciclo de prueba
+// con el mismo documento.
 
 'use strict';
 
@@ -258,7 +268,7 @@ ${citasCrudas}`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 16000,
+    max_tokens: 32000,
     messages: [{ role: 'user', content: prompt }],
     output_config: {
       format: { type: 'json_schema', schema: SCHEMA_GRAFO },
@@ -266,7 +276,7 @@ ${citasCrudas}`;
   });
 
   if (response.stop_reason === 'max_tokens') {
-    throw new Error(`generarGrafoConClaude [${auditoria_id}]: respuesta cortada por max_tokens (16000) — subir el límite.`);
+    throw new Error(`generarGrafoConClaude [${auditoria_id}]: respuesta cortada por max_tokens (32000) — subir el límite.`);
   }
   if (response.stop_reason === 'refusal') {
     throw new Error(`generarGrafoConClaude [${auditoria_id}]: Claude rehusó generar el grafo (stop_reason: refusal).`);
