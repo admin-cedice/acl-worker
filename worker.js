@@ -1,6 +1,55 @@
-// worker.js — ACL Worker v3.34
+// worker.js — ACL Worker v3.35
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.35 (11 ago 2026) — NIVEL BLANDO DE DUPLICADOS REEMPLAZADO POR
+// PRESELECCIÓN + JUICIO SEMÁNTICO DE CLAUDE. La v3.34 comparaba
+// título+institución+período normalizados con regex e igualdad exacta —
+// funcionó mal en la práctica: un informe parlamentario que contiene una
+// ley íntegra (pero con su propio título de portada distinto) no calzaba
+// con la ley ya auditada, y el chequeo se quedaba mudo. La comparación de
+// texto exacto es la herramienta correcta para el nivel DURO (ahí un
+// falso positivo bloquea a alguien sin que nadie lo revise, así que
+// tiene que ser matemáticamente exacta) — pero para el nivel BLANDO, que
+// ya tiene al ciudadano como árbitro final antes de bloquear nada, tiene
+// más sentido usar el juicio del propio Claude. Diseño nuevo, en dos
+// pasos:
+// (1) PRESELECCIÓN BARATA (Postgres, sin Claude): pg_trgm calcula qué
+//     tan parecido es el título nuevo a los títulos de auditorías
+//     'completada' anteriores — similarity(a,b), 0 a 1. Solo los que
+//     superan UMBRAL_SIMILITUD_TITULO (0.30) se preseleccionan, máximo
+//     MAX_CANDIDATOS_SIMILITUD (8). Si ningún título supera el umbral,
+//     el flujo sigue normal sin llamar a Claude — cero costo extra para
+//     un documento genuinamente nuevo.
+// (2) JUICIO SEMÁNTICO (un llamado a Claude, solo si hay candidatos):
+//     juzgarDuplicadosConClaude() le muestra el documento nuevo y la
+//     lista corta de candidatos (título, institución, período — no el
+//     texto completo) y le pregunta, por cada uno, si es GENUINAMENTE el
+//     mismo documento (aunque esté envuelto en un informe/dictamen
+//     distinto), con instrucción explícita de NO confundir esto con una
+//     reforma legítima o un plan de otro período. Ante la duda, Claude
+//     debe responder que no son el mismo — el costo de un falso negativo
+//     acá es bajo (la auditoría simplemente procede, como si el chequeo
+//     no existiera), el de un falso positivo es una interrupción
+//     innecesaria para el ciudadano.
+// Salida estructurada (Structured Outputs) referenciando candidatos por
+// número de lista (1, 2, 3...), no por id — evita cualquier riesgo de
+// que Claude transcriba mal un UUID largo.
+// IMPORTANTE: ningún juicio de Claude, sin importar cuán seguro esté,
+// puede saltar al nivel duro (rechazo automático sin revisión). El
+// resultado más fuerte que puede producir el juicio semántico sigue
+// siendo 'pendiente_confirmacion' — el ciudadano decide siempre.
+// Reemplaza (elimina) clave_blanda_duplicado, calcularClaveBlanda(),
+// normalizarParaClaveBlanda() y buscarDuplicadosBlandos() de v3.34 — ver
+// migracion-duplicados-semanticos.sql (activa pg_trgm, agrega el índice
+// de trigramas, elimina la columna vieja). Los niveles DUROS (hash,
+// identificador oficial) quedan intactos, sin ningún cambio.
+//
+// De paso: analizarConClaude() sube su tope de max_tokens de 32000 a
+// 96000 — el modelo admite hasta 128000, y un documento real (un informe
+// parlamentario que cita cada artículo dos veces) llegó a cortarse por
+// este límite. Cambio de una línea, sin riesgo, protege contra cualquier
+// documento largo o denso, no solo este caso puntual.
 //
 // v3.34 (11 ago 2026) — DETECCIÓN DE DOCUMENTOS DUPLICADOS, 3 niveles:
 // (1) DURO por hash: el texto extraído del PDF se normaliza y se hashea
@@ -16,18 +65,19 @@
 //     anterior, mismo rechazo amable que (1). Cubre el caso real que
 //     motivó esto: mismo documento oficial, dos archivos/escaneos
 //     distintos, texto extraído ligeramente distinto.
-// (3) BLANDO por título+institución+período: para documentos SIN número
+// (3) BLANDO por título+institución+período — VER NOTA DE v3.35 ARRIBA,
+//     este mecanismo fue reemplazado. Se deja la descripción original
+//     solo como referencia histórica: para documentos SIN número
 //     oficial (planes, programas, políticas públicas) — si la combinación
-//     normalizada de título+institución (+período si existe) coincide con
-//     una auditoría 'completada' anterior, NO se rechaza automáticamente
-//     (la señal es más débil, el riesgo de bloquear por error un
-//     documento legítimamente distinto es real). En su lugar, la
-//     auditoría queda en estado nuevo 'pendiente_confirmacion' y se le
-//     manda un correo al ciudadano mostrándole los parecidos encontrados,
-//     con un link firmado para continuar si confirma que quiere auditar
-//     su documento de todas formas — mismo patrón de link firmado sin
-//     sesión que ya usa /notificaciones/optout. Nuevo endpoint público
-//     GET /continuar-procesamiento.
+//     normalizada de título+institución (+período si existe) coincidía
+//     con una auditoría 'completada' anterior, NO se rechazaba
+//     automáticamente. En su lugar, la auditoría quedaba en estado nuevo
+//     'pendiente_confirmacion' y se le mandaba un correo al ciudadano
+//     mostrándole los parecidos encontrados, con un link firmado para
+//     continuar si confirma que quiere auditar su documento de todas
+//     formas — mismo patrón de link firmado sin sesión que ya usa
+//     /notificaciones/optout. Endpoint público GET /continuar-procesamiento
+//     (este sigue existiendo sin cambios en v3.35).
 //
 // procesarAuditoria() ahora recibe un quinto parámetro, saltarDuplicados
 // (default false) — independiente de saltarFiltro (que sigue controlando
@@ -37,13 +87,11 @@
 // sí se vuelve a correr, para no dejar pasar documentos no pertinentes
 // solo porque el ciudadano confirmó que no es un duplicado.
 //
-// Requiere migracion-deteccion-duplicados.sql (5 columnas nuevas en
-// auditorias: hash_documento, identificador_normalizado,
-// clave_blanda_duplicado, institucion_emisora, periodo_documento) —
-// IMPORTANTE: correr esa migración ANTES de desplegar esta versión. Sin
-// ella, el bloque de detección de duplicados falla de forma no
-// bloqueante — la auditoría sigue procesándose normal, solo sin ese
-// chequeo, hasta que se corra la migración.
+// Requiere migracion-deteccion-duplicados.sql (v3.34) Y
+// migracion-duplicados-semanticos.sql (v3.35, corre después) — IMPORTANTE:
+// correr ambas ANTES de desplegar esta versión. Sin ellas, el bloque de
+// detección de duplicados falla de forma no bloqueante — la auditoría
+// sigue procesándose normal, solo sin ese chequeo, hasta que se corran.
 //
 // v3.33 (11 ago 2026) — AVISO MASIVO A CIUDADANOS REGISTRADOS: cuando una
 // auditoría se completa, además del correo "Tu auditoría está lista" (al
@@ -1413,7 +1461,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.34', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.35', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -3058,27 +3106,100 @@ function normalizarIdentificadorOficial(numeroOficial) {
   return soloDigitos.length >= 3 ? soloDigitos : null;
 }
 
-function normalizarParaClaveBlanda(texto) {
-  if (!texto) return '';
-  return texto
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+// ── Nivel blando: preselección por similitud (pg_trgm) + juicio de Claude
+// (11 ago 2026, v3.35) — reemplaza la clave exacta título+institución+
+// período de v3.34. Ver el comentario completo al inicio del archivo.
+
+const UMBRAL_SIMILITUD_TITULO = 0.30; // pg_trgm — por debajo de esto, ni se molesta a Claude
+const MAX_CANDIDATOS_SIMILITUD = 8;   // tope de candidatos que se le muestran a Claude por llamada
+
+// Preselección barata: qué tan parecido es el título nuevo, letra por
+// letra (trigramas), a los títulos de auditorías ya completadas. Sigue
+// siendo mecánico — el umbral solo decide si vale la pena preguntarle a
+// Claude, nunca decide un duplicado por sí solo.
+async function buscarCandidatosPorSimilitud(tituloNuevo, auditoriaIdActual) {
+  if (!tituloNuevo) return [];
+  const { rows } = await db.query(
+    `SELECT id, titulo_documento, institucion_emisora, periodo_documento,
+            link_reporte, link_podcast, link_presentacion, completada_en,
+            similarity(titulo_documento, $1) AS puntaje_similitud
+     FROM auditorias
+     WHERE estado = 'completada'
+       AND id != $2
+       AND similarity(titulo_documento, $1) > $3
+     ORDER BY puntaje_similitud DESC
+     LIMIT $4`,
+    [tituloNuevo, auditoriaIdActual, UMBRAL_SIMILITUD_TITULO, MAX_CANDIDATOS_SIMILITUD]
+  );
+  return rows;
 }
 
-// Clave "blanda" para documentos SIN número oficial (planes, programas,
-// políticas públicas). Exige título + institución como mínimo — con solo
-// el título es demasiado fácil coincidir por accidente. El período se
-// agrega si existe, para distinguir revisiones sucesivas del mismo plan
-// (ej. "2025-2031" vs. una futura "2031-2037").
-function calcularClaveBlanda(titulo, institucion, periodo) {
-  const t = normalizarParaClaveBlanda(titulo);
-  const inst = normalizarParaClaveBlanda(institucion);
-  if (!t || !inst) return null;
-  const p = normalizarParaClaveBlanda(periodo);
-  return [t, inst, p].filter(Boolean).join('|');
+const SCHEMA_JUICIO_DUPLICADOS = {
+  type: 'object',
+  properties: {
+    veredictos: {
+      type: 'array',
+      description: 'Un veredicto por cada candidato de la lista, en el mismo orden en que se presentaron.',
+      items: {
+        type: 'object',
+        properties: {
+          numero: { type: 'integer', description: 'El número del candidato en la lista (1, 2, 3...), tal como se le presentó — NO el id.' },
+          es_mismo_documento: { type: 'boolean', description: 'true SOLO si es genuinamente el mismo instrumento legal o documento de política pública que el nuevo, aunque esté descrito, formateado o envuelto distinto (ej. un informe parlamentario que contiene la misma ley íntegra). false si son documentos distintos, aunque compartan tema, institución o buena parte del vocabulario — en particular, una reforma legítima de una ley anterior NO es el mismo documento, y un plan o programa de un período distinto NO es el mismo documento.' },
+          razon: { type: 'string', description: 'Una frase breve explicando el veredicto.' },
+        },
+        required: ['numero', 'es_mismo_documento', 'razon'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['veredictos'],
+  additionalProperties: false,
+};
+
+// Único llamado a Claude en todo el chequeo de duplicados — recibe el
+// documento nuevo y hasta MAX_CANDIDATOS_SIMILITUD candidatos (solo
+// título/institución/período, nunca el texto completo) y devuelve un
+// veredicto por candidato. El resultado más fuerte que puede producir
+// esto sigue siendo 'pendiente_confirmacion' — nunca un rechazo
+// automático, sin importar cuán seguro esté Claude.
+async function juzgarDuplicadosConClaude(metadatosNuevo, candidatos) {
+  if (candidatos.length === 0) return [];
+
+  const listaCandidatos = candidatos.map((c, i) => `${i + 1}. título: "${c.titulo_documento}"
+   institución: ${c.institucion_emisora || '(no identificada)'}
+   período: ${c.periodo_documento || '(no especificado)'}`).join('\n\n');
+
+  const prompt = `Eres un asistente que ayuda a evitar auditorías repetidas del mismo documento en Auditoría Cívica Liberal, una plataforma de fiscalización ciudadana de leyes y políticas públicas venezolanas.
+
+Se subió un documento nuevo, titulado: "${metadatosNuevo.titulo}"${metadatosNuevo.institucionEmisora ? `, emitido por: ${metadatosNuevo.institucionEmisora}` : ''}${metadatosNuevo.periodo ? `, período: ${metadatosNuevo.periodo}` : ''}.
+
+Estos son documentos YA AUDITADOS en la plataforma, que resultaron parecidos por su título:
+
+${listaCandidatos}
+
+Para cada uno, decide si es GENUINAMENTE EL MISMO documento o instrumento legal que el nuevo — por ejemplo, el mismo proyecto de ley citado íntegro dentro de un informe o dictamen parlamentario distinto, o el mismo plan subido dos veces con el título ligeramente distinto.
+
+NO marques como el mismo documento: una reforma legítima de una ley anterior, un plan o programa de un período distinto, o dos documentos que solo comparten tema, institución o vocabulario. Ante la duda razonable, marca false — el costo de un falso negativo acá es bajo (la auditoría simplemente procede, como si no hubiera parecidos), el de un falso positivo es una interrupción innecesaria para el ciudadano que subió el documento.`;
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-5',
+    max_tokens: 2000,
+    messages: [{ role: 'user', content: prompt }],
+    output_config: {
+      format: { type: 'json_schema', schema: SCHEMA_JUICIO_DUPLICADOS },
+    },
+  });
+
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error('juzgarDuplicadosConClaude: respuesta cortada por max_tokens (2000).');
+  }
+  if (response.stop_reason === 'refusal') {
+    throw new Error('juzgarDuplicadosConClaude: Claude rehusó generar el juicio (stop_reason: refusal).');
+  }
+
+  const texto = extraerTextoRespuesta(response);
+  const datos = JSON.parse(texto);
+  return datos.veredictos || [];
 }
 
 async function buscarDuplicadoPorHash(hashDocumento, auditoriaIdActual) {
@@ -3102,22 +3223,6 @@ async function buscarDuplicadoPorIdentificador(identificadorNormalizado, auditor
     [identificadorNormalizado, auditoriaIdActual]
   );
   return rows[0] || null;
-}
-
-// Devuelve varios (no solo uno) porque acá sí queremos mostrarle al
-// ciudadano todos los parecidos que encontremos, para que decida con la
-// mayor información posible.
-async function buscarDuplicadosBlandos(claveBlanda, auditoriaIdActual) {
-  if (!claveBlanda) return [];
-  const { rows } = await db.query(
-    `SELECT id, titulo_documento, link_reporte, link_podcast, link_presentacion, completada_en
-     FROM auditorias
-     WHERE clave_blanda_duplicado = $1 AND estado = 'completada' AND id != $2
-     ORDER BY completada_en DESC
-     LIMIT 5`,
-    [claveBlanda, auditoriaIdActual]
-  );
-  return rows;
 }
 
 // Token firmado para el link de "continuar de todos modos" del correo de
@@ -3336,14 +3441,13 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     );
     console.log(`✅ [${auditoria_id}] Metadatos: "${metadatos.titulo}"`);
 
-    // Igual que el hash: se calculan siempre (locales, sin costo), para
-    // que esta auditoría quede con sus propias claves guardadas al
-    // completarse, sin importar si el chequeo de abajo se saltó.
+    // Igual que el hash: se calcula siempre (local, sin costo), para que
+    // esta auditoría quede con su propia clave guardada al completarse,
+    // sin importar si el chequeo de abajo se saltó.
     const identificadorNormalizado = normalizarIdentificadorOficial(metadatos.numeroOficial);
-    const claveBlanda = calcularClaveBlanda(metadatos.titulo, metadatos.institucionEmisora, metadatos.periodo);
 
     if (!saltarDuplicados) {
-      console.log(`🔎 [${auditoria_id}] PASO 4.5: Verificando duplicado por identificador oficial / similitud...`);
+      console.log(`🔎 [${auditoria_id}] PASO 4.5: Verificando duplicado por identificador oficial...`);
       try {
         const duplicadoPorIdentificador = await buscarDuplicadoPorIdentificador(identificadorNormalizado, auditoria_id);
         if (duplicadoPorIdentificador) {
@@ -3357,20 +3461,34 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
           console.log(`🔁 [${auditoria_id}] Rechazada — mismo número oficial que ${duplicadoPorIdentificador.id}`);
           return;
         }
+        console.log(`✅ [${auditoria_id}] Sin duplicado por identificador oficial`);
+      } catch (errorDuplicadoIdentificador) {
+        console.error(`⚠️  [${auditoria_id}] No se pudo verificar duplicado por identificador (no bloqueante — ¿faltan las migraciones de duplicados?):`, errorDuplicadoIdentificador.message);
+      }
 
-        const duplicadosBlandos = await buscarDuplicadosBlandos(claveBlanda, auditoria_id);
-        if (duplicadosBlandos.length > 0) {
-          await db.query(
-            `UPDATE auditorias SET estado = 'pendiente_confirmacion' WHERE id = $1`,
-            [auditoria_id]
-          );
-          await enviarEmailPosibleDuplicado(ciudadano_email, auditoria_id, metadatos.titulo, duplicadosBlandos);
-          console.log(`⏸️  [${auditoria_id}] Pendiente de confirmación — ${duplicadosBlandos.length} parecido(s) encontrado(s), esperando al ciudadano`);
-          return;
+      console.log(`🔎 [${auditoria_id}] PASO 4.6: Preseleccionando candidatos por similitud de título...`);
+      try {
+        const candidatos = await buscarCandidatosPorSimilitud(metadatos.titulo, auditoria_id);
+        if (candidatos.length > 0) {
+          console.log(`   [${auditoria_id}] ${candidatos.length} candidato(s) por encima del umbral — consultando a Claude...`);
+          const veredictos = await juzgarDuplicadosConClaude(metadatos, candidatos);
+          const duplicadosConfirmados = veredictos
+            .filter(v => v.es_mismo_documento)
+            .map(v => candidatos[v.numero - 1])
+            .filter(Boolean);
+
+          if (duplicadosConfirmados.length > 0) {
+            await db.query(`UPDATE auditorias SET estado = 'pendiente_confirmacion' WHERE id = $1`, [auditoria_id]);
+            await enviarEmailPosibleDuplicado(ciudadano_email, auditoria_id, metadatos.titulo, duplicadosConfirmados);
+            console.log(`⏸️  [${auditoria_id}] Pendiente de confirmación — Claude confirmó ${duplicadosConfirmados.length} parecido(s), esperando al ciudadano`);
+            return;
+          }
+          console.log(`✅ [${auditoria_id}] Candidatos descartados por Claude — ninguno es el mismo documento`);
+        } else {
+          console.log(`✅ [${auditoria_id}] Sin candidatos por similitud de título`);
         }
-        console.log(`✅ [${auditoria_id}] Sin duplicado por identificador ni por similitud`);
-      } catch (errorDuplicadoMetadatos) {
-        console.error(`⚠️  [${auditoria_id}] No se pudo verificar duplicado por identificador/similitud (no bloqueante — ¿falta migracion-deteccion-duplicados.sql?):`, errorDuplicadoMetadatos.message);
+      } catch (errorDuplicadoSemantico) {
+        console.error(`⚠️  [${auditoria_id}] No se pudo verificar similitud semántica (no bloqueante — ¿falta migracion-duplicados-semanticos.sql?):`, errorDuplicadoSemantico.message);
       }
     }
 
@@ -3503,12 +3621,11 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	             puntaje = $6,
 	             hash_documento = $7,
 	             identificador_normalizado = $8,
-	             clave_blanda_duplicado = $9,
-	             institucion_emisora = $10,
-	             periodo_documento = $11
-	         WHERE id = $12`,
+	             institucion_emisora = $9,
+	             periodo_documento = $10
+	         WHERE id = $11`,
 	        [linkOriginal, linkReporte, linkPodcast, linkPresentacion, carpetaId, datosReporte.puntaje,
-	         hashDocumento, identificadorNormalizado, claveBlanda, metadatos.institucionEmisora, metadatos.periodo,
+	         hashDocumento, identificadorNormalizado, metadatos.institucionEmisora, metadatos.periodo,
 	         auditoria_id]
 	      );
 	    } catch (errorColumnasNuevas) {
@@ -3694,7 +3811,7 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 32000,
+    max_tokens: 96000,
     system: systemFinal,
     messages: [{
       role: 'user',
@@ -3709,7 +3826,7 @@ async function analizarConClaude(textoPDF, config, manualActivo = null) {
   });
 
   if (response.stop_reason === 'max_tokens') {
-    throw new Error('analizarConClaude: respuesta cortada por max_tokens (32000) — el análisis quedó incompleto. Subir max_tokens (el modelo admite hasta 128000).');
+    throw new Error('analizarConClaude: respuesta cortada por max_tokens (96000) — el análisis quedó incompleto. Subir max_tokens (el modelo admite hasta 128000).');
   }
   if (response.stop_reason === 'refusal') {
     throw new Error('analizarConClaude: Claude rehusó generar el análisis para este documento (stop_reason: refusal).');
@@ -4009,12 +4126,13 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.34 corriendo en puerto ${PORT}`);
-  console.log(`   NUEVO 11 ago: detección de duplicados en 3 niveles — hash exacto e identificador`);
-  console.log(`   oficial (rechazo automático con links, motivo 'documento_duplicado'); título+`);
-  console.log(`   institución+período sin número oficial (estado 'pendiente_confirmacion', el`);
-  console.log(`   ciudadano decide vía GET /continuar-procesamiento). Requiere`);
-  console.log(`   migracion-deteccion-duplicados.sql — sin ella, falla no bloqueante (se completa igual).`);
+  console.log(`\n⚙️  ACL Worker v3.35 corriendo en puerto ${PORT}`);
+  console.log(`   Duplicados — DURO (hash, identificador oficial): rechazo automático con links,`);
+  console.log(`   sin Claude, motivo 'documento_duplicado'. BLANDO (v3.35): preselección por`);
+  console.log(`   similitud de título (pg_trgm) + juicio semántico de Claude — el resultado más`);
+  console.log(`   fuerte que produce es 'pendiente_confirmacion', el ciudadano decide vía GET`);
+  console.log(`   /continuar-procesamiento. Requiere migracion-deteccion-duplicados.sql Y`);
+  console.log(`   migracion-duplicados-semanticos.sql — sin ellas, falla no bloqueante.`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
   console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
