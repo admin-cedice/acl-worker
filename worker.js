@@ -1,6 +1,49 @@
-// worker.js — ACL Worker v3.33
+// worker.js — ACL Worker v3.34
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.34 (11 ago 2026) — DETECCIÓN DE DOCUMENTOS DUPLICADOS, 3 niveles:
+// (1) DURO por hash: el texto extraído del PDF se normaliza y se hashea
+//     (SHA-256) — si coincide con una auditoría 'completada' anterior, se
+//     rechaza automáticamente (mismo patrón amable de siempre: correo con
+//     los links a la auditoría existente, motivo_rechazo_tipo =
+//     'documento_duplicado'). No usa Claude, corre justo después de
+//     extraer el texto (PASO 2.5), antes de gastar nada en IA.
+// (2) DURO por identificador oficial: extraerMetadatos() ahora también
+//     pide numero_oficial (decreto/ley/gaceta, si el documento lo declara
+//     explícitamente), institucion_emisora y periodo. Si el número oficial
+//     normalizado (solo dígitos) coincide con una auditoría 'completada'
+//     anterior, mismo rechazo amable que (1). Cubre el caso real que
+//     motivó esto: mismo documento oficial, dos archivos/escaneos
+//     distintos, texto extraído ligeramente distinto.
+// (3) BLANDO por título+institución+período: para documentos SIN número
+//     oficial (planes, programas, políticas públicas) — si la combinación
+//     normalizada de título+institución (+período si existe) coincide con
+//     una auditoría 'completada' anterior, NO se rechaza automáticamente
+//     (la señal es más débil, el riesgo de bloquear por error un
+//     documento legítimamente distinto es real). En su lugar, la
+//     auditoría queda en estado nuevo 'pendiente_confirmacion' y se le
+//     manda un correo al ciudadano mostrándole los parecidos encontrados,
+//     con un link firmado para continuar si confirma que quiere auditar
+//     su documento de todas formas — mismo patrón de link firmado sin
+//     sesión que ya usa /notificaciones/optout. Nuevo endpoint público
+//     GET /continuar-procesamiento.
+//
+// procesarAuditoria() ahora recibe un quinto parámetro, saltarDuplicados
+// (default false) — independiente de saltarFiltro (que sigue controlando
+// SOLO el filtro de admisibilidad). /reintentar-rechazada (override de
+// admin) pasa ambos en true. /continuar-procesamiento (confirmación del
+// ciudadano) pasa solo saltarDuplicados=true — el filtro de admisibilidad
+// sí se vuelve a correr, para no dejar pasar documentos no pertinentes
+// solo porque el ciudadano confirmó que no es un duplicado.
+//
+// Requiere migracion-deteccion-duplicados.sql (5 columnas nuevas en
+// auditorias: hash_documento, identificador_normalizado,
+// clave_blanda_duplicado, institucion_emisora, periodo_documento) —
+// IMPORTANTE: correr esa migración ANTES de desplegar esta versión. Sin
+// ella, el bloque de detección de duplicados falla de forma no
+// bloqueante — la auditoría sigue procesándose normal, solo sin ese
+// chequeo, hasta que se corra la migración.
 //
 // v3.33 (11 ago 2026) — AVISO MASIVO A CIUDADANOS REGISTRADOS: cuando una
 // auditoría se completa, además del correo "Tu auditoría está lista" (al
@@ -1370,7 +1413,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.33', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.34', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1783,7 +1826,7 @@ app.post('/reintentar-rechazada', async (req, res) => {
 
     res.json({ ok: true, mensaje: 'Reprocesando en segundo plano' });
 
-    procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, true).catch(err => {
+    procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, true, true).catch(err => {
       console.error(`❌ [${auditoria_id}] Error reprocesando tras admisión manual:`, err.message);
     });
 
@@ -2991,9 +3034,224 @@ app.get('/notificaciones/optout', async (req, res) => {
   }
 });
 
+// ── Detección de documentos duplicados (11 ago 2026) ──────────────────────
+// 3 niveles — ver el comentario de v3.34 al inicio del archivo para el
+// diseño completo. Todo lo de acá es cálculo local o consultas simples a
+// Postgres, sin llamados a Claude — barato, corre antes de la parte cara
+// del pipeline.
+
+function normalizarTextoParaHash(texto) {
+  return (texto || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function calcularHashDocumento(texto) {
+  return crypto.createHash('sha256').update(normalizarTextoParaHash(texto), 'utf8').digest('hex');
+}
+
+// Extrae solo los dígitos de un número oficial (decreto/ley/gaceta) para
+// que "Decreto 5.364" y "Decreto N° 5364" normalicen igual. Exige al
+// menos 3 dígitos — evita que un número suelto sin relación (ej. un año
+// de 2 cifras mal leído) dispare un falso positivo.
+function normalizarIdentificadorOficial(numeroOficial) {
+  if (!numeroOficial) return null;
+  const soloDigitos = String(numeroOficial).replace(/\D+/g, '');
+  return soloDigitos.length >= 3 ? soloDigitos : null;
+}
+
+function normalizarParaClaveBlanda(texto) {
+  if (!texto) return '';
+  return texto
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Clave "blanda" para documentos SIN número oficial (planes, programas,
+// políticas públicas). Exige título + institución como mínimo — con solo
+// el título es demasiado fácil coincidir por accidente. El período se
+// agrega si existe, para distinguir revisiones sucesivas del mismo plan
+// (ej. "2025-2031" vs. una futura "2031-2037").
+function calcularClaveBlanda(titulo, institucion, periodo) {
+  const t = normalizarParaClaveBlanda(titulo);
+  const inst = normalizarParaClaveBlanda(institucion);
+  if (!t || !inst) return null;
+  const p = normalizarParaClaveBlanda(periodo);
+  return [t, inst, p].filter(Boolean).join('|');
+}
+
+async function buscarDuplicadoPorHash(hashDocumento, auditoriaIdActual) {
+  const { rows } = await db.query(
+    `SELECT id, titulo_documento, link_reporte, link_podcast, link_presentacion, completada_en
+     FROM auditorias
+     WHERE hash_documento = $1 AND estado = 'completada' AND id != $2
+     LIMIT 1`,
+    [hashDocumento, auditoriaIdActual]
+  );
+  return rows[0] || null;
+}
+
+async function buscarDuplicadoPorIdentificador(identificadorNormalizado, auditoriaIdActual) {
+  if (!identificadorNormalizado) return null;
+  const { rows } = await db.query(
+    `SELECT id, titulo_documento, link_reporte, link_podcast, link_presentacion, completada_en
+     FROM auditorias
+     WHERE identificador_normalizado = $1 AND estado = 'completada' AND id != $2
+     LIMIT 1`,
+    [identificadorNormalizado, auditoriaIdActual]
+  );
+  return rows[0] || null;
+}
+
+// Devuelve varios (no solo uno) porque acá sí queremos mostrarle al
+// ciudadano todos los parecidos que encontremos, para que decida con la
+// mayor información posible.
+async function buscarDuplicadosBlandos(claveBlanda, auditoriaIdActual) {
+  if (!claveBlanda) return [];
+  const { rows } = await db.query(
+    `SELECT id, titulo_documento, link_reporte, link_podcast, link_presentacion, completada_en
+     FROM auditorias
+     WHERE clave_blanda_duplicado = $1 AND estado = 'completada' AND id != $2
+     ORDER BY completada_en DESC
+     LIMIT 5`,
+    [claveBlanda, auditoriaIdActual]
+  );
+  return rows;
+}
+
+// Token firmado para el link de "continuar de todos modos" del correo de
+// posible duplicado — mismo mecanismo que generarTokenOptOut(), pero
+// namespaced con el prefijo "continuar:" para que nunca pueda confundirse
+// con un token de otro propósito aunque el id de auditoría y el id de
+// ciudadano coincidieran por casualidad.
+function generarTokenContinuar(auditoriaId) {
+  return crypto.createHmac('sha256', WORKER_SECRET).update(`continuar:${auditoriaId}`).digest('hex');
+}
+
+function verificarTokenContinuar(auditoriaId, tokenRecibido) {
+  if (!auditoriaId || !tokenRecibido) return false;
+  const esperado = generarTokenContinuar(auditoriaId);
+  const bufA = Buffer.from(String(tokenRecibido));
+  const bufB = Buffer.from(esperado);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+async function enviarEmailDocumentoDuplicado(email, duplicado) {
+  const fecha = duplicado.completada_en
+    ? new Date(duplicado.completada_en).toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' })
+    : null;
+  const cuerpo = `<p>Hola,</p>
+       <p>El documento que subiste a Auditoría Cívica Liberal ya fue auditado anteriormente${fecha ? ` (el ${fecha})` : ''}: <strong>${duplicado.titulo_documento}</strong>. Para evitar auditorías repetidas del mismo documento, no lo volvimos a procesar — aquí tienes los materiales de esa auditoría:</p>
+       <ul>
+         ${duplicado.link_reporte      ? `<li><a href="${duplicado.link_reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
+         ${duplicado.link_podcast      ? `<li><a href="${duplicado.link_podcast}">🎙️ Podcast </a>(mp3)</li>` : ''}
+         ${duplicado.link_presentacion ? `<li><a href="${duplicado.link_presentacion}">📊 Presentación </a>(PDF)</li>` : ''}
+         <li><a href="https://liberalmente.app/auditoria/${duplicado.id}/grafo">🌐 Mapa Mental (Web, Grafo3D interactivo)</a></li>
+       </ul>
+       <p>Si crees que esto es un error — por ejemplo, si es una versión o reforma distinta del mismo documento — escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
+       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+    body: JSON.stringify({
+      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+      to: email,
+      subject: 'Este documento ya fue auditado',
+      html: cuerpo,
+    }),
+  });
+  if (!res.ok) throw new Error(`Error enviando email de documento duplicado: ${await res.text()}`);
+  console.log(`   ✅ Email de documento duplicado enviado a ${email}`);
+}
+
+async function enviarEmailPosibleDuplicado(email, auditoria_id, titulo, parecidos) {
+  const token = generarTokenContinuar(auditoria_id);
+  const linkContinuar = `${WORKER_URL_PUBLICO}/continuar-procesamiento?id=${auditoria_id}&token=${token}`;
+
+  const listaParecidos = parecidos.map(p => `
+       <li style="margin-bottom:10px">
+         <strong>${p.titulo_documento}</strong><br>
+         ${p.link_reporte      ? `<a href="${p.link_reporte}">📋 Reporte</a> ` : ''}
+         ${p.link_podcast      ? `<a href="${p.link_podcast}">🎙️ Podcast</a> ` : ''}
+         ${p.link_presentacion ? `<a href="${p.link_presentacion}">📊 Presentación</a>` : ''}
+       </li>`).join('');
+
+  const cuerpo = `<p>Hola,</p>
+       <p>Antes de auditar <strong>${titulo}</strong>, encontramos ${parecidos.length > 1 ? 'estos documentos parecidos' : 'este documento parecido'} ya auditados en la plataforma:</p>
+       <ul>${listaParecidos}</ul>
+       <p>Si tu documento es distinto (por ejemplo, una versión más reciente, o un plan de otra institución con un nombre parecido), puedes continuar con la auditoría de todas formas:</p>
+       <p><a href="${linkContinuar}" style="display:inline-block;background:#C41230;color:#fff;padding:10px 20px;border-radius:2px;text-decoration:none;font-weight:600">Sí, auditar mi documento de todas formas →</a></p>
+       <p>Si no haces nada, tu documento simplemente no se procesará.</p>
+       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+    body: JSON.stringify({
+      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+      to: email,
+      subject: '¿Confirmas que quieres auditar este documento?',
+      html: cuerpo,
+    }),
+  });
+  if (!res.ok) throw new Error(`Error enviando email de posible duplicado: ${await res.text()}`);
+  console.log(`   ✅ Email de posible duplicado enviado a ${email}`);
+}
+
+// Público, sin secreto — se abre directo desde el link "Sí, auditar mi
+// documento de todas formas" del correo de posible duplicado. Mismo
+// patrón que /notificaciones/optout: valida el token firmado, y si es
+// válido, relanza procesarAuditoria() desde cero — igual que hace
+// /reintentar-rechazada — pero con saltarDuplicados=true únicamente (el
+// filtro de admisibilidad SÍ se vuelve a correr; el ciudadano confirmó
+// que no es un duplicado, no que el documento sea admisible).
+app.get('/continuar-procesamiento', async (req, res) => {
+  const { id, token } = req.query;
+  if (!id || !token || !verificarTokenContinuar(id, token)) {
+    return res.status(400).type('text/html').send(
+      paginaOptOut('El enlace no es válido o está incompleto.')
+    );
+  }
+  try {
+    const result = await db.query(
+      `SELECT a.pdf_drive_id, c.email AS ciudadano_email
+       FROM auditorias a
+       JOIN ciudadanos c ON c.id = a.ciudadano_id
+       WHERE a.id = $1 AND a.estado = 'pendiente_confirmacion'`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).type('text/html').send(
+        paginaOptOut('Esta auditoría ya no está esperando confirmación — puede que ya se haya procesado, o el enlace haya caducado.')
+      );
+    }
+    const { pdf_drive_id, ciudadano_email } = result.rows[0];
+    if (!pdf_drive_id) {
+      return res.status(400).type('text/html').send(paginaOptOut('No se pudo continuar: falta el documento original.'));
+    }
+
+    await db.query(`UPDATE auditorias SET estado = 'admitida', admitida_en = NOW() WHERE id = $1`, [id]);
+
+    res.type('text/html').send(
+      paginaOptOut('¡Listo! Tu documento se está procesando. Te avisaremos por correo cuando la auditoría esté lista.')
+    );
+
+    procesarAuditoria(id, ciudadano_email, pdf_drive_id, false, true).catch(err => {
+      console.error(`❌ [${id}] Error reprocesando tras confirmación del ciudadano:`, err.message);
+    });
+
+  } catch (error) {
+    console.error('[continuar-procesamiento] Error:', error.message);
+    res.status(500).type('text/html').send(paginaOptOut('Hubo un problema procesando tu solicitud. Intenta de nuevo más tarde, o escríbenos desde el formulario de contacto.'));
+  }
+});
+
 // ── Función principal ────────────────────────────────────────────────────────
 
-async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, saltarFiltro = false) {
+async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, saltarFiltro = false, saltarDuplicados = false) {
   console.log(`\n🚀 [${auditoria_id}] Iniciando procesamiento`);
   const dir            = path.join(DIRECTORIO_TEMP, auditoria_id);
   const rutaPDF        = path.join(dir, 'original.pdf');
@@ -3012,6 +3270,32 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     const textoPDF = await extraerTextoPDF(rutaPDF);
     fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
     console.log(`✅ [${auditoria_id}] Texto extraído (${textoPDF.length} chars)`);
+
+    // El hash se calcula SIEMPRE (es local, sin costo) — así, aunque este
+    // chequeo se salte (saltarDuplicados=true), la auditoría igual queda
+    // con su propia huella guardada al completarse, para que auditorías
+    // futuras puedan compararse contra ella.
+    const hashDocumento = calcularHashDocumento(textoPDF);
+    if (!saltarDuplicados) {
+      console.log(`🔎 [${auditoria_id}] PASO 2.5: Verificando duplicado exacto (hash)...`);
+      try {
+        const duplicadoPorHash = await buscarDuplicadoPorHash(hashDocumento, auditoria_id);
+        if (duplicadoPorHash) {
+          await db.query(
+            `UPDATE auditorias
+             SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'documento_duplicado', rechazada_en = NOW()
+             WHERE id = $2`,
+            [`Documento idéntico a la auditoría ${duplicadoPorHash.id} ("${duplicadoPorHash.titulo_documento}").`, auditoria_id]
+          );
+          await enviarEmailDocumentoDuplicado(ciudadano_email, duplicadoPorHash);
+          console.log(`🔁 [${auditoria_id}] Rechazada — documento idéntico a ${duplicadoPorHash.id}`);
+          return;
+        }
+        console.log(`✅ [${auditoria_id}] Sin duplicado exacto`);
+      } catch (errorDuplicadoHash) {
+        console.error(`⚠️  [${auditoria_id}] No se pudo verificar duplicado por hash (no bloqueante — ¿falta migracion-deteccion-duplicados.sql?):`, errorDuplicadoHash.message);
+      }
+    }
 
     console.log(`📖 [${auditoria_id}] PASO 3: Leyendo configuración doctrinal...`);
     const config = await obtenerConfigDoctrinal();
@@ -3051,6 +3335,44 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
       [metadatos.titulo, metadatos.pais, metadatos.categoria, auditoria_id]
     );
     console.log(`✅ [${auditoria_id}] Metadatos: "${metadatos.titulo}"`);
+
+    // Igual que el hash: se calculan siempre (locales, sin costo), para
+    // que esta auditoría quede con sus propias claves guardadas al
+    // completarse, sin importar si el chequeo de abajo se saltó.
+    const identificadorNormalizado = normalizarIdentificadorOficial(metadatos.numeroOficial);
+    const claveBlanda = calcularClaveBlanda(metadatos.titulo, metadatos.institucionEmisora, metadatos.periodo);
+
+    if (!saltarDuplicados) {
+      console.log(`🔎 [${auditoria_id}] PASO 4.5: Verificando duplicado por identificador oficial / similitud...`);
+      try {
+        const duplicadoPorIdentificador = await buscarDuplicadoPorIdentificador(identificadorNormalizado, auditoria_id);
+        if (duplicadoPorIdentificador) {
+          await db.query(
+            `UPDATE auditorias
+             SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'documento_duplicado', rechazada_en = NOW()
+             WHERE id = $2`,
+            [`Mismo número oficial que la auditoría ${duplicadoPorIdentificador.id} ("${duplicadoPorIdentificador.titulo_documento}").`, auditoria_id]
+          );
+          await enviarEmailDocumentoDuplicado(ciudadano_email, duplicadoPorIdentificador);
+          console.log(`🔁 [${auditoria_id}] Rechazada — mismo número oficial que ${duplicadoPorIdentificador.id}`);
+          return;
+        }
+
+        const duplicadosBlandos = await buscarDuplicadosBlandos(claveBlanda, auditoria_id);
+        if (duplicadosBlandos.length > 0) {
+          await db.query(
+            `UPDATE auditorias SET estado = 'pendiente_confirmacion' WHERE id = $1`,
+            [auditoria_id]
+          );
+          await enviarEmailPosibleDuplicado(ciudadano_email, auditoria_id, metadatos.titulo, duplicadosBlandos);
+          console.log(`⏸️  [${auditoria_id}] Pendiente de confirmación — ${duplicadosBlandos.length} parecido(s) encontrado(s), esperando al ciudadano`);
+          return;
+        }
+        console.log(`✅ [${auditoria_id}] Sin duplicado por identificador ni por similitud`);
+      } catch (errorDuplicadoMetadatos) {
+        console.error(`⚠️  [${auditoria_id}] No se pudo verificar duplicado por identificador/similitud (no bloqueante — ¿falta migracion-deteccion-duplicados.sql?):`, errorDuplicadoMetadatos.message);
+      }
+    }
 
     console.log(`⏳ [${auditoria_id}] Esperando ventana de rate limit...`);
     await new Promise(r => setTimeout(r, 90_000));
@@ -3168,19 +3490,50 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	    const linkOriginal = await subirArchivo(drive, rutaPDF, `${identificadorLimpio}_original.pdf`, 'application/pdf', carpetaId);
 	    const linkReporte  = await subirArchivo(drive, rutaReportePDF, `Auditoria_de_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 
-	    await db.query(
-	      `UPDATE auditorias
-	       SET estado = 'completada',
-	           link_original = $1,
-	           link_reporte = $2,
-	           link_podcast = $3,
-	           link_presentacion = $4,
-	           drive_carpeta_id = $5,
-	           completada_en = NOW(),
-	           puntaje = $6
-	       WHERE id = $7`,
-	      [linkOriginal, linkReporte, linkPodcast, linkPresentacion, carpetaId, datosReporte.puntaje, auditoria_id]
-	    );
+	    try {
+	      await db.query(
+	        `UPDATE auditorias
+	         SET estado = 'completada',
+	             link_original = $1,
+	             link_reporte = $2,
+	             link_podcast = $3,
+	             link_presentacion = $4,
+	             drive_carpeta_id = $5,
+	             completada_en = NOW(),
+	             puntaje = $6,
+	             hash_documento = $7,
+	             identificador_normalizado = $8,
+	             clave_blanda_duplicado = $9,
+	             institucion_emisora = $10,
+	             periodo_documento = $11
+	         WHERE id = $12`,
+	        [linkOriginal, linkReporte, linkPodcast, linkPresentacion, carpetaId, datosReporte.puntaje,
+	         hashDocumento, identificadorNormalizado, claveBlanda, metadatos.institucionEmisora, metadatos.periodo,
+	         auditoria_id]
+	      );
+	    } catch (errorColumnasNuevas) {
+	      // Respaldo si migracion-deteccion-duplicados.sql todavía no se ha
+	      // corrido — la auditoría de todas formas ya hizo todo el trabajo
+	      // caro (análisis, podcast, presentación); no tiene sentido
+	      // marcarla 'fallida' solo porque faltan columnas de un chequeo
+	      // que es, por diseño, no bloqueante. Se completa sin esas 5
+	      // columnas; simplemente no queda huella para comparar contra
+	      // auditorías futuras hasta que se corra la migración.
+	      console.error(`⚠️  [${auditoria_id}] No se pudieron guardar las columnas de detección de duplicados (¿falta migracion-deteccion-duplicados.sql?), completando sin ellas:`, errorColumnasNuevas.message);
+	      await db.query(
+	        `UPDATE auditorias
+	         SET estado = 'completada',
+	             link_original = $1,
+	             link_reporte = $2,
+	             link_podcast = $3,
+	             link_presentacion = $4,
+	             drive_carpeta_id = $5,
+	             completada_en = NOW(),
+	             puntaje = $6
+	         WHERE id = $7`,
+	        [linkOriginal, linkReporte, linkPodcast, linkPresentacion, carpetaId, datosReporte.puntaje, auditoria_id]
+	      );
+	    }
     console.log(`✅ [${auditoria_id}] Archivos subidos a Drive`);
 
     console.log(`📧 [${auditoria_id}] PASO 8: Enviando email al ciudadano...`);
@@ -3307,12 +3660,12 @@ async function extraerMetadatos(textoPDF) {
   const muestra = textoPDF.slice(0, 3000);
   const respuesta = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 300,
-    system: `Eres un clasificador de documentos jurídicos. Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks.`,
+    max_tokens: 350,
+    system: `Eres un clasificador de documentos jurídicos y de políticas públicas. Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks.`,
     messages: [{
       role: 'user',
       content: `Analiza este fragmento y responde SOLO con este JSON:
-{"titulo":"título oficial completo","identificador":"versión muy corta, máx. 6 palabras, priorizando números de decreto/ley/gaceta si existen (ej: 'Decreto 5364 Gaceta 7039')","pais":"país o General","categoria":"pais|comparativo|doctrinal"}
+{"titulo":"título oficial completo","identificador":"versión muy corta, máx. 6 palabras, priorizando números de decreto/ley/gaceta si existen (ej: 'Decreto 5364 Gaceta 7039')","pais":"país o General","categoria":"pais|comparativo|doctrinal","numero_oficial":"el número de decreto, ley, resolución o gaceta EXACTO tal como aparece en el documento, solo si el documento lo declara explícitamente, o null si no tiene numeración oficial (ej: un plan o programa de gobierno sin número)","institucion_emisora":"nombre del ministerio, organismo o institución que emite el documento, o null si no se identifica con claridad","periodo":"el período, año o rango de años que cubre el documento tal como se declara (ej. '2025-2031'), o null si no se especifica"}
 
 Fragmento:\n${muestra}`,
   }],
@@ -3321,13 +3674,16 @@ Fragmento:\n${muestra}`,
     const limpio = extraerTextoRespuesta(respuesta).trim().replace(/```json|```/g, '').trim();
     const datos  = JSON.parse(limpio);
     return {
-      titulo:        datos.titulo        || 'Documento sin título',
-      identificador: datos.identificador || datos.titulo || 'Documento',
-      pais:          datos.pais          || 'General',
-      categoria:     ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria) ? datos.categoria : 'pais',
+      titulo:             datos.titulo             || 'Documento sin título',
+      identificador:      datos.identificador       || datos.titulo || 'Documento',
+      pais:               datos.pais                || 'General',
+      categoria:          ['pais', 'comparativo', 'doctrinal'].includes(datos.categoria) ? datos.categoria : 'pais',
+      numeroOficial:      datos.numero_oficial       || null,
+      institucionEmisora: datos.institucion_emisora  || null,
+      periodo:            datos.periodo              || null,
     };
   } catch {
-    return { titulo: 'Documento sin título', identificador: 'Documento', pais: 'General', categoria: 'pais' };
+    return { titulo: 'Documento sin título', identificador: 'Documento', pais: 'General', categoria: 'pais', numeroOficial: null, institucionEmisora: null, periodo: null };
   }
 }
 
@@ -3653,7 +4009,12 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.32 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.34 corriendo en puerto ${PORT}`);
+  console.log(`   NUEVO 11 ago: detección de duplicados en 3 niveles — hash exacto e identificador`);
+  console.log(`   oficial (rechazo automático con links, motivo 'documento_duplicado'); título+`);
+  console.log(`   institución+período sin número oficial (estado 'pendiente_confirmacion', el`);
+  console.log(`   ciudadano decide vía GET /continuar-procesamiento). Requiere`);
+  console.log(`   migracion-deteccion-duplicados.sql — sin ella, falla no bloqueante (se completa igual).`);
   console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
   console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
