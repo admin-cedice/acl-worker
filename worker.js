@@ -1,6 +1,22 @@
-// worker.js — ACL Worker v3.32
+// worker.js — ACL Worker v3.33
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.33 (11 ago 2026) — AVISO MASIVO A CIUDADANOS REGISTRADOS: cuando una
+// auditoría se completa, además del correo "Tu auditoría está lista" (al
+// que subió el documento), ahora se manda un aviso equivalente —
+// redacción en tercera persona, mismos 4 links — a todos los demás
+// ciudadanos activos (activo=true, en_lista_negra=false), en lotes de 100
+// vía POST /emails/batch de Resend (respeta el límite real de 2
+// solicitudes/segundo con una pausa entre lotes). Cada correo incluye un
+// link de baja individual (firmado con WORKER_SECRET, sin expiración —
+// no depende de sesión). Nuevo endpoint público GET
+// /notificaciones/optout. Requiere columna nueva
+// ciudadanos.recibir_notificaciones_auditorias (ver
+// migracion-notificaciones-ciudadanos.sql) — sin ella, el aviso masivo
+// falla de forma no bloqueante (mismo patrón que Podcast/Presentación/
+// Mapa Mental) y el resto del pipeline sigue igual. IMPORTANTE: correr la
+// migración ANTES de desplegar esta versión.
 //
 // v3.32 (5 ago 2026) — 4 MÉTRICAS NUEVAS en /metricas/resumen: tiempo
 // promedio del pipeline (admitida→completada), productos incompletos
@@ -346,6 +362,10 @@ const anthropic     = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const db            = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const DIRECTORIO_TEMP = '/tmp/acl-worker';
+// URL pública del worker en Railway — usada para armar el link de baja
+// (opt-out) que va en el correo del aviso masivo. Se abre directo en el
+// navegador desde el correo, sin pasar por el frontend. 11 ago 2026.
+const WORKER_URL_PUBLICO = 'https://acl-worker-production.up.railway.app';
 
 // ── Verificación de rol Superadmin (2 ago 2026) ──────────────────────────
 function decodificarBase64Url(segmento) {
@@ -1350,7 +1370,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.32', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.33', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -2948,6 +2968,29 @@ app.post('/manual/activar', async (req, res) => {
   }
 });
 
+// ── Baja de avisos masivos (11 ago 2026) ──────────────────────────────────
+// Público, sin secreto — se abre directo desde el link del correo, en un
+// navegador sin sesión. Idempotente: si ya estaba dado de baja, muestra
+// el mismo mensaje de confirmación sin error.
+app.get('/notificaciones/optout', async (req, res) => {
+  const { id, token } = req.query;
+  if (!id || !token || !verificarTokenOptOut(id, token)) {
+    return res.status(400).type('text/html').send(
+      paginaOptOut('El enlace no es válido o está incompleto. Si quieres darte de baja de los avisos, escríbenos desde <a href="https://liberalmente.app/#contacto">el formulario de contacto</a>.')
+    );
+  }
+  try {
+    await db.query(`UPDATE ciudadanos SET recibir_notificaciones_auditorias = false WHERE id = $1`, [id]);
+    console.log(`   [notificaciones/optout] ${id} dado de baja de avisos masivos`);
+    res.type('text/html').send(
+      paginaOptOut('Listo — ya no recibirás avisos cuando otros ciudadanos completen una auditoría. Seguirás recibiendo el correo de tus propias auditorías.')
+    );
+  } catch (error) {
+    console.error('[notificaciones/optout] Error:', error.message);
+    res.status(500).type('text/html').send(paginaOptOut('Hubo un problema procesando tu solicitud. Intenta de nuevo más tarde.'));
+  }
+});
+
 // ── Función principal ────────────────────────────────────────────────────────
 
 async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, saltarFiltro = false) {
@@ -3141,13 +3184,23 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`✅ [${auditoria_id}] Archivos subidos a Drive`);
 
     console.log(`📧 [${auditoria_id}] PASO 8: Enviando email al ciudadano...`);
-	    const ciudadanoInfo = await db.query(`SELECT nombre FROM ciudadanos WHERE email = $1`, [ciudadano_email]);
+	    const ciudadanoInfo = await db.query(`SELECT id, nombre FROM ciudadanos WHERE email = $1`, [ciudadano_email]);
+	    const ciudadanoId = ciudadanoInfo.rows[0]?.id || null;
 	    const nombreCiudadano = ciudadanoInfo.rows[0]?.nombre || null;
-	    await enviarEmailFinal(ciudadano_email, nombreCiudadano, metadatos.titulo, auditoria_id, {
+	    const linksProductos = {
 	      reporte: linkReporte,
 	      podcast: linkPodcast,
 	      presentacion: linkPresentacion,
-    });
+	    };
+	    await enviarEmailFinal(ciudadano_email, nombreCiudadano, metadatos.titulo, auditoria_id, linksProductos);
+
+	    console.log(`📣 [${auditoria_id}] PASO 8.5: Avisando a otros ciudadanos registrados...`);
+	    try {
+	      await enviarAvisoAuditoriaATodos(ciudadanoId, metadatos.titulo, auditoria_id, linksProductos);
+	    } catch (errorAvisoMasivo) {
+	      console.error(`⚠️  [${auditoria_id}] No se pudo enviar el aviso masivo (no bloqueante):`, errorAvisoMasivo.message);
+	    }
+
     console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
 
   } catch (error) {
@@ -3393,6 +3446,115 @@ async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links) {
   console.log(`   ✅ Email final enviado a ${email}`);
 }
 
+// ── Aviso masivo a ciudadanos registrados (11 ago 2026) ──────────────────
+// Cuando una auditoría se completa, además del correo de arriba (a quien
+// subió el documento), se avisa a todos los demás ciudadanos activos.
+// Requiere ciudadanos.recibir_notificaciones_auditorias (ver
+// migracion-notificaciones-ciudadanos.sql) — sin esa columna, la consulta
+// de abajo lanza un error que el llamador (procesarAuditoria, PASO 8.5)
+// atrapa sin bloquear el resto del pipeline.
+
+function generarTokenOptOut(ciudadanoId) {
+  return crypto.createHmac('sha256', WORKER_SECRET).update(String(ciudadanoId)).digest('hex');
+}
+
+function verificarTokenOptOut(ciudadanoId, tokenRecibido) {
+  if (!ciudadanoId || !tokenRecibido) return false;
+  const esperado = generarTokenOptOut(ciudadanoId);
+  const bufA = Buffer.from(String(tokenRecibido));
+  const bufB = Buffer.from(esperado);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function esperarMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+const RESEND_BATCH_URL = 'https://api.resend.com/emails/batch';
+const TAMANO_LOTE_RESEND = 100;    // límite real de Resend por llamada al endpoint /emails/batch
+const PAUSA_ENTRE_LOTES_MS = 600;  // Resend: 2 solicitudes/segundo compartidas por cuenta
+
+// Avisa a todos los ciudadanos registrados (menos quien subió el
+// documento) de que hay una auditoría nueva. SIEMPRE se llama envuelta en
+// try/catch desde procesarAuditoria() — un fallo acá nunca debe afectar
+// el estado "completada" de la auditoría ni el correo normal al ciudadano.
+async function enviarAvisoAuditoriaATodos(ciudadanoExcluidoId, titulo, auditoria_id, links) {
+  const { rows: destinatarios } = await db.query(
+    `SELECT id, nombre, email
+     FROM ciudadanos
+     WHERE activo = true
+       AND en_lista_negra = false
+       AND recibir_notificaciones_auditorias = true
+       AND ($1::uuid IS NULL OR id != $1)`,
+    [ciudadanoExcluidoId]
+  );
+
+  if (destinatarios.length === 0) {
+    console.log(`   [${auditoria_id}] Aviso masivo: no hay otros ciudadanos que notificar`);
+    return;
+  }
+
+  const emails = destinatarios.map(c => {
+    const primerNombre = c.nombre ? c.nombre.split(' ')[0] : null;
+    const saludo = primerNombre ? `Hola, ${primerNombre}.` : 'Hola,';
+    const tokenOptOut = generarTokenOptOut(c.id);
+    const linkOptOut = `${WORKER_URL_PUBLICO}/notificaciones/optout?id=${c.id}&token=${tokenOptOut}`;
+
+    return {
+      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+      to: c.email,
+      subject: '🎉 Una nueva auditoría está lista',
+      html: `
+        <p>${saludo}</p>
+        <p>Una nueva auditoría ciudadana, esta vez sobre <strong>${titulo}</strong>, está lista. Aquí están los materiales:</p>
+        <ul>
+          ${links.reporte      ? `<li><a href="${links.reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
+          ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Podcast </a>(mp3)</li>` : ''}
+          ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Presentación </a>(PDF)</li>` : ''}
+          <li><a href="https://liberalmente.app/auditoria/${auditoria_id}/grafo">🌐 Mapa Mental (Web, Grafo3D interactivo)</a></li>
+        </ul>
+        <p>Si quieres compartir este correo con otras personas, ¡no dudes en reenviárselos!</p>
+        <p>Saludos,</p>
+        <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>
+        <p style="font-size:12px;color:#888">Si no quisieras continuar recibiendo auditorías hechas por otros ciudadanos, <a href="${linkOptOut}">haz click aquí</a>.</p>
+      `,
+    };
+  });
+
+  for (let i = 0; i < emails.length; i += TAMANO_LOTE_RESEND) {
+    const lote = emails.slice(i, i + TAMANO_LOTE_RESEND);
+    const numeroLote = Math.floor(i / TAMANO_LOTE_RESEND) + 1;
+    const res = await fetch(RESEND_BATCH_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify(lote),
+    });
+    if (!res.ok) {
+      console.error(`   [${auditoria_id}] Aviso masivo: falló el lote ${numeroLote} (${lote.length} correos): ${await res.text()}`);
+    } else {
+      console.log(`   [${auditoria_id}] Aviso masivo: lote ${numeroLote} enviado (${lote.length} correos)`);
+    }
+    if (i + TAMANO_LOTE_RESEND < emails.length) {
+      await esperarMs(PAUSA_ENTRE_LOTES_MS);
+    }
+  }
+
+  console.log(`   [${auditoria_id}] Aviso masivo: ${emails.length} ciudadano(s) notificado(s) en total`);
+}
+
+function paginaOptOut(mensaje) {
+  return `<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"><title>Auditoría Cívica Liberal</title>
+<style>body{font-family:Arial,sans-serif;max-width:480px;margin:80px auto;text-align:center;color:#1A1A1A;padding:0 20px}
+a{color:#C41230}</style></head>
+<body>
+  <h2 style="color:#C41230">Auditoría Cívica Liberal</h2>
+  <p>${mensaje}</p>
+  <p><a href="https://liberalmente.app">Volver a liberalmente.app</a></p>
+</body></html>`;
+}
+
 async function enviarEmailRechazo(email, motivo) {
   const cuerpos = {
     no_pertinente: `<p>Hola,</p>
@@ -3495,8 +3657,11 @@ app.listen(PORT, () => {
   console.log(`   ROLES: exigirSuperadmin() protege /manual, /prompts (subir-version, activar),`);
   console.log(`   /pesos/actualizar, /prompts-productos/guardar y /contactos-apoyo/* — requiere`);
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
-  console.log(`   Pasos automáticos: 1-8 (PDF→análisis→reporte→Drive→completada→email)`);
+  console.log(`   Pasos automáticos: 1-8.5 (PDF→análisis→reporte→Drive→completada→email→aviso masivo)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
+  console.log(`   NUEVO 11 ago: PASO 8.5 avisa a todos los ciudadanos activos (no bloqueante) — requiere`);
+  console.log(`   ciudadanos.recibir_notificaciones_auditorias (migracion-notificaciones-ciudadanos.sql).`);
+  console.log(`   Baja individual: GET /notificaciones/optout (público, link firmado sin expiración)`);
   console.log(`   NUEVO 4 ago: prompts_productos conectado al pipeline real (mapa_articulos en PASO 6.5,`);
   console.log(`   podcast_generador_voces/reglas + podcast_revisor_criterios en PASO 6.6)`);
   console.log(`   NUEVO 4 ago: contactos_apoyo conectado a la Presentación (PASO 6.7) — cae a DUMMY solo`);
