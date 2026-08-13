@@ -79,6 +79,17 @@
 // protegidas que generarIdeasActivismoTotal() — nunca editables). Ver el
 // changelog completo del lado de generarPresentacionPDF.js (v3.0) para
 // cómo se conecta esto a las láminas reales.
+//
+// v7 (13 ago 2026) — FIX: generarIdeasActivismoTotal() cortaba por
+// max_tokens (2000) en documentos con 4+ alertas/muchos criterios NO
+// aplicables al caso total — el modelo necesitaba más espacio para las
+// 3-5 ideas completas de lo que dejaba el límite viejo. Mismo tipo de
+// ajuste que ya se le hizo a analizarConClaude() en worker.js (subir el
+// tope), a una escala mucho menor: acá solo se generan unas pocas ideas
+// cortas, no el análisis completo de un documento. Subido de 2000 a 4000
+// — no se tocó generarIdeaActivismoCriterio() (el caso híbrido, una idea
+// a la vez, max_tokens 1000), porque no hay evidencia de que ese haya
+// fallado nunca por este motivo.
 
 'use strict';
 
@@ -267,7 +278,7 @@ async function generarIdeasActivismoTotal(datos, metadatos, veredicto, auditoria
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 2000,
+    max_tokens: 4000,
     messages: [{ role: 'user', content: prompt }],
     output_config: {
       format: { type: 'json_schema', schema: SCHEMA_IDEAS_ACTIVISMO_TOTAL },
@@ -275,7 +286,7 @@ async function generarIdeasActivismoTotal(datos, metadatos, veredicto, auditoria
   });
 
   if (response.stop_reason === 'max_tokens') {
-    throw new Error(`generarIdeasActivismoTotal [${auditoria_id}]: respuesta cortada por max_tokens (2000) — subir el límite.`);
+    throw new Error(`generarIdeasActivismoTotal [${auditoria_id}]: respuesta cortada por max_tokens (4000) — subir el límite.`);
   }
   if (response.stop_reason === 'refusal') {
     throw new Error(`generarIdeasActivismoTotal [${auditoria_id}]: Claude rehusó generar las ideas (stop_reason: refusal).`);
