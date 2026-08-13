@@ -1891,18 +1891,30 @@ app.post('/prompts/subir-version', async (req, res) => {
     return res.status(400).json({ error: 'Faltan campos requeridos (version, prompt_sistema, prompt_analisis)' });
   }
   try {
+    // 12 ago 2026: la nueva versión arranca con los pesos de la versión
+    // activa en este momento, en vez de vacía (que hacía que /admin/pesos
+    // mostrara todo en 1 después de cada "Activar"). Sigue siendo editable
+    // desde /admin/pesos como siempre — esto solo cambia el punto de
+    // partida. Si algún id de la versión anterior ya no existe en la
+    // nueva (ej. una reestructuración del Test), ese peso sobrante
+    // simplemente no se usa — GET /pesos solo lee los ids que vienen de
+    // CRITERIO_A_CATEGORIA, así que un peso "huérfano" en el JSON no
+    // rompe nada ni hace falta limpiarlo a mano.
+    const pesosVersionActiva = await obtenerPesosCriterios();
+
     const result = await db.query(
       `INSERT INTO configuracion_doctrinal
-         (version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, fuentes_activas, basado_en_manual_version, archivo_pdf, activo, creado_en, actualizado_en)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, NOW(), NOW())
+         (version, prompt_sistema, prompt_analisis, prompt_semantico, prompt_admisibilidad, fuentes_activas, basado_en_manual_version, archivo_pdf, pesos_criterios, activo, creado_en, actualizado_en)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, NOW(), NOW())
        RETURNING id, version`,
       [version, prompt_sistema, prompt_analisis, prompt_semantico || null, prompt_admisibilidad || null,
        fuentes_activas ? JSON.stringify(fuentes_activas) : null,
        basado_en_manual_version || null,
-       pdf_base64 || null]
+       pdf_base64 || null,
+       JSON.stringify(pesosVersionActiva)]
     );
-    console.log(`   Nueva versión de prompts creada (inactiva): ${result.rows[0].version}${pdf_base64 ? ' — con PDF' : ' — sin PDF'}`);
-    res.json({ ok: true, id: result.rows[0].id, version: result.rows[0].version, tiene_pdf: !!pdf_base64 });
+    console.log(`   Nueva versión de prompts creada (inactiva): ${result.rows[0].version}${pdf_base64 ? ' — con PDF' : ' — sin PDF'} — pesos heredados de la versión activa (${Object.keys(pesosVersionActiva).length} criterios)`);
+    res.json({ ok: true, id: result.rows[0].id, version: result.rows[0].version, tiene_pdf: !!pdf_base64, pesos_heredados: Object.keys(pesosVersionActiva).length });
   } catch (error) {
     console.error('❌ Error subiendo versión de prompts:', error.message);
     res.status(500).json({ error: error.message });
