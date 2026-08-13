@@ -2295,7 +2295,7 @@ const SCHEMA_CRITERIOS_TEST = {
       items: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: 'Código del criterio, formato "C-01" a "C-28", tal como aparece en el texto.' },
+          id: { type: 'string', description: 'Código del criterio, formato "C-01" a "C-39", tal como aparece en el texto.' },
           pregunta: { type: 'string', description: 'El enunciado completo y exacto de la pregunta de este criterio, tal como aparece en el texto — no lo resumas ni lo parafrasees.' },
         },
         required: ['id', 'pregunta'],
@@ -2313,7 +2313,7 @@ async function extraerCriteriosDelTest(promptAnalisis) {
     max_tokens: 4000,
     messages: [{
       role: 'user',
-      content: `El siguiente es el prompt de análisis (Test de Libertad) de una plataforma de auditoría cívica liberal. Extrae cada uno de los criterios que contiene, con su código (C-01 a C-28) y el enunciado EXACTO de la pregunta, sin resumir ni parafrasear.\n\nPROMPT DE ANÁLISIS:\n${promptAnalisis}`,
+      content: `El siguiente es el prompt de análisis (Test de Libertad) de una plataforma de auditoría cívica liberal. Extrae cada uno de los criterios que contiene, con su código (C-01 a C-39) y el enunciado EXACTO de la pregunta, sin resumir ni parafrasear.\n\nPROMPT DE ANÁLISIS:\n${promptAnalisis}`,
     }],
     output_config: {
       format: { type: 'json_schema', schema: SCHEMA_CRITERIOS_TEST },

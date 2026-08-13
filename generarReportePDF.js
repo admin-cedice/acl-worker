@@ -187,19 +187,22 @@ const NUMEROS_CATEGORIA = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX
 // no es un problema de arquitectura abierto, es una actualización acotada
 // y conocida, igual que esta.
 const CRITERIO_A_CATEGORIA = (() => {
+  // 13 ago 2026 — actualizado para el Test corregido (39 criterios, sin el
+  // duplicado C-11 ni los saltos que tenía la versión anterior). Ver
+  // conversación del 12-13 ago para el detalle de cómo se recalculó cada rango.
   const rangos = {
     I:    [1, 4],
     II:   [5, 9],
-    III:  [10, 13],
-    IV:   [14, 16],
-    V:    [17, 19],
-    VI:   [20, 26],
+    III:  [10, 14],
+    IV:   [15, 17],
+    V:    [18, 20],
+    VI:   [21, 26],
     VII:  [27, 28],
-    VIII: [29, 32],
-    IX:   [33, 34],
-    X:    [35, 36],
-    XI:   [37, 38],
-    XII:  [39, 40],
+    VIII: [29, 31],
+    IX:   [32, 33],
+    X:    [34, 35],
+    XI:   [36, 37],
+    XII:  [38, 39],
   };
   const mapa = {};
   for (const [num, [desde, hasta]] of Object.entries(rangos)) {
@@ -218,7 +221,7 @@ function schemaCriterios() {
       properties: {
         id: {
           type: 'string',
-          description: 'Código del criterio, formato "C-01" a "C-40".',
+          description: 'Código del criterio, formato "C-01" a "C-39".',
         },
         pregunta: {
           type: 'string',
@@ -840,7 +843,7 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
     // Solo puede pasar si Claude inventa un id fuera de C-01..C-40 —
     // no debería ocurrir, pero si pasa, mejor que quede visible en el log
     // a que el criterio desaparezca en silencio.
-    console.warn(`   ⚠️ [${auditoria_id}] Criterios con id no reconocido (no mapean a C-01..C-40): ${sinMapeoConocido.join(', ')}`);
+    console.warn(`   ⚠️ [${auditoria_id}] Criterios con id no reconocido (no mapean a C-01..C-39): ${sinMapeoConocido.join(', ')}`);
   }
 
   // Orden interno estable dentro de cada categoría, sin importar el orden
@@ -865,9 +868,9 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
   console.log(`   ║ DIAGNÓSTICO [${auditoria_id}] (salida estructurada)`);
   console.log(`   ╠══════════════════════════════════════════════════`);
   console.log(`   ║ Categorías : ${categorias.length} (se esperan 12)`);
-  console.log(`   ║ Criterios  : ${todos.length} (se esperan 40)`);
-  if (todos.length !== 40) {
-    console.warn(`   ⚠️ [${auditoria_id}] Se esperaban 40 criterios en total, llegaron ${todos.length}.`);
+  console.log(`   ║ Criterios  : ${todos.length} (se esperan 39)`);
+    if (todos.length !== 39) {
+      console.warn(`   ⚠️ [${auditoria_id}] Se esperaban 39 criterios en total, llegaron ${todos.length}.`);
   }
   categorias.forEach(cat => console.log(`   ║   Cat. ${cat.num.padEnd(3)}: ${cat.criterios.length} criterios`));
   console.log(`   ╠──────────────────────────────────────────────────`);
@@ -1069,7 +1072,7 @@ function generarHTML(datos, metadatos) {
   } = metadatos;
 
   const criteriosParseados  = categorias.reduce((acc, cat) => acc + cat.criterios.length, 0);
-  const totalCriterios      = criteriosParseados || 40;
+  const totalCriterios      = criteriosParseados || 39;
   const criteriosDetectados = criteriosParseados > 0;
 
   const desgloseFicha = criteriosDetectados
