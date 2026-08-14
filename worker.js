@@ -3372,6 +3372,8 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
   // rutaPDF ya no es fija — ahora depende de si el documento es PDF o TXT
   // (ver PASO 1 más abajo, descargarYExtraerTexto()). 14 ago 2026.
   const rutaTXT        = path.join(dir, 'original.txt');
+  const rutaReporte    = path.join(dir, 'reporte.txt');
+  const rutaReportePDF = path.join(dir, 'reporte.pdf');
   fs.mkdirSync(dir, { recursive: true });
   try {
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando documento...`);
