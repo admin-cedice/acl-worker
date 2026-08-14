@@ -1461,7 +1461,7 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.35', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.36', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
@@ -1497,11 +1497,9 @@ app.get('/regenerar-grafo', async (req, res) => {
     const pesosCriterios = await obtenerPesosCriterios();
     const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, pesosCriterios);
 
-    const rutaPDF = path.join(dir, 'original.pdf');
     const driveAuth = autenticarDrive();
-    const drive = google.drive({ version: 'v3', auth: driveAuth });
-    await descargarPDF(drive, pdf_drive_id, rutaPDF);
-    const textoPDF = await extraerTextoPDF(rutaPDF);
+	const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const { texto: textoPDF } = await descargarYExtraerTexto(drive, pdf_drive_id, dir); // soporta PDF o TXT, 14 ago 2026
 
     // 4 ago 2026: se lee el prompt personalizado de "mapa_articulos" antes
     // de llamar a generarGrafoConClaude() — si no hay ninguno guardado
@@ -3371,21 +3369,19 @@ app.get('/continuar-procesamiento', async (req, res) => {
 async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, saltarFiltro = false, saltarDuplicados = false) {
   console.log(`\n🚀 [${auditoria_id}] Iniciando procesamiento`);
   const dir            = path.join(DIRECTORIO_TEMP, auditoria_id);
-  const rutaPDF        = path.join(dir, 'original.pdf');
+  // rutaPDF ya no es fija — ahora depende de si el documento es PDF o TXT
+  // (ver PASO 1 más abajo, descargarYExtraerTexto()). 14 ago 2026.
   const rutaTXT        = path.join(dir, 'original.txt');
-  const rutaReporte    = path.join(dir, 'reporte.txt');
-  const rutaReportePDF = path.join(dir, 'reporte.pdf');
   fs.mkdirSync(dir, { recursive: true });
   try {
-    console.log(`📥 [${auditoria_id}] PASO 1: Descargando PDF...`);
-    const driveAuth = autenticarDrive();
-    const drive = google.drive({ version: 'v3', auth: driveAuth });
-    await descargarPDF(drive, pdf_drive_id, rutaPDF);
-    console.log(`✅ [${auditoria_id}] PDF descargado`);
+    console.log(`📥 [${auditoria_id}] PASO 1: Descargando documento...`);
+	const driveAuth = autenticarDrive();
+	const drive = google.drive({ version: 'v3', auth: driveAuth });
+	const { texto: textoPDF, esTexto: esArchivoTexto, rutaOriginal: rutaDocumentoOriginal } = await descargarYExtraerTexto(drive, pdf_drive_id, dir);
+	console.log(`✅ [${auditoria_id}] Documento descargado (${esArchivoTexto ? 'TXT' : 'PDF'})`);
 
-    console.log(`📝 [${auditoria_id}] PASO 2: Extrayendo texto...`);
-    const textoPDF = await extraerTextoPDF(rutaPDF);
-    fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
+	console.log(`📝 [${auditoria_id}] PASO 2: Texto listo (${esArchivoTexto ? 'ya venía en texto plano' : 'extraído del PDF'})`);
+	fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
     console.log(`✅ [${auditoria_id}] Texto extraído (${textoPDF.length} chars)`);
 
     // El hash se calcula SIEMPRE (es local, sin costo) — así, aunque este
@@ -3617,7 +3613,9 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     }
 
     console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo original y reporte a Drive...`);
-	    const linkOriginal = await subirArchivo(drive, rutaPDF, `${identificadorLimpio}_original.pdf`, 'application/pdf', carpetaId);
+		const nombreOriginal = `${identificadorLimpio}_original.${esArchivoTexto ? 'txt' : 'pdf'}`;
+		const mimeOriginal   = esArchivoTexto ? 'text/plain' : 'application/pdf';
+		const linkOriginal = await subirArchivo(drive, rutaDocumentoOriginal, nombreOriginal, mimeOriginal, carpetaId);
 	    const linkReporte  = await subirArchivo(drive, rutaReportePDF, `Auditoria_de_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 
 	    try {
@@ -3783,6 +3781,36 @@ async function extraerTextoPDF(rutaPDF) {
   const buffer = fs.readFileSync(rutaPDF);
   const data   = await pdfParse(buffer);
   return data.text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// ── Soporte para documentos .txt, además de PDF (14 ago 2026) ────────────
+// Pedido de Moisés: algunos PDF pesan demasiado por gráficos decorativos,
+// pero convertidos a .txt sí se pueden auditar. En vez de cambiar el
+// contrato entre /api/generar-auditoria y /procesar (que solo manda
+// pdf_drive_id, nada de tipo de archivo), el worker le pregunta a Drive
+// directamente qué tipo de archivo es, justo antes de descargarlo — así
+// no hace falta tocar la base de datos ni el frontend más allá de dejarlo
+// seleccionar .txt en /subir (ya hecho).
+async function obtenerTipoArchivoDrive(drive, fileId) {
+  const { data } = await drive.files.get({ fileId, fields: 'mimeType, name' });
+  const esTexto = data.mimeType === 'text/plain' || (data.name || '').toLowerCase().endsWith('.txt');
+  return { esTexto, nombre: data.name || '' };
+}
+
+// Descarga el documento original (PDF o TXT, decidido con
+// obtenerTipoArchivoDrive) y devuelve su texto ya extraído — el PDF sigue
+// usando pdfParse() exactamente como siempre; el TXT se lee directo, sin
+// ninguna librería. Devuelve también esTexto y la ruta real usada, porque
+// procesarAuditoria() los necesita más adelante (PASO 7) para volver a
+// subir el original a Drive con el nombre y tipo correctos.
+async function descargarYExtraerTexto(drive, fileId, dir) {
+  const { esTexto } = await obtenerTipoArchivoDrive(drive, fileId);
+  const rutaOriginal = path.join(dir, esTexto ? 'original-subido.txt' : 'original.pdf');
+  await descargarPDF(drive, fileId, rutaOriginal); // descargarPDF() es un descargador genérico de bytes, pese al nombre — sirve igual para un .txt
+  const texto = esTexto
+    ? fs.readFileSync(rutaOriginal, 'utf8').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+    : await extraerTextoPDF(rutaOriginal);
+  return { texto, esTexto, rutaOriginal };
 }
 
 async function extraerMetadatos(textoPDF) {
