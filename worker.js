@@ -1664,9 +1664,10 @@ app.get('/regenerar-podcast', async (req, res) => {
 
     console.log(`   [REGENERAR-PODCAST] Generando guion y audio para: ${titulo_documento}`);
     const resultadoGuion = await generarYRevisarGuion(
-      datosReporte,
-      { titulo: titulo_documento, pais: pais || '' },
-      textoVoces, textoReglas, textoCriteriosRevisor
+	  datosReporte,
+	  { titulo: titulo_documento, pais: pais || '' },
+	  pesosCriterios,
+	  textoVoces, textoReglas, textoCriteriosRevisor
     );
     const rutaMp3 = path.join(dir, 'podcast.mp3');
     const fraseDinamica = `Hoy nos ocupamos de: ${titulo_documento}.`;
@@ -3610,9 +3611,10 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	        obtenerPromptProducto('podcast_revisor_criterios'),
 	      ]);
 	      const resultadoGuion = await generarYRevisarGuion(
-	        datosReporte,
-	        { titulo: metadatos.titulo, pais: metadatos.pais || '' },
-	        textoVoces, textoReglas, textoCriteriosRevisor
+		  	datosReporte,
+		    { titulo: metadatos.titulo, pais: metadatos.pais || '' },
+		  	pesosCriterios,
+		  	textoVoces, textoReglas, textoCriteriosRevisor
 	      );
 	      const rutaMp3 = path.join(dir, 'podcast.mp3');
 	      const fraseDinamica = `Hoy nos ocupamos de: ${metadatos.titulo}.`;

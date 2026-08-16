@@ -41,6 +41,41 @@
 // saltar a ese techo ya probado en vez de subir a un número intermedio
 // que quizás tampoco alcanzara, para no gastar un tercer ciclo de prueba
 // con el mismo documento.
+//
+// v7 (16 ago 2026) — FIX: caso real (Programa de Gobierno presidido por
+// María Corina Machado) donde grafo_datos.enlaces salió vacío ([]) pese a
+// que la auditoría sí tenía 39 nodos de criterio — la Presentación,
+// alimentada con total=0, mostraba "RECHAZAR 100%" para un documento que
+// el Reporte calificó con 87% de alineación. Causa raíz: PROMPT_GRAFO_RESPALDO
+// (REGLA 1) solo sabía reconocer "Art. N" — un programa de gobierno
+// organizado en Ejes/Programas/secciones con nombre, sin artículos
+// numerados, no calzaba con ese patrón, así que Claude devolvió una lista
+// de componentes vacía. Esto no era un caso aislado: afectaba a TODO
+// documento organizado por ejes/programas en vez de artículos.
+//
+// Fix: REGLA 1 ahora reconoce dos tipos de componente — artículos
+// numerados (como antes) O, si el documento no los usa, la unidad
+// organizativa real del propio documento (ejes, programas, secciones con
+// nombre propio), instrucción explícita de nunca devolver una lista vacía
+// (como último recurso, el título completo del documento cuenta como
+// único componente). SCHEMA_GRAFO actualizado en dos puntos (descripción
+// de "articulos" y de su subcampo "id") para reflejar lo mismo. Nota
+// aparte, no resuelta en este cambio: si existe un prompt personalizado
+// guardado en prompts_productos bajo la clave "mapa_articulos", ese texto
+// sobreescribe este respaldo — revisar/actualizar también ese texto en
+// /admin, o este fix no tiene efecto para esa auditoría en particular.
+//
+// (16 ago 2026, nota de arquitectura): calcularResumenHorizontes() —
+// junto con la agrupación por horizonte (en_contra/neutral/a_favor) que
+// alimentaba— queda SUPERADA como fuente de cualquier decisión de
+// contenido: el Podcast y la Presentación ahora seleccionan qué destacar
+// con seleccionarPuntosDestacados() (generarActivismo.js), que usa el
+// puntaje ya calculado del Reporte y ya no depende de grafo_datos/enlaces
+// para decidir nada. calcularResumenHorizontes() se deja intacta, sin
+// llamarse desde ningún punto activo del pipeline — mismo criterio que ya
+// se usa en este proyecto con otro código superado (normalizarComponentes(),
+// generarGrafoComponentes(), etc.): no se borra, por si hace falta
+// retomarla o compararla más adelante.
 
 'use strict';
 
@@ -175,18 +210,22 @@ Responde con un título por cada artículo de la lista, usando exactamente el mi
 // siendo el texto por defecto si prompts_productos no tiene todavía la
 // clave "mapa_articulos", pero ahora generarGrafoConClaude() puede recibir
 // un texto personalizado desde /admin/productos-comunicacionales.
+// FIX (16 ago 2026, v7): ver el changelog completo al inicio del archivo —
+// REGLA 1 y dos descripciones del schema actualizadas para reconocer
+// estructuras "ad hoc" (ejes, programas, secciones) en documentos que no
+// usan artículos numerados.
 const SCHEMA_GRAFO = {
   type: 'object',
   properties: {
     articulos: {
       type: 'array',
-      description: 'Cada artículo, numeral fusionado con su padre, o disposición (Final/Transitoria) real de ESTE documento que fue citado en al menos un criterio del análisis.',
+      description: 'Cada componente real de ESTE documento (artículo, numeral fusionado con su padre, disposición Final/Transitoria, o —si el documento no usa artículos— eje, programa o sección con nombre propio) que fue citado en al menos un criterio del análisis. Nunca vacío — ver REGLA 1 del prompt.',
       items: {
         type: 'object',
         properties: {
           id: {
             type: 'string',
-            description: 'Identificador corto, ej. "Art. 7" o "Art. 64 (Disposiciones Finales)". Siempre el número DE ESTE documento, nunca el de una ley externa que mencione.',
+            description: 'Identificador corto del componente — "Art. N" para artículos numerados, o el nombre/número real tal como aparece en el documento para otras unidades (ejes, programas, secciones). Siempre DE ESTE documento, nunca de una ley externa que mencione, y nunca inventado.',
           },
           titulo: {
             type: 'string',
@@ -228,22 +267,25 @@ const SCHEMA_GRAFO = {
   additionalProperties: false,
 };
 
-const PROMPT_GRAFO_RESPALDO = `Eres un asistente que prepara los datos de un grafo visual para una auditoría cívica liberal (liberalmente.app). Tu tarea tiene dos partes: identificar los artículos reales de ESTE documento que fueron citados en el análisis, y mapear qué criterios cita cada uno.
+const PROMPT_GRAFO_RESPALDO = `Eres un asistente que prepara los datos de un grafo visual para una auditoría cívica liberal (liberalmente.app). Tu tarea tiene dos partes: identificar los componentes reales de ESTE documento que fueron citados en el análisis, y mapear qué criterios cita cada uno.
 
-REGLA 1 — Qué SÍ es un artículo real de este documento:
-Un artículo, o una disposición (Final o Transitoria) del propio documento que se está auditando. Usa como id "Art. N" (ej. "Art. 7"), o "Art. N (Disposiciones Finales)" / "Art. N (Disposiciones Transitorias)" si la disposición pertenece a esa sección específica — esas secciones suelen reiniciar su propia numeración, así que "Art. 64 (Disposiciones Finales)" y "Art. 64 (Disposiciones Transitorias)" son DOS artículos distintos que comparten número, no se fusionan entre sí.
+REGLA 1 — Qué SÍ es un componente real de este documento:
+La unidad estructural en la que el propio documento organiza su contenido.
+- Si el documento usa artículos numerados (leyes, decretos, reglamentos), el componente es el artículo, o una disposición (Final o Transitoria) del propio documento. Usa como id "Art. N" (ej. "Art. 7"), o "Art. N (Disposiciones Finales)" / "Art. N (Disposiciones Transitorias)" si la disposición pertenece a esa sección específica — esas secciones suelen reiniciar su propia numeración, así que "Art. 64 (Disposiciones Finales)" y "Art. 64 (Disposiciones Transitorias)" son DOS componentes distintos que comparten número, no se fusionan entre sí.
+- Si el documento NO usa artículos numerados (por ejemplo, un programa de gobierno, un plan o una política pública organizada en ejes, programas, secciones o capítulos con nombre propio), el componente es esa unidad tal como el documento la nombra — ej. "Eje 2 - Estabilización Expansiva", "Programa de gas domiciliario", "Sección 3.1". Usa el nombre o número real del documento como id, abreviado a lo esencial (máximo ~8 palabras) si el título original es largo. Nunca inventes un componente que no exista en el texto, y nunca fuerces el formato "Art. N" sobre un documento que no lo usa.
+Todo documento tiene alguna unidad organizativa citable — nunca respondas con una lista de componentes vacía. Si genuinamente no encuentras ninguna subdivisión con nombre propio, usa como único componente el título del documento completo.
 
-REGLA 2 — Qué NO es un artículo (no le asignes id, no aparece en la lista):
-- La Exposición de Motivos (es el preámbulo explicativo, no establece reglas de juego).
-- Citas a leyes o artículos externos a este documento (ej. "artículo 82 de la Constitución").
+REGLA 2 — Qué NO es un componente (no le asignes id, no aparece en la lista):
+- La Exposición de Motivos o el preámbulo (no establece reglas de juego, es explicativo).
+- Citas a leyes, artículos o instrumentos externos a este documento (ej. "artículo 82 de la Constitución").
 
 REGLA 3 — Numerales: si una cita menciona un numeral específico de un artículo (ej. "numeral 8"), el nodo sigue siendo el artículo completo — el numeral es contexto para escribir mejor el título, nunca crea un nodo aparte.
 
-REGLA 4 — Leyes de reforma: si el documento modifica, suprime o agrega artículos a una ley ya vigente, el id del nodo es SIEMPRE el número del artículo DE ESTE documento de reforma — nunca el número del artículo de la ley vigente que menciona (ese va en "articulo_referido"). Marca "accion" y "articulo_referido" según corresponda para cada artículo. Si el documento no es una reforma de nada, todos los artículos llevan accion "ninguna" y articulo_referido vacío.
+REGLA 4 — Leyes de reforma: si el documento modifica, suprime o agrega artículos a una ley ya vigente, el id del nodo es SIEMPRE el número del artículo DE ESTE documento de reforma — nunca el número del artículo de la ley vigente que menciona (ese va en "articulo_referido"). Marca "accion" y "articulo_referido" según corresponda para cada artículo. Si el documento no es una reforma de nada, o el componente no es un artículo (ej. es un eje o programa), todos llevan accion "ninguna" y articulo_referido vacío.
 
-Para cada artículo real identificado, escribe un título corto (6 a 10 palabras) que resuma en lenguaje llano qué establece, basándote en el texto real del documento — no inventes ni generalices. Si accion no es "ninguna", el título debe decirlo explícitamente.
+Para cada componente real identificado, escribe un título corto (6 a 10 palabras) que resuma en lenguaje llano qué establece, basándote en el texto real del documento — no inventes ni generalices. Si accion no es "ninguna", el título debe decirlo explícitamente.
 
-Luego, para cada criterio de la lista de abajo, indica cuáles de los artículos que identificaste lo respaldan, usando exactamente los mismos ids que les asignaste arriba.`;
+Luego, para cada criterio de la lista de abajo, indica cuáles de los componentes que identificaste lo respaldan, usando exactamente los mismos ids que les asignaste arriba.`;
 
 async function generarGrafoConClaude(textoPDF, datos, auditoria_id = 'N/A', promptPersonalizado = null) {
   const criterios = datos.categorias.flatMap(cat => cat.criterios);
@@ -367,7 +409,12 @@ function calcularDatosGrafo(datos, analisisGrafo = { articulos: [], citas: [] },
   return { nodos, enlaces };
 }
 
-// ── En uso — resumen por horizonte (Presentación) ─────────────────────────
+// ── SUPERADA (16 ago 2026) — resumen por horizonte ────────────────────────
+// Ya no alimenta ninguna decisión de contenido activa (ver nota de
+// arquitectura en el changelog, arriba). Se deja intacta, sin llamarse
+// desde ningún punto activo del pipeline, por si hace falta retomarla o
+// compararla más adelante — mismo criterio que ya se usa en este proyecto
+// con otro código superado.
 const HORIZONTE_POR_RESULTADO = {
   'NO': 'en_contra',
   'SI_MATIZ': 'neutral',

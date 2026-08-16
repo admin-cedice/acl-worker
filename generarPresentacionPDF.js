@@ -3,31 +3,70 @@
 //
 // [... changelog anterior sin cambios, ver versiones previas del archivo ...]
 //
-// v2.7 (4 ago 2026) — CONTACTOS DE APOYO REALES:
-// generarPresentacionPDF() acepta ahora un séptimo parámetro opcional
-// `contactosApoyo` — el arreglo real que worker.js lee de la tabla nueva
-// contactos_apoyo (vía obtenerContactosApoyoActivos()), la misma que
-// alimenta /admin/contactos-apoyo. Si llega con al menos un contacto, se
-// usa tal cual. Si no llega, o llega vacío (tabla recién creada, sin
-// sembrar todavía), se cae a obtenerContactosApoyo() de generarActivismo.js
-// —los datos DUMMY que ya existían— con una advertencia explícita en el
-// log, para que nunca se generen Presentaciones con datos de prueba sin
-// que quede rastro de que pasó.
+// v2.7 (4 ago 2026) — CONTACTOS DE APOYO REALES.
+// v2.9 (9 ago 2026) — SE ELIMINAN LOS DESCALIFICADORES.
+// v3.0 (10 ago 2026) — CASO HÍBRIDO CON IDEAS REALES.
 //
-// v2.9 (9 ago 2026) — SE ELIMINAN LOS DESCALIFICADORES: quitado el bloque
-// que forzaba `veredicto` a { modo: 'rechazo_total', alineacionPorcentaje: 0 }
-// cuando `datos.descalificado` venía en true (campo que ya no existe en el
-// objeto que devuelve generarReportePDF.js v4.6). El veredicto de esta
-// Presentación ahora sale siempre y únicamente de
-// calcularVeredictoActivismo(resumenHorizontes) — mismo criterio acordado
-// con Roberto y Moisés para el puntaje del Reporte. `veredicto` pasa de
-// `let` a `const`, ya que no vuelve a reasignarse en ningún punto.
+// v4.0 (16 ago 2026) — SE RETIRA EL VEREDICTO BINARIO, SELECCIÓN
+// PROPORCIONAL PARA TODOS LOS CASOS:
+//
+// Motivo: un caso real (programa de gobierno, 87% de alineación en el
+// Reporte) mostró "RECHAZAR 100%" en la portada de esta Presentación. La
+// causa inmediata fue un fallo en el reconocimiento de artículos (ver
+// generarDatosGrafo.js v7) — pero la causa de fondo era de diseño: el
+// veredicto (rechazo_total/promocion_total/hibrido, calcularVeredictoActivismo())
+// dependía enteramente de grafo_datos/enlaces, así que CUALQUIER fallo en
+// ese reconocimiento (pasado o futuro) podía producir una recomendación
+// que no reflejara ningún análisis real. Además, el concepto de
+// "horizontes" (en_contra/neutral/a_favor) que alimentaba ese cálculo
+// quedó descartado como diseño — ningún producto lo usa ya.
+//
+// Rediseño (decisión de Moisés, 16 ago 2026): la Presentación deja de
+// calcular un veredicto binario. En su lugar, usa
+// seleccionarPuntosDestacados() (generarActivismo.js) — la misma función
+// que ahora también usa el Podcast — para elegir siempre 10 puntos
+// (positivos y negativos), en la misma proporción que la alineación
+// general del documento (el mismo datos.puntaje que ya muestra el
+// Reporte, NUNCA grafo_datos/enlaces). Se genera una idea de activismo
+// real por cada punto (generarIdeaActivismoCriterio(), sin cambios en su
+// propia lógica) — hacia el rechazo si el criterio dio NO, hacia la
+// mejora si dio SÍ con matiz, hacia la promoción si dio SÍ pleno. Un
+// documento con 87% de alineación ahora muestra 9 ideas para defender lo
+// que funciona y 1 para corregir lo que no — nunca "RECHAZAR 100%".
+//
+// Portada: el título ya no dice "RECHAZAR/APOYAR 100%" — dice
+// "Alineación Liberal: XX%. Ideas de Activismo" (texto aprobado por
+// Moisés), con el mismo color semántico de siempre (rojo/dorado/verde)
+// según el rango del porcentaje, ya sin ninguna decisión de contenido
+// atada a ese color.
+//
+// Parámetro `grafoDatos` (quinto, sin cambios de posición): se sigue
+// aceptando por compatibilidad con worker.js (procesarAuditoria y
+// /regenerar-presentacion lo siguen pasando tal cual), pero ya NO se usa
+// para nada — queda reservado por si más adelante se decide mostrar, como
+// enriquecimiento opcional, qué artículos respaldan cada punto. Ningún
+// llamador necesita cambiar.
+//
+// SUPERADAS por este cambio, dejadas intactas sin llamarse (mismo
+// criterio que ya usa este proyecto con otro código superado):
+// calcularVeredictoActivismo(), calcularResumenHorizontes(),
+// generarIdeasActivismoTotal(), seleccionarCriteriosHibridos() — ver el
+// changelog completo en generarActivismo.js v8 y generarDatosGrafo.js.
+// Dentro de este archivo: generarTituloRecomendacionGeneral(),
+// generarLaminasVeredictoTotalHTML(), generarSeccionActivismoHTML() y
+// generarLaminasHibridoHTML() se retiran (no eran parte de la superficie
+// pública del módulo, no hay nada externo que dependa de ellas) — su
+// lógica se unifica en la nueva generarLaminasIdeasHTML(), que cubre
+// todos los casos por igual. HORIZONTES, AREA_POR_RESULTADO y
+// calcularSeccionesHorizonte() (dead code ya desde antes de este cambio,
+// solo usado por generarLaminasHallazgosHTML(), que tampoco se llama
+// desde generarHTML()) quedan intactos sin tocar.
 
 'use strict';
 
 const fs = require('fs');
-const { calcularDatosGrafo, calcularResumenHorizontes, etiquetaCortaComponente } = require('./generarDatosGrafo');
-const { calcularVeredictoActivismo, generarIdeasActivismoTotal, seleccionarCriteriosHibridos, generarIdeaActivismoCriterio, obtenerContactosApoyo } = require('./generarActivismo');
+const { etiquetaCortaComponente } = require('./generarDatosGrafo');
+const { seleccionarPuntosDestacados, generarIdeaActivismoCriterio, obtenerContactosApoyo } = require('./generarActivismo');
 
 function esc(str) {
   if (!str) return '';
@@ -57,6 +96,12 @@ const ILUSTRACION_POR_CATEGORIA = {
   coaliciones:               'activismo-coaliciones.png',
 };
 
+// ── SUPERADO / dead code, sin tocar (ver nota en el changelog de arriba) ──
+// HORIZONTES y AREA_POR_RESULTADO ya no alimentan la portada ni la sección
+// de Activismo desde el v4.0 — quedan porque calcularSeccionesHorizonte()
+// y generarLaminasHallazgosHTML() (más abajo) los siguen usando, y esos
+// dos ya eran dead code desde antes de este cambio (generarHTML() no los
+// llama — ver nota histórica: "LÁMINA DE HALLAZGOS ILUSTRADOS — RETIRADA").
 const HORIZONTES = [
   { key: 'en_contra', nombre: 'EN CONTRA', color: '#C41230', colorTexto: '#791F1F', fondo: '#FFF5F6' },
   { key: 'neutral',   nombre: 'NEUTRAL',   color: '#B8860B', colorTexto: '#633806', fondo: '#F8F3E6' },
@@ -89,11 +134,13 @@ function partirEnBloques(lista, tam) {
   return bloques;
 }
 
-function generarTituloRecomendacionGeneral(veredicto) {
-  if (veredicto.modo === 'rechazo_total') return 'Recomendación General: RECHAZAR 100% A ESTE INSTRUMENTO.';
-  if (veredicto.modo === 'promocion_total') return 'Recomendación General: APOYAR 100% A ESTE INSTRUMENTO.';
-  return 'Recomendación General: EJECUTAR ACCIONES DE RECHAZO, MEJORA O APOYO, A NIVEL DE ARTÍCULOS ESPECÍFICOS.';
-}
+// ── EN USO (16 ago 2026) — tipo y color de idea, directo por resultado ───
+// Reemplaza a TIPO_ACTIVISMO_POR_HORIZONTE/COLOR_POR_HORIZONTE/ORDEN_HORIZONTE
+// del v3.0 (que pasaban por AREA_POR_RESULTADO) — ahora es un único paso,
+// sin el concepto de horizonte de por medio.
+const TIPO_ACTIVISMO_POR_RESULTADO  = { NO: 'rechazo', SI_MATIZ: 'mejora', SI: 'promocion' };
+const COLOR_ACTIVISMO_POR_RESULTADO = { NO: '#C41230', SI_MATIZ: '#B8860B', SI: '#2E7D32' };
+const ORDEN_TIPO_ACTIVISMO          = { rechazo: 0, mejora: 1, promocion: 2 };
 
 const CSS = `
   @page { size: A4 landscape; margin: 14mm 16mm; }
@@ -192,10 +239,13 @@ const CSS = `
   .contacto-descripcion { font-size: 13px; color: #8A8478; margin-top: 5px; }
 `;
 
-function generarPortadaHTML(titulo, pais, generadoEl, veredicto) {
-  const color = veredicto.modo === 'rechazo_total' ? '#C41230'
-    : veredicto.modo === 'promocion_total' ? '#2E7D32'
-    : '#B8860B';
+// ── Portada (16 ago 2026, v4.0) — ya no muestra un veredicto binario ─────
+// El color sigue el mismo semáforo de siempre (rojo/dorado/verde) según el
+// rango del porcentaje, pero ya no está atado a ninguna decisión de
+// contenido — es puramente visual, igual que en el Reporte.
+function generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje) {
+  const color = alineacionPorcentaje < 20 ? '#C41230' : alineacionPorcentaje > 80 ? '#2E7D32' : '#B8860B';
+  const tituloHero = `Alineación Liberal: ${alineacionPorcentaje}%. Ideas de Activismo`;
 
   return `
 <div class="portada-pres">
@@ -213,7 +263,7 @@ function generarPortadaHTML(titulo, pais, generadoEl, veredicto) {
     <div class="portada-subtitulo">${esc(pais)}</div>
   </div>
   <div class="portada-hero">
-    <h2 class="recomendacion-general" style="color:${color}">${esc(generarTituloRecomendacionGeneral(veredicto))}</h2>
+    <h2 class="recomendacion-general" style="color:${color}">${esc(tituloHero)}</h2>
     <div class="motto">
       <div class="motto-linea1">Defiende la libertad.</div>
       <div class="motto-linea2">Audita el poder.</div>
@@ -222,6 +272,7 @@ function generarPortadaHTML(titulo, pais, generadoEl, veredicto) {
 </div>`;
 }
 
+// ── SUPERADO / dead code, sin tocar — no se llama desde generarHTML() ────
 function generarTarjetaCriterioHTML(c, articulos) {
   const src = `${RUTA_BASE_IMAGENES}/${esc(c.id)}.png`;
   const marcador = c.resultado === 'NO'
@@ -276,57 +327,28 @@ function generarLaminaIdeaHTML(idea, numero, total, color) {
 </div>`;
 }
 
-function generarLaminasVeredictoTotalHTML(veredicto, ideas) {
-  const color = veredicto.modo === 'rechazo_total' ? '#C41230' : '#2E7D32';
-  const lista = ideas || [];
-  return lista.map((idea, i) => generarLaminaIdeaHTML(idea, i + 1, lista.length, color)).join('\n');
-}
-
-const TIPO_ACTIVISMO_POR_HORIZONTE = { en_contra: 'rechazo', neutral: 'mejora', a_favor: 'promocion' };
-
-// v6.0 (10 ago 2026) — CASO HÍBRIDO CON IDEAS REALES: reemplaza a
-// generarLaminaActivismoHorizonteHTML() (listaba TODOS los criterios
-// aplicables de cada horizonte, con un texto de relleno en vez de una
-// idea real — el hueco documentado desde el 22 de julio). Ahora recibe
-// directamente la lista de ideas ya generadas por criterio (ver
-// seleccionarCriteriosHibridos() y generarIdeaActivismoCriterio() en
-// generarActivismo.js) y reutiliza generarLaminaIdeaHTML() — la misma
-// lámina de una idea por página, con ilustración, que ya usa el caso
-// total — coloreando cada una según el horizonte real de su propio
-// criterio (rojo=rechazo, dorado=mejora, verde=promoción), no un solo
-// color fijo para toda la Presentación como en el caso total. Orden:
-// rechazo primero, mejora, promoción al final — mismo criterio de
-// urgencia que ya usa el resto de la Presentación.
-const COLOR_POR_HORIZONTE = { en_contra: '#C41230', neutral: '#B8860B', a_favor: '#2E7D32' };
-const ORDEN_HORIZONTE = { en_contra: 0, neutral: 1, a_favor: 2 };
-
-function generarLaminasHibridoHTML(ideasConCriterio) {
+// ── EN USO (16 ago 2026) — una lámina por idea, para TODOS los casos ─────
+// Reemplaza a generarLaminasVeredictoTotalHTML() + generarSeccionActivismoHTML()
+// + generarLaminasHibridoHTML() del v3.0 — antes había una rama para el
+// caso "total" (color único para toda la Presentación) y otra para el
+// caso "híbrido" (color por criterio). Ahora solo existe este camino:
+// siempre una idea por criterio, siempre coloreada según su propio
+// resultado. Orden: rechazo primero, mejora, promoción al final — mismo
+// criterio de urgencia que ya usaba el caso híbrido.
+function generarLaminasIdeasHTML(ideasConCriterio) {
   const lista = ideasConCriterio || [];
   const ordenadas = [...lista].sort((a, b) => {
-    const ha = AREA_POR_RESULTADO[a.resultado], hb = AREA_POR_RESULTADO[b.resultado];
-    return (ORDEN_HORIZONTE[ha] ?? 9) - (ORDEN_HORIZONTE[hb] ?? 9);
+    const ta = TIPO_ACTIVISMO_POR_RESULTADO[a.resultado] || 'promocion';
+    const tb = TIPO_ACTIVISMO_POR_RESULTADO[b.resultado] || 'promocion';
+    return (ORDEN_TIPO_ACTIVISMO[ta] ?? 9) - (ORDEN_TIPO_ACTIVISMO[tb] ?? 9);
   });
   return ordenadas.map((item, i) => {
-    const horizonte = AREA_POR_RESULTADO[item.resultado];
-    const color = COLOR_POR_HORIZONTE[horizonte] || '#8A8478';
+    const color = COLOR_ACTIVISMO_POR_RESULTADO[item.resultado] || '#8A8478';
     return generarLaminaIdeaHTML(item.idea, i + 1, ordenadas.length, color);
   }).join('\n');
 }
 
-function generarSeccionActivismoHTML(veredicto, ideasActivismoTotal, ideasActivismoHibrido) {
-  if (veredicto.modo !== 'hibrido') {
-    return generarLaminasVeredictoTotalHTML(veredicto, ideasActivismoTotal);
-  }
-  return generarLaminasHibridoHTML(ideasActivismoHibrido);
-}
-
-// ── Lámina de contacto ────────────────────────────────────────────────
-// v2.7 (4 ago 2026): ya no asume que la lista es siempre DUMMY — el
-// banner amarillo de aviso ahora solo aparece si de verdad se está usando
-// el respaldo (ver la lógica en generarPresentacionPDF() más abajo, que
-// decide entre datos reales y DUMMY antes de llegar aquí). Esta función
-// recibe la lista ya decidida y un flag `esDummy` para saber si mostrar
-// el aviso.
+// ── Lámina de contacto — sin cambios ──────────────────────────────────────
 function generarLaminaContactoHTML(contactos, esDummy) {
   const itemsHTML = (contactos || []).map(c => `
     <div class="contacto-item">
@@ -356,10 +378,10 @@ function generarLaminaContactoHTML(contactos, esDummy) {
 
 function generarHTML(datos, metadatos, contexto) {
   const { titulo = 'Documento auditado', pais = '', generadoEl = '' } = metadatos;
-  const { veredicto, ideasActivismoTotal, ideasActivismoHibrido, contactosApoyo, contactosSonDummy } = contexto;
+  const { alineacionPorcentaje, ideasConCriterio, contactosApoyo, contactosSonDummy } = contexto;
 
-  const portadaHTML   = generarPortadaHTML(titulo, pais, generadoEl, veredicto);
-  const activismoHTML = generarSeccionActivismoHTML(veredicto, ideasActivismoTotal, ideasActivismoHibrido);
+  const portadaHTML   = generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje);
+  const activismoHTML = generarLaminasIdeasHTML(ideasConCriterio);
   const contactoHTML  = generarLaminaContactoHTML(contactosApoyo, contactosSonDummy);
 
   return `<!DOCTYPE html>
@@ -491,72 +513,28 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 }
 
 // ── Función principal exportada ───────────────────────────────────────────
-// v2.7 (4 ago 2026): séptimo parámetro opcional `contactosApoyo` — ver
-// changelog arriba. Se usa si trae al menos un contacto; si no, se cae al
-// respaldo DUMMY de generarActivismo.js, con aviso explícito en el log Y
-// en la propia lámina (el banner amarillo solo aparece cuando de verdad
-// son datos de prueba).
-// v2.8 (4 ago 2026) — ESTILO DE ACTIVISMO EDITABLE: octavo parámetro
-// opcional `promptsActivismo` — objeto { estiloPersona, reglasGeneracion }
-// que worker.js arma leyendo prompts_productos ("presentacion_activismo_estilo"
-// y "presentacion_activismo_reglas") y pasa tal cual a
-// generarIdeasActivismoTotal(). Si no llega (objeto vacío por defecto),
-// generarActivismo.js usa sus propios textos de respaldo — comportamiento
-// idéntico al de antes de este cambio.
-// v2.9 (9 ago 2026) — ver changelog arriba: ya no se lee `datos.descalificado`
-// en ningún punto de esta función.
-// v3.0 (10 ago 2026) — CASO HÍBRIDO CON IDEAS REALES: hasta ahora, un
-// documento híbrido (ni rechazo ni apoyo total) mostraba un texto de
-// relleno ("[PENDIENTE...]") por cada criterio aplicable — hueco
-// documentado desde el 22 de julio, expuesto por primera vez hoy con la
-// primera auditoría real que cayó en esa banda. Se genera ahora 1 idea
-// real por criterio, para hasta 7 criterios (1 por cada una de las 7
-// categorías doctrinales con más criterios, el de mayor peso dentro de
-// cada una — decisión de Moisés: "la Presentación no debe ser
-// exhaustiva"). Ver seleccionarCriteriosHibridos() y
-// generarIdeaActivismoCriterio() en generarActivismo.js (v6).
+// Firma SIN CAMBIOS respecto al v3.0 — ningún llamador en worker.js
+// necesita modificarse por esto. `grafoDatos` (quinto parámetro) se sigue
+// aceptando pero ya no se usa — ver el changelog v4.0 al inicio del
+// archivo.
 async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}, contactosApoyo = null, promptsActivismo = {}) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v3.0`);
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v4.0`);
 
-  let enlaces;
-  if (grafoDatos && Array.isArray(grafoDatos.enlaces)) {
-    enlaces = grafoDatos.enlaces;
-    console.log(`   [${auditoria_id}] Usando grafo real recibido: ${enlaces.length} enlaces`);
-  } else {
-    console.warn(`   ⚠️ [${auditoria_id}] generarPresentacionPDF: no se recibió un grafo real (grafoDatos) — el veredicto de activismo se calculará con 0 enlaces, lo cual SIEMPRE da RECHAZO TOTAL sin importar el documento. Revisar si el Paso 6.5 falló para esta auditoría, o si el llamador todavía no pasa grafoDatos.`);
-    enlaces = calcularDatosGrafo(datos).enlaces;
-  }
+  const seleccion = seleccionarPuntosDestacados(datos, pesosCriterios);
+  console.log(`   [${auditoria_id}] Alineación: ${seleccion.alineacionPorcentaje}% — puntos seleccionados: ${seleccion.negativos.length} negativo(s), ${seleccion.positivos.length} positivo(s)`);
 
-  const resumenHorizontes = calcularResumenHorizontes(enlaces, pesosCriterios);
-  const veredicto = calcularVeredictoActivismo(resumenHorizontes);
-
-  let ideasActivismoTotal = null;
-  let ideasActivismoHibrido = null;
-  if (veredicto.modo !== 'hibrido') {
-    console.log(`   [${auditoria_id}] Generando ideas de activismo (${veredicto.modo})...`);
-    ideasActivismoTotal = await generarIdeasActivismoTotal(
-      datos, metadatos, veredicto, auditoria_id,
-      promptsActivismo.estiloPersona, promptsActivismo.reglasGeneracion
-    );
-    console.log(`   [${auditoria_id}] ${ideasActivismoTotal.length} ideas generadas`);
-  } else {
-    // v6.0 (10 ago 2026): caso híbrido con ideas reales — hasta 7
-    // criterios (1 por cada una de las 7 categorías doctrinales con más
-    // criterios, el de mayor peso dentro de cada una). Ver el changelog
-    // completo en generarActivismo.js.
-    const seleccionados = seleccionarCriteriosHibridos(datos, pesosCriterios);
-    console.log(`   [${auditoria_id}] Caso híbrido: generando ${seleccionados.length} idea(s) puntual(es), 1 por categoría entre las 7 con más criterios...`);
-    ideasActivismoHibrido = await Promise.all(
-      seleccionados.map(({ criterio, categoriaDoctrinal }) => {
-        const tipo = TIPO_ACTIVISMO_POR_HORIZONTE[AREA_POR_RESULTADO[criterio.resultado]];
-        return generarIdeaActivismoCriterio(
-          criterio, categoriaDoctrinal, metadatos, tipo, auditoria_id,
-          promptsActivismo.estiloPersona, promptsActivismo.reglasGeneracion
-        );
-      })
-    );
-    console.log(`   [${auditoria_id}] ${ideasActivismoHibrido.length} idea(s) híbrida(s) generada(s)`);
-  }
+  const todosLosPuntos = [...seleccion.negativos, ...seleccion.positivos];
+  console.log(`   [${auditoria_id}] Generando ${todosLosPuntos.length} idea(s) de activismo (una por punto, en paralelo)...`);
+  const ideasConCriterio = await Promise.all(
+    todosLosPuntos.map(({ criterio, categoriaDoctrinal }) => {
+      const tipo = TIPO_ACTIVISMO_POR_RESULTADO[criterio.resultado] || 'promocion';
+      return generarIdeaActivismoCriterio(
+        criterio, categoriaDoctrinal, metadatos, tipo, auditoria_id,
+        promptsActivismo.estiloPersona, promptsActivismo.reglasGeneracion
+      );
+    })
+  );
+  console.log(`   [${auditoria_id}] ${ideasConCriterio.length} idea(s) generada(s)`);
 
   // Contactos reales si worker.js mandó al menos uno; si no, respaldo DUMMY
   // — y se deja constancia clara de cuál de los dos casos fue.
@@ -567,7 +545,10 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
   }
 
   const html = generarHTML(datos, metadatos, {
-    veredicto, ideasActivismoTotal, ideasActivismoHibrido, contactosApoyo: contactos, contactosSonDummy,
+    alineacionPorcentaje: seleccion.alineacionPorcentaje,
+    ideasConCriterio,
+    contactosApoyo: contactos,
+    contactosSonDummy,
   });
   const rutaHTML = rutaSalida.replace('.pdf', '.html');
   fs.writeFileSync(rutaHTML, html, 'utf8');

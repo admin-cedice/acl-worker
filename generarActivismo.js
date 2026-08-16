@@ -1,95 +1,83 @@
 // generarActivismo.js — ACL Worker
 // Umbusk LLC · Auditoría Cívica Liberal
 //
-// v2 (22 jul 2026) — primera generación real de contenido. Hasta ahora
-// este archivo solo calculaba el veredicto (puro, sin llamados a Claude);
-// generarIdeasActivismoTotal() es la primera pieza que sí le pide algo a
-// Claude — mismo patrón de aislamiento que generarTitulosArticulos() en
-// generarDatosGrafo.js: un llamado chico y separado del análisis
-// principal, para que un fallo acá no tumbe el resto del pipeline.
+// v2 (22 jul 2026) — primera generación real de contenido.
+// v3 (31 jul 2026) — FIX + PESOS.
+// v5 (4 ago 2026) — ESTILO EDITABLE DESDE ADMIN, DATOS Y SEGURIDAD PROTEGIDOS.
+// v4 (4 ago 2026) — obtenerContactosApoyo() PASA A SER RESPALDO.
+// v6 (10 ago 2026) — CASO HÍBRIDO, PRIMERA VERSIÓN REAL.
+// v7 (13 ago 2026) — FIX max_tokens generarIdeasActivismoTotal().
+// [... ver versiones previas del archivo para el detalle completo de cada
+// una de las entradas de arriba, sin cambios ...]
 //
-// Alcance de esta v2 (decidido con Moisés, 22 jul 2026): solo el caso
-// TOTAL (rechazo_total / promocion_total — fuera de la banda 20%-80%).
-// El caso híbrido (artículo por artículo: hasta 3 "En contra" a
-// rechazar, hasta 3 "Neutros" a mejorar, hasta 3 "A favor" a promover,
-// cada uno con 3-5 ideas) queda para una siguiente sesión — es un
-// llamado más grande porque primero hay que seleccionar cuáles artículos
-// importan más, y hoy no hay ningún campo de gravedad/severidad en el
-// schema para guiar esa selección (era del pptx viejo, superado) — sería
-// puro criterio de Claude leyendo el análisis de cada uno.
+// v8 (16 ago 2026) — HORIZONTES DESCARTADOS, SELECCIÓN PROPORCIONAL ÚNICA
+// PARA PODCAST Y PRESENTACIÓN:
 //
-// v3 (31 jul 2026) — FIX + PESOS: calcularVeredictoActivismo() ahora usa
-// neutral.peso / a_favor.peso en vez de neutral.cantidad / a_favor.cantidad
-// cuando esos campos vienen presentes en resumenHorizontes (ver
-// calcularResumenHorizontes() en generarDatosGrafo.js v2 — suma ponderada
-// por los pesos de criterios de /admin/pesos, en vez de contar enlaces
-// crudos). Con fallback a .cantidad si algún llamador todavía pasa un
-// resumenHorizontes sin .peso, para no romper nada. De paso: se descubrió
-// (31 jul 2026) que generarPresentacionPDF.js llamaba a esta función
-// pasando SIEMPRE un resumenHorizontes con total=0 (por un bug ajeno a
-// este archivo — ver el fix en generarPresentacionPDF.js v2.5 y
-// worker.js v3.12), lo cual hacía que el veredicto fuera RECHAZO TOTAL en
-// el 100% de las Presentaciones generadas hasta hoy, sin importar el
-// documento. Esta función en sí nunca tuvo el bug — solo recibía datos
-// vacíos de su llamador.
+// Contexto del cambio: el diseño de "3 horizontes" (en_contra/neutral/
+// a_favor, calcularResumenHorizontes() en generarDatosGrafo.js) quedó
+// descartado como concepto — ningún producto lo usa ya. Además, el
+// veredicto de la Presentación (calcularVeredictoActivismo(), 3 modos:
+// rechazo_total/promocion_total/hibrido, umbral 20%/80%) dependía por
+// completo de grafo_datos/enlaces — lo cual produjo un bug real:
+// grafo_datos.enlaces vacío (por una causa AJENA a este archivo — ver el
+// fix en generarDatosGrafo.js v7) hacía que total=0, y total=0 caía
+// siempre en "rechazo_total" por defecto, sin haber analizado nada. Caso
+// real: un programa de gobierno con 87% de alineación en el Reporte
+// mostró "RECHAZAR 100%" en la Presentación.
 //
-// v5 (4 ago 2026) — ESTILO EDITABLE DESDE ADMIN, DATOS Y SEGURIDAD
-// PROTEGIDOS: generarIdeasActivismoTotal() ahora acepta estiloPersona y
-// reglasGeneracion opcionales (worker.js los lee de prompts_productos,
-// claves "presentacion_activismo_estilo" y "presentacion_activismo_reglas").
-// Solo se expusieron dos fragmentos genuinamente de estilo, sin dato y sin
-// riesgo — la frase de apertura y las reglas de generación no relacionadas
-// con seguridad. A propósito NO se expusieron: el menú de 14 tácticas
-// (MENU_TACTICAS_ACTIVISMO, acoplado al enum de CATEGORIAS_ACTIVISMO en el
-// schema — editarlo sin tocar el código desincronizaría ambos), ni las dos
-// reglas de seguridad de contenido (no violencia, no testimonios
-// fabricados) — esas siguen siempre fijas, en la misma posición, sin
-// importar qué haya guardado en la base de datos. Mismo patrón de
-// TEXTO_..._RESPALDO que ya usan generarDatosGrafo.js y
-// generarGuionPresentacion.js.
+// Decisión de Moisés (16 ago 2026): en vez de parchear ese caso límite,
+// se rediseña el mecanismo de fondo. Nueva función,
+// seleccionarPuntosDestacados() — reemplaza tanto calcularVeredictoActivismo()
+// (Presentación) como seleccionarEscenas() (Podcast, en
+// generarGuionPresentacion.js), y pasa a ser la ÚNICA fuente de selección
+// para ambos productos:
 //
-
-// v4 (4 ago 2026) — obtenerContactosApoyo() PASA A SER RESPALDO, NO FUENTE
-// PRINCIPAL: la lista real y curada ahora vive en la tabla contactos_apoyo
-// (worker.js: /contactos-apoyo/*, pantalla /admin/contactos-apoyo).
-// generarPresentacionPDF.js recibe esa lista real como parámetro y solo
-// llama a esta función si la tabla todavía no tiene ningún contacto activo
-// — sin cambios de código acá, solo de rol: esto sigue siendo la red de
-// seguridad ("nunca mostrar una lámina de contacto completamente vacía"),
-// no la fuente de verdad. Se deja intacta, DUMMY, hasta que se decida si
-// vale la pena borrarla una vez la tabla esté sembrada de forma
-// confiable.
+// - Selecciona siempre TOTAL_PUNTOS_DESTACADOS (10 por defecto) criterios
+//   — positivos y negativos — en la MISMA proporción que la alineación
+//   general del documento. Ej.: 87% de alineación → 9 positivos, 1
+//   negativo. 42% → 4 positivos, 6 negativos.
+// - La fuente de la alineación es SIEMPRE datos.puntaje — el mismo número
+//   que ya calcula y muestra el Reporte — nunca grafo_datos/enlaces. Esto
+//   hace que el bug de raíz (grafo_datos vacío) ya no pueda volver a
+//   producir un resultado como el del caso real: ni el Podcast ni la
+//   Presentación dependen de que Claude haya reconocido bien la
+//   estructura del documento (eso sigue siendo trabajo exclusivo del Mapa
+//   Mental, que es descriptivo, no una decisión de contenido).
+// - Relevancia dentro de cada bolsa: el peso del criterio (/admin/pesos)
+//   — decisión explícita de Moisés. Un SÍ con matiz cuenta como positivo
+//   (mitad de relevancia que un SÍ pleno del mismo peso — puede seguir
+//   ganándole a un SÍ pleno si su peso doctrinal es mucho mayor).
+// - Piso: si una bolsa tiene al menos un criterio real disponible pero la
+//   proporción redondeó a 0, se fuerza a 1 — nunca se oculta por completo
+//   lo positivo ni lo negativo si existe. Pedido explícito del Ala
+//   Doctrinal (vía Moisés): las auditorías se sentían "demasiado
+//   estrictas" — un documento con buen puntaje debe verse reflejado como
+//   tal, no quedar invisible.
+// - Se usan TODOS los puntos seleccionados (hasta 10), sin reducir la
+//   cantidad para ahorrar llamados — decisión explícita de Moisés:
+//   reducir la cantidad de criterios comentados dejaría ocultos muchos
+//   aspectos reales, exactamente lo que se busca evitar.
 //
-// v6 (10 ago 2026) — CASO HÍBRIDO, PRIMERA VERSIÓN REAL: la primera
-// auditoría real que cayó en la banda híbrida (20%-80%) expuso el hueco
-// documentado desde julio — la Presentación mostraba un texto de relleno
-// ("[PENDIENTE...]") en vez de una idea real, criterio por criterio.
-// Decisión de Moisés (10 ago 2026): en vez de cubrir los ~24 criterios
-// aplicables típicos de un documento híbrido (demasiado, la Presentación
-// "no debe ser exhaustiva — son solo ideas para impulsar el activismo"),
-// se genera UNA idea real por cada una de las 7 categorías doctrinales
-// (de las 12) con más criterios — dentro de cada una, el criterio de
-// mayor peso entre los que aplican a este documento. El "dato de
-// gravedad/severidad" que faltaba en julio para hacer esta selección ya
-// existe: es el peso de /admin/pesos, agregado esta semana para el
-// tamaño de esferas del Mapa Mental — la misma pieza sirve para las dos
-// cosas. Nuevo: seleccionarCriteriosHibridos() (puro, sin Claude) y
-// generarIdeaActivismoCriterio() (un llamado a Claude por criterio
-// seleccionado, mismo menú de tácticas y mismas reglas de seguridad
-// protegidas que generarIdeasActivismoTotal() — nunca editables). Ver el
-// changelog completo del lado de generarPresentacionPDF.js (v3.0) para
-// cómo se conecta esto a las láminas reales.
+// SUPERADAS por este cambio, dejadas intactas sin llamarse desde ningún
+// punto activo del pipeline (mismo criterio que ya usa este proyecto con
+// otro código superado — no se borran, por si hace falta retomarlas o
+// compararlas más adelante):
+// - calcularVeredictoActivismo() y sus umbrales UMBRAL_RECHAZO_TOTAL /
+//   UMBRAL_PROMOCION_TOTAL.
+// - seleccionarCriteriosHibridos() (selección por "1 criterio por cada
+//   una de las 7 categorías con más criterios" — reemplazada por
+//   selección pura por peso, sin ese paso de diversidad por categoría).
+// - generarIdeasActivismoTotal() y construirPromptIdeasActivismo() (el
+//   llamado único que generaba 3-5 ideas agrupadas para el caso "total")
+//   — reemplazado por generarIdeaActivismoCriterio() (sin cambios en su
+//   propia lógica), llamado una vez por cada punto seleccionado, para
+//   TODOS los casos, no solo el híbrido.
 //
-// v7 (13 ago 2026) — FIX: generarIdeasActivismoTotal() cortaba por
-// max_tokens (2000) en documentos con 4+ alertas/muchos criterios NO
-// aplicables al caso total — el modelo necesitaba más espacio para las
-// 3-5 ideas completas de lo que dejaba el límite viejo. Mismo tipo de
-// ajuste que ya se le hizo a analizarConClaude() en worker.js (subir el
-// tope), a una escala mucho menor: acá solo se generan unas pocas ideas
-// cortas, no el análisis completo de un documento. Subido de 2000 a 4000
-// — no se tocó generarIdeaActivismoCriterio() (el caso híbrido, una idea
-// a la vez, max_tokens 1000), porque no hay evidencia de que ese haya
-// fallado nunca por este motivo.
+// SIN CAMBIOS: generarIdeaActivismoCriterio(), construirPromptIdeaActivismoCriterio(),
+// CATEGORIAS_ACTIVISMO, MENU_TACTICAS_ACTIVISMO, los textos de respaldo de
+// estilo, y obtenerContactosApoyo() — toda esta maquinaria sigue siendo la
+// que genera cada idea individual; lo único que cambió es CUÁNTOS
+// criterios se seleccionan y CÓMO se decide cuáles.
 
 'use strict';
 
@@ -98,7 +86,8 @@ const Anthropic = require('@anthropic-ai/sdk');
 const UMBRAL_RECHAZO_TOTAL   = 0.20;
 const UMBRAL_PROMOCION_TOTAL = 0.80;
 
-// ── Veredicto general del instrumento ────────────────────────────────────
+// ── SUPERADA (16 ago 2026) — veredicto general por horizontes ────────────
+// Ver el changelog v8 arriba. Se deja intacta, sin llamarse.
 function calcularVeredictoActivismo(resumenHorizontes) {
   const { total, neutral, a_favor } = resumenHorizontes;
   const pesoNeutral = neutral.peso !== undefined ? neutral.peso : neutral.cantidad;
@@ -168,7 +157,8 @@ const MENU_TACTICAS_ACTIVISMO = `
 14. Construcción de coaliciones: reunir organizaciones con intereses comunes; coordinar mensajes entre grupos distintos; plataforma compartida; dividir responsabilidades (investigación, vocería, movilización); acordar demandas mínimas comunes; alianzas entre sectores sociales, empresariales, académicos y comunitarios.
 `.trim();
 
-// ── Ideas de activismo — caso total (rechazo o promoción) ───────────────
+// ── Ideas de activismo — SUPERADO (16 ago 2026), caso "total" agrupado ───
+// Ver changelog v8. Se deja intacto, sin llamarse.
 const SCHEMA_IDEAS_ACTIVISMO_TOTAL = {
   type: 'object',
   properties: {
@@ -201,10 +191,9 @@ const SCHEMA_IDEAS_ACTIVISMO_TOTAL = {
   additionalProperties: false,
 };
 
-// ── Ideas de activismo — caso híbrido, UNA idea por criterio (10 ago 2026) ──
-// Mismas 3 propiedades que el caso total, pero para un solo criterio a la
-// vez — no envueltas en un arreglo, porque cada llamado genera una sola
-// idea (ver generarIdeaActivismoCriterio()).
+// ── Ideas de activismo — UNA idea por criterio (EN USO desde el 10 ago
+// 2026 para el caso híbrido; desde el 16 ago 2026, para TODOS los casos —
+// ver seleccionarPuntosDestacados() más abajo) ──
 const SCHEMA_IDEA_ACTIVISMO_UNICA = {
   type: 'object',
   properties: {
@@ -238,12 +227,9 @@ const TEXTO_PERSONA_ACTIVISMO_RESPALDO = `Eres un asistente de activismo cívico
 
 const TEXTO_REGLAS_ACTIVISMO_RESPALDO = `Basa cada idea en una o más tácticas concretas del menú de arriba, adaptadas específicamente a este documento (referenciando su tema, artículos o país cuando ayude a que no suene genérica) — no un consejo que serviría igual para cualquier ley. Usa categorías variadas entre las ideas (evita repetir la misma categoría más de una vez salvo que el contexto realmente lo amerite) — cada categoría tiene su propia ilustración, y la variedad hace la presentación más rica visualmente.`;
 
-// Construye el prompt completo. estiloPersona / reglasGeneracion: opcionales
-// — si vienen null o vacíos, se usa el texto de respaldo de arriba.
-// worker.js los lee de prompts_productos antes de llamar a
-// generarIdeasActivismoTotal(). El resto del prompt —datos reales, menú de
-// tácticas, reglas de seguridad— siempre se arma igual, en código, en la
-// misma posición exacta que ya tenía.
+// ── SUPERADO (16 ago 2026) — construirPromptIdeasActivismo() y
+// generarIdeasActivismoTotal() — ver changelog v8. Se dejan intactos, sin
+// llamarse desde ningún punto activo del pipeline.
 function construirPromptIdeasActivismo(datos, metadatos, veredicto, estiloPersona = null, reglasGeneracion = null) {
   const esRechazo = veredicto.modo === 'rechazo_total';
 
@@ -297,16 +283,8 @@ async function generarIdeasActivismoTotal(datos, metadatos, veredicto, auditoria
   return datosRespuesta.ideas;
 }
 
-// ── Caso híbrido — selección de criterios (10 ago 2026) ──────────────────
-// Pura, sin llamar a Claude. Decisión de Moisés: la Presentación de un
-// documento híbrido no debe ser exhaustiva (cubrir los ~24 criterios
-// aplicables típicos sería demasiado) — son solo ideas puntuales para
-// impulsar el activismo. Selecciona hasta 7 criterios: uno por cada una
-// de las 7 categorías doctrinales (de las 12 totales) con más criterios,
-// y dentro de cada una, el de mayor peso entre los que aplican a este
-// documento (resultado !== 'NA'). Una categoría sin ningún criterio
-// aplicable en este documento en particular se omite sin más — nunca se
-// fuerza una selección artificial.
+// ── SUPERADA (16 ago 2026) — selección del caso híbrido por categoría ────
+// Ver changelog v8. Se deja intacta, sin llamarse.
 function pesoDeCriterioActivismo(criterioId, pesosCriterios) {
   const valor = pesosCriterios ? pesosCriterios[criterioId] : undefined;
   if (valor && typeof valor === 'object') {
@@ -335,12 +313,121 @@ function seleccionarCriteriosHibridos(datos, pesosCriterios = {}) {
   return seleccion;
 }
 
-// ── Caso híbrido — generación, UN llamado a Claude por criterio ──────────
-// Mismo menú de tácticas y mismas reglas de seguridad de contenido que
-// generarIdeasActivismoTotal() — nunca editables desde Admin, siempre
-// fijas en código. `tipo` es 'rechazo' | 'mejora' | 'promocion', según el
-// resultado real del criterio (NO / SI_MATIZ / SI) — lo decide el
-// llamador (generarPresentacionPDF.js), que ya tiene ese mapa.
+// ══════════════════════════════════════════════════════════════════════
+// ── EN USO (16 ago 2026) — selección proporcional, Podcast + Presentación
+// ══════════════════════════════════════════════════════════════════════
+// Ver el changelog v8 completo al inicio del archivo para el porqué.
+// Reemplaza a seleccionarCriteriosHibridos() (arriba) y a
+// seleccionarEscenas() (generarGuionPresentacion.js). Es la única función
+// de selección que usan hoy tanto el Podcast como la Presentación — así,
+// cuando ambos productos hablan del "mismo" hallazgo, es literalmente el
+// mismo criterio, no una selección independiente que podría no coincidir.
+
+const TOTAL_PUNTOS_DESTACADOS = 10;
+
+// Valor de un criterio dentro de la bolsa "positivos": un SÍ pleno vale el
+// doble que un SÍ con matiz del mismo peso doctrinal — decisión explícita
+// de Moisés (16 ago 2026): "interpretemos los SI_MATIZ como positivos,
+// pero su relevancia es menor si hay SI completo". Un SÍ con matiz de
+// mucho más peso igual puede superar a un SÍ pleno de poco peso.
+function valorPositivoCriterio(criterio) {
+  if (criterio.resultado === 'SI') return 1;
+  if (criterio.resultado === 'SI_MATIZ') return 0.5;
+  return 0;
+}
+
+// Alineación general del documento, para decidir la proporción 0-100.
+// SIEMPRE datos.puntaje (el mismo número que ya ve el ciudadano en el
+// Reporte) cuando existe — nunca grafo_datos/enlaces, a propósito: esto
+// es lo que hace que el bug de raíz (reconocimiento de artículos fallido)
+// ya no pueda volver a afectar ni al Podcast ni a la Presentación. Solo
+// si datos.puntaje viene null (caso raro: documento sin ningún SÍ pleno,
+// la fórmula del Reporte lo exige) se recalcula acá con el mismo criterio
+// de ponderación pero sin esa restricción, para que la selección nunca se
+// quede sin base.
+function calcularAlineacionParaSeleccion(datos, pesosCriterios) {
+  if (datos.puntaje !== null && datos.puntaje !== undefined) return Number(datos.puntaje);
+  const criterios = datos.categorias.flatMap(cat => cat.criterios).filter(c => c.resultado !== 'NA');
+  if (criterios.length === 0) return 0;
+  let sumaPeso = 0, sumaPonderada = 0;
+  criterios.forEach(c => {
+    const peso = pesoDeCriterioActivismo(c.id, pesosCriterios);
+    sumaPeso += peso;
+    sumaPonderada += peso * valorPositivoCriterio(c);
+  });
+  return sumaPeso > 0 ? Math.round((sumaPonderada / sumaPeso) * 100) : 0;
+}
+
+// Selecciona hasta `totalPuntos` criterios (10 por defecto): positivos y
+// negativos, en la misma proporción que la alineación general. Cada
+// elemento devuelto trae { criterio, categoriaDoctrinal: {num, nombre} } —
+// mismo formato que ya esperaba generarIdeaActivismoCriterio().
+function seleccionarPuntosDestacados(datos, pesosCriterios = {}, totalPuntos = TOTAL_PUNTOS_DESTACADOS) {
+  const todos = [];
+  datos.categorias.forEach(cat => {
+    cat.criterios.forEach(c => {
+      if (c.resultado === 'NA') return;
+      todos.push({ criterio: c, categoriaDoctrinal: { num: cat.num, nombre: cat.nombre } });
+    });
+  });
+
+  const positivos = todos
+    .filter(item => item.criterio.resultado === 'SI' || item.criterio.resultado === 'SI_MATIZ')
+    .sort((a, b) =>
+      (pesoDeCriterioActivismo(b.criterio.id, pesosCriterios) * valorPositivoCriterio(b.criterio)) -
+      (pesoDeCriterioActivismo(a.criterio.id, pesosCriterios) * valorPositivoCriterio(a.criterio))
+    );
+  const negativos = todos
+    .filter(item => item.criterio.resultado === 'NO')
+    .sort((a, b) => pesoDeCriterioActivismo(b.criterio.id, pesosCriterios) - pesoDeCriterioActivismo(a.criterio.id, pesosCriterios));
+
+  const alineacionPorcentaje = calcularAlineacionParaSeleccion(datos, pesosCriterios);
+
+  let nPositivos = Math.round((alineacionPorcentaje / 100) * totalPuntos);
+  let nNegativos = totalPuntos - nPositivos;
+
+  // Piso: nunca ocultar por completo un lado que sí tiene al menos un
+  // criterio real disponible — pedido explícito del Ala Doctrinal.
+  if (nPositivos === 0 && positivos.length > 0) {
+    nPositivos = 1;
+    nNegativos = Math.max(0, nNegativos - 1);
+  }
+  if (nNegativos === 0 && negativos.length > 0) {
+    nNegativos = 1;
+    nPositivos = Math.max(0, nPositivos - 1);
+  }
+
+  // No pedir más de lo que realmente existe en cada bolsa.
+  nPositivos = Math.min(nPositivos, positivos.length);
+  nNegativos = Math.min(nNegativos, negativos.length);
+
+  // Si alguna bolsa se quedó corta de candidatos reales, el cupo sobrante
+  // pasa a la otra (nunca se desperdicia cupo si hay más material
+  // disponible del otro lado).
+  const cupoUsado = nPositivos + nNegativos;
+  let cupoLibre = Math.min(totalPuntos, positivos.length + negativos.length) - cupoUsado;
+  if (cupoLibre > 0) {
+    const extraPositivos = Math.min(cupoLibre, positivos.length - nPositivos);
+    nPositivos += extraPositivos;
+    cupoLibre -= extraPositivos;
+    const extraNegativos = Math.min(cupoLibre, negativos.length - nNegativos);
+    nNegativos += extraNegativos;
+  }
+
+  return {
+    alineacionPorcentaje,
+    positivos: positivos.slice(0, nPositivos),
+    negativos: negativos.slice(0, nNegativos),
+  };
+}
+
+// ── Caso híbrido — generación, UN llamado a Claude por criterio (10 ago
+// 2026) — SIN CAMBIOS: desde el 16 ago 2026 esta es la única forma en la
+// que se genera una idea, para TODOS los puntos seleccionados por
+// seleccionarPuntosDestacados(), no solo el caso híbrido de antes.
+// `tipo` es 'rechazo' | 'mejora' | 'promocion', según el resultado real
+// del criterio (NO / SI_MATIZ / SI) — lo decide el llamador
+// (generarPresentacionPDF.js), que ya tiene ese mapa.
 function construirPromptIdeaActivismoCriterio(criterio, categoriaDoctrinal, metadatos, tipo, estiloPersona = null, reglasGeneracion = null) {
   const persona = (estiloPersona && estiloPersona.trim()) ? estiloPersona.trim() : TEXTO_PERSONA_ACTIVISMO_RESPALDO;
   const reglas  = (reglasGeneracion && reglasGeneracion.trim()) ? reglasGeneracion.trim() : TEXTO_REGLAS_ACTIVISMO_RESPALDO;
@@ -348,7 +435,7 @@ function construirPromptIdeaActivismoCriterio(criterio, categoriaDoctrinal, meta
 
   return `${persona}
 
-Este documento obtuvo un resultado mixto en la auditoría — no amerita ni rechazo total ni apoyo total, sino acciones puntuales, criterio por criterio. Te toca generar UNA sola idea de activismo, enfocada exclusivamente en el siguiente criterio.
+Te toca generar UNA sola idea de activismo, enfocada exclusivamente en el siguiente criterio de este documento.
 
 DOCUMENTO: ${metadatos.titulo}${metadatos.pais ? ` (${metadatos.pais})` : ''}
 
@@ -416,10 +503,14 @@ function obtenerContactosApoyo() {
 }
 
 module.exports = {
+  // EN USO:
+  seleccionarPuntosDestacados,
+  generarIdeaActivismoCriterio,
+  obtenerContactosApoyo,
+  // SUPERADAS — se dejan exportadas por compatibilidad, sin llamarse desde
+  // ningún punto activo del pipeline (ver changelog v8):
   calcularVeredictoActivismo,
   construirPromptIdeasActivismo,
   generarIdeasActivismoTotal,
   seleccionarCriteriosHibridos,
-  generarIdeaActivismoCriterio,
-  obtenerContactosApoyo,
 };
