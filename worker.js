@@ -1670,8 +1670,9 @@ app.get('/regenerar-podcast', async (req, res) => {
 	  textoVoces, textoReglas, textoCriteriosRevisor
     );
     const rutaMp3 = path.join(dir, 'podcast.mp3');
-    const fraseDinamica = `Hoy nos ocupamos de: ${titulo_documento}.`;
-    await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica });
+	const fraseDinamica = `Hoy nos ocupamos de: ${titulo_documento}.`;
+	const piezasFijas = await prepararPiezasFijasPodcast(dir);
+    await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica, ...piezasFijas });
 
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
@@ -1691,18 +1692,105 @@ app.get('/regenerar-podcast', async (req, res) => {
   }
 });
 
-// ── Piezas fijas del podcast (cortina/cierre) — movido a Admin (2 ago 2026) ──
+// ── Piezas fijas del podcast (cortina/cierre) — movido a Admin (2 ago 2026),
+// guardado directo en base de datos desde el 16 ago 2026 ──────────────────
+//
+// Antes (2 ago - 16 ago 2026): el texto vivía en configuracion_podcast,
+// pero la voz y la música mezclada solo podían vivir como archivos dentro
+// del repo (assets/cortina-fija.mp3, assets/cierre-fijo.mp3) — cambiarlas
+// exigía descargar el mp3 generado, subirlo a GitHub a mano, y esperar un
+// redeploy de Railway. Bug real reportado por Moisés: cambió el texto,
+// generó la voz nueva, pero al "mezclar" el resultado seguía usando la
+// voz VIEJA — porque el paso de mezcla leía siempre el archivo que ya
+// estaba en disco (el desplegado), nunca el que se acababa de generar en
+// el navegador.
+//
+// Ahora: configuracion_podcast guarda también la música cruda
+// (musica_cortina/musica_cierre, sube una sola vez, se reusa) y el mp3
+// final ya mezclado (audio_cortina/audio_cierre) — todo en base64, mismo
+// patrón que ya usan configuracion_doctrinal.archivo_pdf y
+// manual_liberalismo.archivo_pdf. Un solo botón ("Generar y guardar
+// pieza", /podcast/pieza-fija/generar) hace todo: lee el texto actual, le
+// pide la voz a ElevenLabs, la mezcla con la música ya guardada, y
+// guarda el resultado — listo para el próximo podcast sin GitHub ni
+// redeploy. Requiere migracion-audio-podcast-fijo.sql.
+//
+// DISEÑO DE LA TABLA — cambia de "historial" a "fila única": antes, cada
+// "Guardar textos" insertaba una fila nueva (patrón usado en varias otras
+// tablas de este proyecto para llevar historial). Acá se abandona ese
+// patrón a propósito: no hay ningún concepto de "versión anterior" de la
+// cortina que valga la pena conservar (a diferencia del Test de Libertad
+// o el Manual, que sí tienen su propio flujo de "Activar" una versión
+// entre varias) — y con audio de por medio, cada fila nueva duplicaría
+// varios cientos de KB de más. guardarConfiguracionPodcast() actualiza
+// siempre la misma fila (la más reciente si ya existe alguna, o crea la
+// primera si la tabla está vacía) — cualquier fila vieja que haya
+// quedado de antes de este cambio es inofensiva, no hace falta borrarla.
+// Eliminado por completo, a pedido explícito de Moisés: la opción
+// "Mezclar desde Drive" (POST /podcast/mezclar-musica-drive) — quedaba
+// como una alternativa confusa a subir el archivo directo.
 
-async function obtenerTextosPodcast() {
+async function obtenerConfiguracionPodcast() {
   try {
     const { rows } = await db.query(
-      `SELECT texto_cortina, texto_cierre FROM configuracion_podcast ORDER BY id DESC LIMIT 1`
+      `SELECT texto_cortina, texto_cierre,
+              musica_cortina, musica_cortina_inicio,
+              musica_cierre, musica_cierre_inicio,
+              audio_cortina, audio_cierre
+       FROM configuracion_podcast ORDER BY id DESC LIMIT 1`
     );
     if (rows.length > 0) return rows[0];
   } catch (err) {
-    console.warn('   [obtenerTextosPodcast] No se pudo leer configuracion_podcast, se usa el texto fijo del código:', err.message);
+    console.warn('   [obtenerConfiguracionPodcast] No se pudo leer configuracion_podcast (¿falta migracion-audio-podcast-fijo.sql?), se usa el texto fijo del código:', err.message);
   }
-  return { texto_cortina: TEXTO_CORTINA_FIJA, texto_cierre: TEXTO_CIERRE_FIJO };
+  return {
+    texto_cortina: TEXTO_CORTINA_FIJA, texto_cierre: TEXTO_CIERRE_FIJO,
+    musica_cortina: null, musica_cortina_inicio: null,
+    musica_cierre: null, musica_cierre_inicio: null,
+    audio_cortina: null, audio_cierre: null,
+  };
+}
+
+// Actualiza (o crea, si todavía no existe ninguna) la única fila de
+// configuracion_podcast — `cambios` es un objeto parcial, solo las
+// columnas que de verdad cambian (ej. { texto_cortina: '...' }). Los
+// nombres de columna siempre vienen de este mismo archivo, nunca de
+// datos externos — seguro de inyección SQL.
+async function guardarConfiguracionPodcast(cambios) {
+  const columnas = Object.keys(cambios);
+  const valores = Object.values(cambios);
+  const { rows } = await db.query(`SELECT id FROM configuracion_podcast ORDER BY id DESC LIMIT 1`);
+  if (rows.length === 0) {
+    const placeholders = columnas.map((_, i) => `$${i + 1}`).join(', ');
+    await db.query(`INSERT INTO configuracion_podcast (${columnas.join(', ')}) VALUES (${placeholders})`, valores);
+  } else {
+    const asignaciones = columnas.map((col, i) => `${col} = $${i + 1}`).join(', ');
+    await db.query(`UPDATE configuracion_podcast SET ${asignaciones} WHERE id = $${columnas.length + 1}`, [...valores, rows[0].id]);
+  }
+}
+
+// Escribe a archivos temporales el mp3 final ya guardado en
+// configuracion_podcast (audio_cortina/audio_cierre), si existe — para
+// pasárselos a generarPodcastMp3() como rutaCortinaFija/rutaCierreFijo.
+// Si la base de datos todavía no tiene nada guardado (antes de la
+// primera vez que se use "Generar y guardar" en /admin/podcast, o si
+// falta la migración), devuelve rutas `undefined` — generarPodcastMp3()
+// cae sola a sus archivos por defecto en assets/, exactamente el mismo
+// comportamiento que tenía todo el pipeline antes de este cambio.
+async function prepararPiezasFijasPodcast(dirTemp) {
+  const config = await obtenerConfiguracionPodcast();
+  const resultado = {};
+  if (config.audio_cortina) {
+    const ruta = path.join(dirTemp, 'cortina-fija-db.mp3');
+    fs.writeFileSync(ruta, Buffer.from(config.audio_cortina, 'base64'));
+    resultado.rutaCortinaFija = ruta;
+  }
+  if (config.audio_cierre) {
+    const ruta = path.join(dirTemp, 'cierre-fijo-db.mp3');
+    fs.writeFileSync(ruta, Buffer.from(config.audio_cierre, 'base64'));
+    resultado.rutaCierreFijo = ruta;
+  }
+  return resultado;
 }
 
 app.get('/podcast/textos-fijos', async (req, res) => {
@@ -1710,8 +1798,8 @@ app.get('/podcast/textos-fijos', async (req, res) => {
     return res.status(401).json({ error: 'No autorizado' });
   }
   try {
-    const textos = await obtenerTextosPodcast();
-    res.json({ ok: true, ...textos });
+    const config = await obtenerConfiguracionPodcast();
+    res.json({ ok: true, texto_cortina: config.texto_cortina, texto_cierre: config.texto_cierre });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1724,11 +1812,8 @@ app.post('/podcast/textos-fijos/actualizar', async (req, res) => {
     return res.status(400).json({ error: 'Faltan texto_cortina o texto_cierre' });
   }
   try {
-    await db.query(
-      `INSERT INTO configuracion_podcast (texto_cortina, texto_cierre) VALUES ($1, $2)`,
-      [texto_cortina.trim(), texto_cierre.trim()]
-    );
-    console.log('   [podcast/textos-fijos/actualizar] ✅ Textos guardados');
+    await guardarConfiguracionPodcast({ texto_cortina: texto_cortina.trim(), texto_cierre: texto_cierre.trim() });
+    console.log('   [podcast/textos-fijos/actualizar] ✅ Textos guardados (música y audio ya guardados se mantienen igual)');
     res.json({ ok: true });
   } catch (error) {
     console.error('❌ Error en /podcast/textos-fijos/actualizar:', error.message);
@@ -1736,114 +1821,115 @@ app.post('/podcast/textos-fijos/actualizar', async (req, res) => {
   }
 });
 
-app.post('/podcast/generar-pieza', async (req, res) => {
+// Guarda la música CRUDA de una pieza (intro | cierre) — se sube una sola
+// vez, se reusa en cada "Generar y guardar" hasta que se reemplace.
+app.post('/podcast/pieza-fija/musica', async (req, res) => {
+  if (!exigirSuperadmin(req, res)) return;
+  const { pieza, musica_base64, inicio_musica } = req.body || {};
+  if (!['intro', 'cierre'].includes(pieza)) {
+    return res.status(400).json({ error: 'Falta o es inválido el campo "pieza" (intro | cierre)' });
+  }
+  if (!musica_base64) {
+    return res.status(400).json({ error: 'Falta el archivo de música (musica_base64)' });
+  }
+  try {
+    const columnaMusica = pieza === 'intro' ? 'musica_cortina' : 'musica_cierre';
+    const columnaInicio = pieza === 'intro' ? 'musica_cortina_inicio' : 'musica_cierre_inicio';
+    await guardarConfiguracionPodcast({ [columnaMusica]: musica_base64, [columnaInicio]: inicio_musica || null });
+    console.log(`   [podcast/pieza-fija/musica] ✅ Música de "${pieza}" guardada (${Math.round(musica_base64.length * 0.75 / 1024)} KB aprox.)`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error en /podcast/pieza-fija/musica:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// EL BOTÓN ÚNICO: lee el texto y la música ya guardados, genera la voz
+// con ElevenLabs, mezcla, y guarda el resultado — listo para el próximo
+// podcast sin GitHub ni redeploy. Devuelve también el mp3 en la
+// respuesta, para que /admin/podcast pueda ofrecer escucharlo/descargarlo
+// como confirmación — pero guardarlo en la base de datos ya ocurrió antes
+// de responder, así que ese paso extra es opcional para el usuario.
+app.post('/podcast/pieza-fija/generar', async (req, res) => {
   if (!exigirSuperadmin(req, res)) return;
   const { pieza } = req.body || {};
   if (!['intro', 'cierre'].includes(pieza)) {
     return res.status(400).json({ error: 'Falta o es inválido el campo "pieza" (intro | cierre)' });
   }
+
+  const dirTemp = path.join(DIRECTORIO_TEMP, `pieza-fija-generar-${pieza}-${Date.now()}`);
+  fs.mkdirSync(dirTemp, { recursive: true });
+
   try {
-    const textos = await obtenerTextosPodcast();
-    const texto = pieza === 'intro' ? textos.texto_cortina : textos.texto_cierre;
-    const buffer = await generarAudioLote(
+    const config = await obtenerConfiguracionPodcast();
+    const texto = pieza === 'intro' ? config.texto_cortina : config.texto_cierre;
+    const musicaBase64 = pieza === 'intro' ? config.musica_cortina : config.musica_cierre;
+    const inicioMusica = pieza === 'intro' ? config.musica_cortina_inicio : config.musica_cierre_inicio;
+
+    console.log(`   [podcast/pieza-fija/generar] Generando voz para "${pieza}"...`);
+    const bufferVoz = await generarAudioLote(
       [{ voice_id: VOZ_ID.ANITA, text: texto }],
       'pieza-fija',
       pieza
     );
-    const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
+
+    let bufferFinal = bufferVoz;
+
+    if (musicaBase64) {
+      const rutaVoz = path.join(dirTemp, 'voz.mp3');
+      const rutaMusica = path.join(dirTemp, 'musica.mp3');
+      const rutaSalida = path.join(dirTemp, 'final.mp3');
+      fs.writeFileSync(rutaVoz, bufferVoz);
+      fs.writeFileSync(rutaMusica, Buffer.from(musicaBase64, 'base64'));
+      const inicioSegundos = parsearTiempoASegundos(inicioMusica);
+      console.log(`   [podcast/pieza-fija/generar] Mezclando con la música guardada (desde el segundo ${inicioSegundos})...`);
+      await agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, { inicioSegundos });
+      bufferFinal = fs.readFileSync(rutaSalida);
+    } else {
+      console.warn(`   [podcast/pieza-fija/generar] ⚠️ No hay música guardada para "${pieza}" todavía — se guarda solo la voz, sin música de fondo. Sube una música primero si quieres que la lleve.`);
+    }
+
+    const audioBase64 = bufferFinal.toString('base64');
+    const columnaAudio = pieza === 'intro' ? 'audio_cortina' : 'audio_cierre';
+    await guardarConfiguracionPodcast({ [columnaAudio]: audioBase64 });
+
+    console.log(`   [podcast/pieza-fija/generar] ✅ "${pieza}" generada y guardada (${Math.round(bufferFinal.length / 1024)} KB) — ya está lista para los próximos podcasts.`);
+
     res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
-    res.send(buffer);
+    res.setHeader('Content-Disposition', `inline; filename="${pieza === 'intro' ? 'cortina-fija' : 'cierre-fijo'}.mp3"`);
+    res.send(bufferFinal);
   } catch (error) {
-    console.error('   [podcast/generar-pieza] ❌ Error:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/podcast/subir-musica-fija', async (req, res) => {
-  if (!exigirSuperadmin(req, res)) return;
-
-  const { musica_base64, pieza, inicio_musica } = req.body || {};
-  const rutasVoz = { intro: RUTA_CORTINA_FIJA_DEFECTO, cierre: RUTA_CIERRE_FIJO_DEFECTO };
-  const rutaVoz = rutasVoz[pieza];
-
-  if (!rutaVoz) {
-    return res.status(400).json({ error: 'Falta o es inválido el campo "pieza" (intro | cierre)' });
-  }
-  if (!musica_base64) {
-    return res.status(400).json({ error: 'Falta el archivo de música' });
-  }
-  if (!fs.existsSync(rutaVoz)) {
-    return res.status(404).json({ error: `No existe todavía ${rutaVoz} — genera la pieza de voz primero.` });
-  }
-
-  const dirTemp = path.join(DIRECTORIO_TEMP, `subir-musica-${pieza}-${Date.now()}`);
-  fs.mkdirSync(dirTemp, { recursive: true });
-
-  try {
-    const rutaMusica = path.join(dirTemp, 'musica.mp3');
-    fs.writeFileSync(rutaMusica, Buffer.from(musica_base64, 'base64'));
-    console.log(`   [podcast/subir-musica-fija] Música recibida (${Math.round(fs.statSync(rutaMusica).size / 1024)} KB), mezclando con ${rutaVoz}...`);
-
-    const inicioSegundos = parsearTiempoASegundos(inicio_musica);
-    const rutaSalida = path.join(dirTemp, `${pieza}-con-musica.mp3`);
-    await agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, { inicioSegundos });
-
-    const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
-    const buffer = fs.readFileSync(rutaSalida);
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
-    res.send(buffer);
-  } catch (error) {
-    console.error('   [podcast/subir-musica-fija] ❌ Error:', error.message);
+    console.error('   [podcast/pieza-fija/generar] ❌ Error:', error.message);
     res.status(500).json({ error: error.message });
   } finally {
     fs.rmSync(dirTemp, { recursive: true, force: true });
   }
 });
 
-app.post('/podcast/mezclar-musica-drive', async (req, res) => {
-  if (!exigirSuperadmin(req, res)) return;
-
-  const { pieza, musica_drive_id, inicio_musica } = req.body || {};
-  const rutasVoz = { intro: RUTA_CORTINA_FIJA_DEFECTO, cierre: RUTA_CIERRE_FIJO_DEFECTO };
-  const rutaVoz = rutasVoz[pieza];
-
-  if (!rutaVoz) {
-    return res.status(400).json({ error: 'Falta o es inválido el campo "pieza" (intro | cierre)' });
+// Reproducir/descargar lo que está guardado AHORA MISMO, sin regenerar
+// nada — útil para que /admin/podcast muestre "así suena la cortina
+// actual" al abrir la pantalla.
+app.get('/podcast/pieza-fija/audio/:pieza', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
   }
-  if (!musica_drive_id) {
-    return res.status(400).json({ error: 'Falta musica_drive_id — sube la pista a Drive primero y copia su fileId' });
+  const { pieza } = req.params;
+  if (!['intro', 'cierre'].includes(pieza)) {
+    return res.status(400).json({ error: 'pieza inválida (intro | cierre)' });
   }
-  if (!fs.existsSync(rutaVoz)) {
-    return res.status(404).json({ error: `No existe todavía ${rutaVoz} — genera la pieza de voz primero.` });
-  }
-
-  const dirTemp = path.join(DIRECTORIO_TEMP, `mezcla-musica-drive-${pieza}-${Date.now()}`);
-  fs.mkdirSync(dirTemp, { recursive: true });
-
   try {
-    console.log(`   [podcast/mezclar-musica-drive] Descargando música (Drive: ${musica_drive_id})...`);
-    const driveAuth = autenticarDrive();
-    const drive = google.drive({ version: 'v3', auth: driveAuth });
-    const rutaMusica = path.join(dirTemp, 'musica.mp3');
-    await descargarPDF(drive, musica_drive_id, rutaMusica);
-
-    const inicioSegundos = parsearTiempoASegundos(inicio_musica);
-    console.log(`   [podcast/mezclar-musica-drive] Mezclando con ${rutaVoz} (música desde el segundo ${inicioSegundos})...`);
-    const rutaSalida = path.join(dirTemp, `${pieza}-con-musica.mp3`);
-    await agregarFondoMusical(rutaVoz, rutaMusica, rutaSalida, { inicioSegundos });
-
-    const nombreArchivo = pieza === 'intro' ? 'cortina-fija.mp3' : 'cierre-fijo.mp3';
-    const buffer = fs.readFileSync(rutaSalida);
+    const config = await obtenerConfiguracionPodcast();
+    const audioBase64 = pieza === 'intro' ? config.audio_cortina : config.audio_cierre;
+    if (!audioBase64) {
+      return res.status(404).json({ error: `Todavía no hay ningún audio guardado para "${pieza}" — usa "Generar y guardar" primero.` });
+    }
+    const buffer = Buffer.from(audioBase64, 'base64');
     res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+    res.setHeader('Content-Disposition', `inline; filename="${pieza === 'intro' ? 'cortina-fija' : 'cierre-fijo'}.mp3"`);
     res.send(buffer);
   } catch (error) {
-    console.error('   [podcast/mezclar-musica-drive] ❌ Error:', error.message);
+    console.error('❌ Error en /podcast/pieza-fija/audio:', error.message);
     res.status(500).json({ error: error.message });
-  } finally {
-    fs.rmSync(dirTemp, { recursive: true, force: true });
   }
 });
 
@@ -3617,8 +3703,9 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 		  	textoVoces, textoReglas, textoCriteriosRevisor
 	      );
 	      const rutaMp3 = path.join(dir, 'podcast.mp3');
-	      const fraseDinamica = `Hoy nos ocupamos de: ${metadatos.titulo}.`;
-	      await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica });
+		  const fraseDinamica = `Hoy nos ocupamos de: ${metadatos.titulo}.`;
+		  const piezasFijas = await prepararPiezasFijasPodcast(dir);
+	      await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica, ...piezasFijas });
 	      linkPodcast = await subirArchivo(drive, rutaMp3, `Podcast_${identificadorLimpio}.mp3`, 'audio/mpeg', carpetaId);
 	      console.log(`✅ [${auditoria_id}] Podcast generado y subido — veredicto del revisor: ${resultadoGuion.veredicto}`);
 	    } catch (errorPodcast) {
