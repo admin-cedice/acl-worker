@@ -1,6 +1,26 @@
-// worker.js — ACL Worker v3.35
+// worker.js — ACL Worker v3.36
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.36 (15 ago 2026) — 2 FIXES en /metricas/resumen, reportados por
+// Moisés al revisar el dashboard:
+// (1) PUNTAJE PROMEDIO EN BLANCO pese a que la Distribución de puntaje sí
+//     mostraba datos reales. Causa raíz: la columna `puntaje` es NUMERIC
+//     en Postgres, y la librería 'pg' entrega los NUMERIC como STRING (no
+//     los convierte a número por su cuenta, para no arriesgar precisión).
+//     Los operadores >= y < de la distribución igual funcionaban (JS los
+//     convierte a número para comparar), pero la suma del promedio usaba
+//     "+", que con strings NO suma — CONCATENA texto. "45.00" + "70.00"
+//     dio "045.5070.00...", un string con más de un punto decimal, que ya
+//     no es un número válido — Math.round() de eso da NaN, y
+//     JSON.stringify() convierte NaN en null, de ahí el guión en pantalla.
+//     Fix: Number(row.puntaje) explícito en ambos cálculos.
+// (2) "VE" Y "Venezuela" APARECÍAN COMO PAÍSES DISTINTOS — extraerMetadatos()
+//     no siempre devolvía el mismo formato. Normalizado directo en la
+//     consulta de porPais (CASE WHEN ... GROUP BY 1) — corrige de una vez
+//     los datos viejos y los nuevos, sin necesitar una migración.
+// De paso, se aclaró el subtítulo de "Consumo por tipo de producto" en
+// app/admin/page.js — ver ese archivo.
 //
 // v3.35 (11 ago 2026) — NIVEL BLANDO DE DUPLICADOS REEMPLAZADO POR
 // PRESELECCIÓN + JUICIO SEMÁNTICO DE CLAUDE. La v3.34 comparaba
@@ -2479,9 +2499,22 @@ app.get('/metricas/resumen', async (req, res) => {
          FROM auditorias WHERE estado = 'rechazada' GROUP BY motivo ORDER BY total DESC`,
         [], []
       ),
+      // 15 ago 2026: normalización de país directo en la consulta — "VE" y
+      // "Venezuela" se guardaban como dos valores distintos en la base de
+      // datos (extraerMetadatos() no siempre devolvía el mismo formato).
+      // En vez de una migración que reescriba filas viejas, se normaliza
+      // acá mismo: cualquier variante de "VE" se agrupa bajo "Venezuela"
+      // ANTES del GROUP BY (con GROUP BY 1, la posición del CASE, no la
+      // columna original) — corrige de una vez los datos viejos y los
+      // nuevos que sigan llegando así, sin tocar ninguna fila existente.
       consultaSegura(
-        `SELECT COALESCE(pais, 'General') AS pais, COUNT(*)::int AS total
-         FROM auditorias WHERE pais IS NOT NULL GROUP BY pais ORDER BY total DESC`,
+        `SELECT
+           CASE WHEN UPPER(TRIM(pais)) = 'VE' THEN 'Venezuela' ELSE COALESCE(pais, 'General') END AS pais,
+           COUNT(*)::int AS total
+         FROM auditorias
+         WHERE pais IS NOT NULL
+         GROUP BY 1
+         ORDER BY total DESC`,
         [], []
       ),
       consultaSegura(
@@ -2543,12 +2576,24 @@ app.get('/metricas/resumen', async (req, res) => {
       { rango: '60–80%', min: 60, max: 80 },
       { rango: '80–100%', min: 80, max: 101 },
     ];
+    // 15 ago 2026 — FIX: puntaje llega como STRING desde Postgres (columna
+    // NUMERIC — la librería 'pg' nunca convierte NUMERIC a número por su
+    // cuenta, para no arriesgar precisión). Los operadores >= y < de abajo
+    // igual funcionaban bien (JS los convierte a número para comparar),
+    // así que la distribución nunca se vio afectada. El problema real
+    // estaba en el promedio: sumar con "+" strings como "45.00" no suma,
+    // CONCATENA texto ("045.5070.00...") — y ese texto ya no es un número
+    // válido (dos puntos decimales), así que Math.round() daba NaN, y
+    // JSON.stringify() convierte NaN en null — de ahí el guión en pantalla
+    // pese a que la distribución sí mostraba datos reales. Se fuerza
+    // Number() en ambos lugares, explícito, para no depender de que JS
+    // adivine correctamente en cada operador.
     const distribucionPuntaje = RANGOS_PUNTAJE.map(r => ({
       rango: r.rango,
-      total: puntajesRows.filter(row => row.puntaje >= r.min && row.puntaje < r.max).length,
+      total: puntajesRows.filter(row => Number(row.puntaje) >= r.min && Number(row.puntaje) < r.max).length,
     }));
     const puntajePromedio = puntajesRows.length > 0
-      ? Math.round(puntajesRows.reduce((acc, row) => acc + row.puntaje, 0) / puntajesRows.length)
+      ? Math.round(puntajesRows.reduce((acc, row) => acc + Number(row.puntaje), 0) / puntajesRows.length)
       : null;
 
     res.json({
@@ -4168,7 +4213,7 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.35 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.36 corriendo en puerto ${PORT}`);
   console.log(`   Duplicados — DURO (hash, identificador oficial): rechazo automático con links,`);
   console.log(`   sin Claude, motivo 'documento_duplicado'. BLANDO (v3.35): preselección por`);
   console.log(`   similitud de título (pg_trgm) + juicio semántico de Claude — el resultado más`);
@@ -4180,6 +4225,9 @@ app.listen(PORT, () => {
   console.log(`   ADMIN_JWT_SECRET en Railway (mismo valor que Next.js)`);
   console.log(`   Pasos automáticos: 1-8.5 (PDF→análisis→reporte→Drive→completada→email→aviso masivo)`);
   console.log(`   PASO 6.6 Podcast (Claude+ElevenLabs) y PASO 6.7 Presentación (Claude+CloudConvert) activos`);
+  console.log(`   NUEVO 15 ago: /metricas/resumen — puntajePromedio corregido (NUMERIC llega como`);
+  console.log(`   string desde pg, la suma con "+" concatenaba en vez de sumar) y "porPais" normaliza`);
+  console.log(`   VE → Venezuela directo en la consulta (sin migración, corrige datos viejos y nuevos)`);
   console.log(`   NUEVO 11 ago: PASO 8.5 avisa a todos los ciudadanos activos (no bloqueante) — requiere`);
   console.log(`   ciudadanos.recibir_notificaciones_auditorias (migracion-notificaciones-ciudadanos.sql).`);
   console.log(`   Baja individual: GET /notificaciones/optout (público, link firmado sin expiración)`);
