@@ -3570,8 +3570,42 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	console.log(`✅ [${auditoria_id}] Documento descargado (${esArchivoTexto ? 'TXT' : 'PDF'})`);
 
 	console.log(`📝 [${auditoria_id}] PASO 2: Texto listo (${esArchivoTexto ? 'ya venía en texto plano' : 'extraído del PDF'})`);
-	fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
-    console.log(`✅ [${auditoria_id}] Texto extraído (${textoPDF.length} chars)`);
+		fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
+	    console.log(`✅ [${auditoria_id}] Texto extraído (${textoPDF.length} chars)`);
+
+	    // 17 ago 2026 — NUEVO: detección de extracción de texto fallida.
+	    // Caso real (Ley del Régimen Especial de Arrendamiento de Inmuebles
+	    // Destinados a Vivienda, Gaceta 7.065): un PDF "impreso" desde una
+	    // página web con Microsoft Print to PDF puede verse perfectamente
+	    // legible a simple vista, pero tener el texto dibujado como trazos
+	    // vectoriales (letras convertidas en dibujos) en vez de caracteres
+	    // reales — ni pdf-parse ni pdftotext pueden extraer nada de ahí,
+	    // aunque no sea un escaneo ni tenga imágenes incrustadas.
+	    //
+	    // Sin este chequeo, ese texto casi vacío pasaba de largo hasta el
+	    // Filtro de Admisibilidad (PASO 3.5), que —correctamente, dado lo
+	    // poco que se le mandó— rechazaba el documento con el motivo
+	    // "no_pertinente" ("no parece tratarse de una ley..."), un mensaje
+	    // engañoso: el problema nunca fue el contenido, fue que nunca llegó
+	    // a leerse.
+	    //
+	    // Umbral de 200 caracteres: arbitrario pero generoso — cualquier
+	    // documento real de una sola página ya lo supera con margen; nunca
+	    // debería descalificar un documento legítimo, solo atrapar
+	    // extracciones genuinamente vacías o casi vacías.
+	    const UMBRAL_MINIMO_TEXTO_EXTRAIDO = 200;
+	    if (textoPDF.trim().length < UMBRAL_MINIMO_TEXTO_EXTRAIDO) {
+	      const mensaje = 'No pudimos leer el texto de este PDF — probablemente esté guardado como imagen, o el texto no sea seleccionable (por ejemplo, si se generó "imprimiendo" una página web a PDF). Intenta con el PDF original del documento oficial, con un PDF donde puedas seleccionar y copiar el texto, o conviértelo a texto (.txt) antes de subirlo.';
+	      await db.query(
+	        `UPDATE auditorias
+	         SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'texto_no_extraible', rechazada_en = NOW()
+	         WHERE id = $2`,
+	        [mensaje, auditoria_id]
+	      );
+	      await enviarEmailRechazo(ciudadano_email, 'texto_no_extraible');
+	      console.log(`🔒 [${auditoria_id}] Rechazada — texto extraído insuficiente (${textoPDF.trim().length} caracteres, mínimo ${UMBRAL_MINIMO_TEXTO_EXTRAIDO})`);
+	      return;
+    }
 
     // El hash se calcula SIEMPRE (es local, sin costo) — así, aunque este
     // chequeo se salte (saltarDuplicados=true), la auditoría igual queda
@@ -4293,6 +4327,12 @@ a{color:#C41230}</style></head>
 
 async function enviarEmailRechazo(email, motivo) {
   const cuerpos = {
+      texto_no_extraible: `<p>Hola,</p>
+         <p>No pudimos leer el texto del documento que subiste a Auditoría Cívica Liberal. Esto suele pasar cuando el PDF está guardado como imagen, o cuando el texto no es seleccionable — por ejemplo, si el archivo se generó "imprimiendo" una página web a PDF en vez de descargar el documento original.</p>
+         <p>Intenta subir el PDF oficial del documento (por ejemplo, directo de la Gaceta Oficial), un PDF donde puedas seleccionar y copiar el texto con el mouse, o convierte el documento a un archivo .txt antes de subirlo.</p>
+         <p>Si crees que esto es un error, escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
+         <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`,
+
     no_pertinente: `<p>Hola,</p>
        <p>Revisamos el documento que subiste a Auditoría Cívica Liberal, y no pudimos admitirlo para el análisis: no parece tratarse de una ley, decreto, reglamento o política pública — que es justamente lo que audita nuestra plataforma.</p>
        <p>Si crees que esto es un error, puedes volver a subir el documento correcto, o escribirnos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
