@@ -3350,6 +3350,30 @@ NO marques como el mismo documento: una reforma legítima de una ley anterior, u
   return datos.veredictos || [];
 }
 
+// Estados TERMINALES de una auditoría — cualquier estado que NO esté en
+// esta lista se trata como "todavía en curso" para este chequeo. Se
+// define por exclusión, no por inclusión, a propósito: confirmado contra
+// la restricción CHECK real de auditorias.estado en Postgres (16 ago
+// 2026) hay más estados intermedios de los que aparecen en las partes
+// del pipeline ya revisadas (empaquetando, awaiting_session,
+// pendiente_confirmacion) — con la lista por exclusión, un estado
+// intermedio nuevo que se agregue más adelante queda cubierto sin
+// necesitar acordarse de actualizar esto.
+const ESTADOS_TERMINALES = ['completada', 'parcialmente_completada', 'rechazada', 'fallida', 'error'];
+
+async function buscarDuplicadoEnProceso(hashDocumento, auditoriaIdActual) {
+  const { rows } = await db.query(
+    `SELECT id, titulo_documento
+     FROM auditorias
+     WHERE hash_documento = $1
+       AND estado NOT IN ('completada', 'parcialmente_completada', 'rechazada', 'fallida', 'error')
+       AND id != $2
+     LIMIT 1`,
+    [hashDocumento, auditoriaIdActual]
+  );
+  return rows[0] || null;
+}
+
 async function buscarDuplicadoPorHash(hashDocumento, auditoriaIdActual) {
   const { rows } = await db.query(
     `SELECT id, titulo_documento, link_reporte, link_podcast, link_presentacion, completada_en
@@ -3418,6 +3442,31 @@ async function enviarEmailDocumentoDuplicado(email, duplicado) {
   });
   if (!res.ok) throw new Error(`Error enviando email de documento duplicado: ${await res.text()}`);
   console.log(`   ✅ Email de documento duplicado enviado a ${email}`);
+}
+
+// Aviso para cuando el documento ya se está procesando AHORA MISMO en
+// otra auditoría (no completada todavía) — sin links, porque todavía no
+// hay nada listo. Distinto de enviarEmailDocumentoDuplicado() (esa es
+// para cuando ya existe una auditoría terminada).
+async function enviarEmailDocumentoEnProceso(email, tituloDocumento) {
+  const cuerpo = `<p>Hola,</p>
+       <p>Ya estamos procesando este mismo documento${tituloDocumento ? ` — <strong>${tituloDocumento}</strong>` : ''} — lo subiste hace poco, y esa auditoría sigue en curso ahora mismo. Para no duplicar el trabajo, no volvimos a procesar esta segunda subida.</p>
+       <p>Te avisaremos por correo apenas la primera esté lista — no hace falta que hagas nada, ni que vuelvas a subir el documento.</p>
+       <p>Si crees que esto es un error, escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
+       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+    body: JSON.stringify({
+      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+      to: email,
+      subject: 'Ya estamos procesando este documento',
+      html: cuerpo,
+    }),
+  });
+  if (!res.ok) throw new Error(`Error enviando email de documento en proceso: ${await res.text()}`);
+  console.log(`   ✅ Email de documento en proceso enviado a ${email}`);
 }
 
 async function enviarEmailPosibleDuplicado(email, auditoria_id, titulo, parecidos) {
@@ -3529,25 +3578,57 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     // con su propia huella guardada al completarse, para que auditorías
     // futuras puedan compararse contra ella.
     const hashDocumento = calcularHashDocumento(textoPDF);
-    if (!saltarDuplicados) {
-      console.log(`🔎 [${auditoria_id}] PASO 2.5: Verificando duplicado exacto (hash)...`);
-      try {
-        const duplicadoPorHash = await buscarDuplicadoPorHash(hashDocumento, auditoria_id);
-        if (duplicadoPorHash) {
-          await db.query(
-            `UPDATE auditorias
-             SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'documento_duplicado', rechazada_en = NOW()
-             WHERE id = $2`,
-            [`Documento idéntico a la auditoría ${duplicadoPorHash.id} ("${duplicadoPorHash.titulo_documento}").`, auditoria_id]
-          );
-          await enviarEmailDocumentoDuplicado(ciudadano_email, duplicadoPorHash);
-          console.log(`🔁 [${auditoria_id}] Rechazada — documento idéntico a ${duplicadoPorHash.id}`);
-          return;
-        }
-        console.log(`✅ [${auditoria_id}] Sin duplicado exacto`);
-      } catch (errorDuplicadoHash) {
-        console.error(`⚠️  [${auditoria_id}] No se pudo verificar duplicado por hash (no bloqueante — ¿falta migracion-deteccion-duplicados.sql?):`, errorDuplicadoHash.message);
-      }
+	    if (!saltarDuplicados) {
+	      // 16 ago 2026: se escribe el hash en la base de datos LO ANTES
+	      // POSIBLE — antes incluso de los propios chequeos de esta
+	      // auditoría — para que cualquier otra subida del MISMO documento
+	      // que llegue unos segundos o minutos después pueda encontrarla. Si
+	      // esta auditoría termina rechazada más abajo, el hash guardado no
+	      // causa ningún problema — ninguna consulta futura la trata como
+	      // coincidencia una vez que deja de estar en un estado activo.
+	      try {
+	        await db.query(`UPDATE auditorias SET hash_documento = $1 WHERE id = $2`, [hashDocumento, auditoria_id]);
+	      } catch (errorEscrituraHash) {
+	        console.error(`⚠️  [${auditoria_id}] No se pudo escribir hash_documento de forma temprana (no bloqueante — ¿falta migracion-deteccion-duplicados.sql?):`, errorEscrituraHash.message);
+	      }
+
+	      console.log(`🔎 [${auditoria_id}] PASO 2.5a: Verificando si el mismo documento ya se está procesando ahora mismo...`);
+	      try {
+	        const duplicadoEnProceso = await buscarDuplicadoEnProceso(hashDocumento, auditoria_id);
+	        if (duplicadoEnProceso) {
+	          await db.query(
+	            `UPDATE auditorias
+	             SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'documento_en_proceso', rechazada_en = NOW()
+	             WHERE id = $2`,
+	            [`El mismo documento ya se está procesando en la auditoría ${duplicadoEnProceso.id}.`, auditoria_id]
+	          );
+	          await enviarEmailDocumentoEnProceso(ciudadano_email, duplicadoEnProceso.titulo_documento);
+	          console.log(`🔁 [${auditoria_id}] Rechazada — el mismo documento ya se está procesando en ${duplicadoEnProceso.id}`);
+	          return;
+	        }
+	        console.log(`✅ [${auditoria_id}] Nadie más está procesando este documento ahora mismo`);
+	      } catch (errorEnProceso) {
+	        console.error(`⚠️  [${auditoria_id}] No se pudo verificar duplicado en proceso (no bloqueante):`, errorEnProceso.message);
+	      }
+
+	      console.log(`🔎 [${auditoria_id}] PASO 2.5b: Verificando duplicado exacto ya completado (hash)...`);
+	      try {
+	        const duplicadoPorHash = await buscarDuplicadoPorHash(hashDocumento, auditoria_id);
+	        if (duplicadoPorHash) {
+	          await db.query(
+	            `UPDATE auditorias
+	             SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'documento_duplicado', rechazada_en = NOW()
+	             WHERE id = $2`,
+	            [`Documento idéntico a la auditoría ${duplicadoPorHash.id} ("${duplicadoPorHash.titulo_documento}").`, auditoria_id]
+	          );
+	          await enviarEmailDocumentoDuplicado(ciudadano_email, duplicadoPorHash);
+	          console.log(`🔁 [${auditoria_id}] Rechazada — documento idéntico a ${duplicadoPorHash.id}`);
+	          return;
+	        }
+	        console.log(`✅ [${auditoria_id}] Sin duplicado exacto ya completado`);
+	      } catch (errorDuplicadoHash) {
+	        console.error(`⚠️  [${auditoria_id}] No se pudo verificar duplicado por hash (no bloqueante — ¿falta migracion-deteccion-duplicados.sql?):`, errorDuplicadoHash.message);
+	      }
     }
 
     console.log(`📖 [${auditoria_id}] PASO 3: Leyendo configuración doctrinal...`);
