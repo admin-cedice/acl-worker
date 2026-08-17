@@ -3566,7 +3566,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando documento...`);
 	const driveAuth = autenticarDrive();
 	const drive = google.drive({ version: 'v3', auth: driveAuth });
-	const { texto: textoPDF, esTexto: esArchivoTexto, rutaOriginal: rutaDocumentoOriginal } = await descargarYExtraerTexto(drive, pdf_drive_id, dir);
+	let { texto: textoPDF, esTexto: esArchivoTexto, rutaOriginal: rutaDocumentoOriginal } = await descargarYExtraerTexto(drive, pdf_drive_id, dir);
 	console.log(`✅ [${auditoria_id}] Documento descargado (${esArchivoTexto ? 'TXT' : 'PDF'})`);
 
 	console.log(`📝 [${auditoria_id}] PASO 2: Texto listo (${esArchivoTexto ? 'ya venía en texto plano' : 'extraído del PDF'})`);
@@ -3594,17 +3594,44 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	    // debería descalificar un documento legítimo, solo atrapar
 	    // extracciones genuinamente vacías o casi vacías.
 	    const UMBRAL_MINIMO_TEXTO_EXTRAIDO = 200;
-	    if (textoPDF.trim().length < UMBRAL_MINIMO_TEXTO_EXTRAIDO) {
-	      const mensaje = 'No pudimos leer el texto de este PDF — probablemente esté guardado como imagen, o el texto no sea seleccionable (por ejemplo, si se generó "imprimiendo" una página web a PDF). Intenta con el PDF original del documento oficial, con un PDF donde puedas seleccionar y copiar el texto, o conviértelo a texto (.txt) antes de subirlo.';
-	      await db.query(
-	        `UPDATE auditorias
-	         SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'texto_no_extraible', rechazada_en = NOW()
-	         WHERE id = $2`,
-	        [mensaje, auditoria_id]
-	      );
-	      await enviarEmailRechazo(ciudadano_email, 'texto_no_extraible');
-	      console.log(`🔒 [${auditoria_id}] Rechazada — texto extraído insuficiente (${textoPDF.trim().length} caracteres, mínimo ${UMBRAL_MINIMO_TEXTO_EXTRAIDO})`);
-	      return;
+		    if (textoPDF.trim().length < UMBRAL_MINIMO_TEXTO_EXTRAIDO) {
+		      if (esArchivoTexto) {
+		        // Un .txt corto no tiene "versión visual" que rescatar — no hay
+		        // nada más que intentar.
+		        const mensaje = 'El archivo de texto que subiste tiene muy poco contenido para auditar. Revisa que se haya subido completo.';
+		        await db.query(
+		          `UPDATE auditorias
+		           SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'texto_no_extraible', rechazada_en = NOW()
+		           WHERE id = $2`,
+		          [mensaje, auditoria_id]
+		        );
+		        await enviarEmailRechazo(ciudadano_email, 'texto_no_extraible');
+		        console.log(`🔒 [${auditoria_id}] Rechazada — archivo .txt con muy poco contenido`);
+		        return;
+		      }
+
+		      console.log(`⚠️  [${auditoria_id}] Extracción normal insuficiente (${textoPDF.trim().length} caracteres) — intentando transcripción de respaldo con Claude...`);
+		      try {
+		        const textoTranscrito = await transcribirPDFConClaude(rutaDocumentoOriginal, auditoria_id);
+		        if (!textoTranscrito || textoTranscrito.trim().length < UMBRAL_MINIMO_TEXTO_EXTRAIDO) {
+		          throw new Error(`la transcripción de respaldo también resultó insuficiente (${textoTranscrito ? textoTranscrito.trim().length : 0} caracteres)`);
+		        }
+		        textoPDF = textoTranscrito.trim();
+		        fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
+		        console.log(`✅ [${auditoria_id}] Transcripción de respaldo exitosa (${textoPDF.length} chars) — el pipeline continúa con normalidad`);
+		      } catch (errorTranscripcion) {
+		        console.error(`❌ [${auditoria_id}] Transcripción de respaldo falló:`, errorTranscripcion.message);
+		        const mensaje = 'No pudimos leer el texto de este PDF, ni siquiera con nuestro método de respaldo. Es posible que el archivo esté dañado, protegido, casi en blanco, o exceda el límite de 100 páginas que admite nuestro sistema de lectura visual. Intenta con el PDF original del documento oficial, o convirtiéndolo a texto (.txt) antes de subirlo.';
+		        await db.query(
+		          `UPDATE auditorias
+		           SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'texto_no_extraible', rechazada_en = NOW()
+		           WHERE id = $2`,
+		          [mensaje, auditoria_id]
+		        );
+		        await enviarEmailRechazo(ciudadano_email, 'texto_no_extraible');
+		        console.log(`🔒 [${auditoria_id}] Rechazada — texto no extraíble ni por el método normal ni por el de respaldo`);
+		        return;
+		      }
     }
 
     // El hash se calcula SIEMPRE (es local, sin costo) — así, aunque este
@@ -4040,6 +4067,53 @@ async function extraerTextoPDF(rutaPDF) {
   return data.text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// ── Transcripción de respaldo vía Claude (visión) — 17 ago 2026 ─────────
+// Se activa SOLO cuando pdf-parse extrajo muy poco texto (ver el chequeo
+// en procesarAuditoria(), justo después de la extracción normal). Cubre
+// el caso real que expuso el hueco: un PDF "impreso" desde una página web
+// con Microsoft Print to PDF, perfectamente legible a simple vista, pero
+// con las letras dibujadas como trazos vectoriales en vez de texto real
+// — ni pdf-parse ni pdftotext pueden extraer nada de ahí.
+//
+// En vez de instalar OCR como dependencia de sistema en Railway (con el
+// riesgo de infraestructura que eso trae), se usa la propia API de
+// Claude: ya sabe leer PDFs directamente, renderizando cada página como
+// imagen internamente — funciona igual en documentos escaneados, en PDFs
+// sin capa de texto, y en este caso puntual — sin ninguna dependencia
+// nueva, reutilizando el mismo cliente que ya usa el resto del pipeline.
+// Límite real de la API: 100 páginas y ~32MB por solicitud.
+async function transcribirPDFConClaude(rutaPDF, auditoria_id = 'N/A') {
+  const buffer = fs.readFileSync(rutaPDF);
+  const pdfBase64 = buffer.toString('base64');
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-5',
+    max_tokens: 64000,
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'document',
+          source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 },
+        },
+        {
+          type: 'text',
+          text: 'Transcribe TODO el texto de este documento, palabra por palabra, tal como aparece — es un documento legal (ley, decreto, reglamento o política pública) que no tiene una capa de texto extraíble por métodos normales (probablemente porque se generó "imprimiendo" una página web a PDF, o es un documento escaneado). Transcribe el texto completo, en el mismo orden en que aparece, incluyendo títulos, artículos, numerales y disposiciones. No agregues comentarios tuyos, no resumas, no omitas nada — el objetivo es una transcripción fiel y completa, palabra por palabra, para que otro sistema la analice después. Responde ÚNICAMENTE con el texto transcrito, sin ningún encabezado ni explicación tuya antes o después.',
+        },
+      ],
+    }],
+  });
+
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error(`transcribirPDFConClaude [${auditoria_id}]: respuesta cortada por max_tokens (64000) — el documento es demasiado largo para transcribir en un solo llamado.`);
+  }
+  if (response.stop_reason === 'refusal') {
+    throw new Error(`transcribirPDFConClaude [${auditoria_id}]: Claude rehusó transcribir el documento (stop_reason: refusal).`);
+  }
+
+  return extraerTextoRespuesta(response);
+}
+
 // ── Soporte para documentos .txt, además de PDF (14 ago 2026) ────────────
 // Pedido de Moisés: algunos PDF pesan demasiado por gráficos decorativos,
 // pero convertidos a .txt sí se pueden auditar. En vez de cambiar el
@@ -4328,15 +4402,16 @@ a{color:#C41230}</style></head>
 async function enviarEmailRechazo(email, motivo) {
   const cuerpos = {
       texto_no_extraible: `<p>Hola,</p>
-         <p>No pudimos leer el texto del documento que subiste a Auditoría Cívica Liberal. Esto suele pasar cuando el PDF está guardado como imagen, o cuando el texto no es seleccionable — por ejemplo, si el archivo se generó "imprimiendo" una página web a PDF en vez de descargar el documento original.</p>
+         <p>No pudimos leer el texto del documento que subiste a Auditoría Cívica Liberal, ni siquiera con nuestro método de respaldo (que puede leer documentos escaneados o sin texto seleccionable). Esto puede pasar si el archivo está dañado, protegido, casi en blanco, o excede el límite de 100 páginas que admite nuestro sistema de lectura.</p>
          <p>Intenta subir el PDF oficial del documento (por ejemplo, directo de la Gaceta Oficial), un PDF donde puedas seleccionar y copiar el texto con el mouse, o convierte el documento a un archivo .txt antes de subirlo.</p>
          <p>Si crees que esto es un error, escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
          <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`,
 
     no_pertinente: `<p>Hola,</p>
-       <p>Revisamos el documento que subiste a Auditoría Cívica Liberal, y no pudimos admitirlo para el análisis: no parece tratarse de una ley, decreto, reglamento o política pública — que es justamente lo que audita nuestra plataforma.</p>
-       <p>Si crees que esto es un error, puedes volver a subir el documento correcto, o escribirnos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
-       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`,
+         <p>No pudimos leer el texto del documento que subiste a Auditoría Cívica Liberal. Esto suele pasar cuando el PDF está guardado como imagen, o cuando el texto no es seleccionable — por ejemplo, si el archivo se generó "imprimiendo" una página web a PDF en vez de descargar el documento original.</p>
+         <p>Intenta subir el PDF oficial del documento (por ejemplo, directo de la Gaceta Oficial), un PDF donde puedas seleccionar y copiar el texto con el mouse, o convierte el documento a un archivo .txt antes de subirlo.</p>
+         <p>Si crees que esto es un error, escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
+         <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`,
 
     fuera_de_alcance_geografico: `<p>Hola,</p>
        <p>Revisamos el documento que subiste a Auditoría Cívica Liberal. Es un documento legítimo, pero por ahora nuestro alcance se concentra únicamente en leyes, decretos y políticas públicas venezolanas — no pudimos admitirlo porque corresponde a otro país.</p>
