@@ -1799,7 +1799,13 @@ app.get('/podcast/textos-fijos', async (req, res) => {
   }
   try {
     const config = await obtenerConfiguracionPodcast();
-    res.json({ ok: true, texto_cortina: config.texto_cortina, texto_cierre: config.texto_cierre });
+    res.json({
+      ok: true,
+      texto_cortina: config.texto_cortina,
+      texto_cierre: config.texto_cierre,
+      tiene_musica_cortina: !!config.musica_cortina,
+      tiene_musica_cierre: !!config.musica_cierre,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
