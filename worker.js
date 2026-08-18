@@ -1692,6 +1692,217 @@ app.get('/regenerar-podcast', async (req, res) => {
   }
 });
 
+// ENDPOINT DE RECUPERACIÓN — retoma una auditoría que quedó interrumpida a
+// mitad de camino (ej. un despliegue mató el proceso mientras corría) SIN
+// repetir el análisis de los 39 criterios, que es lo más caro y lento del
+// pipeline. Revisa qué ya se alcanzó a guardar (reporte_texto, grafo_datos,
+// link_reporte, link_podcast, link_presentacion) y solo rehace lo que
+// falta — funciona sin importar en qué paso exacto se haya interrumpido,
+// no solo el caso puntual que lo motivó (17 ago 2026, Rafael Klemprer:
+// interrumpida durante el Podcast por un despliegue en curso).
+//
+// Requiere que la auditoría ya tenga reporte_texto guardado — sin eso no
+// hay nada que retomar (el análisis nunca terminó); en ese caso, usa
+// /reintentar-rechazada o pide que se vuelva a subir el documento.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/reanudar-auditoria?secret=TU_SECRETO&auditoria_id=ID_AQUI
+app.get('/reanudar-auditoria', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+  const auditoria_id = req.query.auditoria_id;
+  if (!auditoria_id) {
+    return res.status(400).type('text/plain').send('Falta ?auditoria_id en la URL');
+  }
+
+  const dir = path.join(DIRECTORIO_TEMP, `reanudar-${auditoria_id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const result = await db.query(
+      `SELECT a.reporte_texto, a.grafo_datos, a.titulo_documento, a.pais, a.pdf_drive_id,
+              a.link_original, a.link_reporte, a.link_podcast, a.link_presentacion,
+              a.estado, a.ciudadano_id, c.email AS ciudadano_email, c.nombre AS ciudadano_nombre
+       FROM auditorias a
+       LEFT JOIN ciudadanos c ON c.id = a.ciudadano_id
+       WHERE a.id = $1`,
+      [auditoria_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).type('text/plain').send('Auditoría no encontrada.');
+    }
+    const fila = result.rows[0];
+    if (!fila.reporte_texto) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene reporte_texto guardado — el análisis nunca terminó, no hay nada que retomar. Usa /reintentar-rechazada o pide que se vuelva a subir el documento.');
+    }
+    if (fila.estado === 'completada') {
+      return res.status(400).type('text/plain').send('Esta auditoría ya está completada — no hace falta reanudarla.');
+    }
+    if (!fila.pdf_drive_id) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene pdf_drive_id guardado — no se puede recuperar el documento original.');
+    }
+    if (!fila.ciudadano_email) {
+      return res.status(400).type('text/plain').send('No se pudo encontrar el ciudadano dueño de esta auditoría (¿ciudadano_id roto?).');
+    }
+
+    console.log(`   [REANUDAR] [${auditoria_id}] Retomando — link_reporte:${!!fila.link_reporte} link_podcast:${!!fila.link_podcast} link_presentacion:${!!fila.link_presentacion} grafo_datos:${!!fila.grafo_datos}`);
+
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+
+    // El original hace falta de todas formas — para volver a subirlo, y
+    // (si hiciera falta regenerar el grafo) para tener el texto completo.
+    const { texto: textoPDF, esTexto: esArchivoTexto, rutaOriginal: rutaDocumentoOriginal } = await descargarYExtraerTexto(drive, fila.pdf_drive_id, dir);
+
+    const pesosCriterios = await obtenerPesosCriterios();
+    const generadoEl = new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' });
+    const metadatos = { titulo: fila.titulo_documento, pais: fila.pais || '', generadoEl };
+
+    // Carpeta de Drive — idempotente: encuentra la que ya se haya creado
+    // en el intento anterior (busca por nombre = auditoria_id), o crea
+    // una si de verdad no existe todavía.
+    const carpetaId = await obtenerCarpetaAuditoria(drive, auditoria_id);
+    const identificadorLimpio = limpiarIdentificador(fila.titulo_documento);
+
+    // ── Reporte (PDF + datosReporte) ──────────────────────────────────
+    let datosReporte;
+    let linkReporte = fila.link_reporte;
+    if (!linkReporte) {
+      console.log(`   [REANUDAR] [${auditoria_id}] Regenerando y subiendo Reporte...`);
+      const rutaReportePDF = path.join(dir, 'reporte.pdf');
+      datosReporte = await generarReportePDF(
+        fila.reporte_texto,
+        { ...metadatos, fecha: '', paginas: '', marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026' },
+        rutaReportePDF, auditoria_id, pesosCriterios
+      );
+      linkReporte = await subirArchivo(drive, rutaReportePDF, `Auditoria_de_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
+    } else {
+      console.log(`   [REANUDAR] [${auditoria_id}] Reporte ya estaba subido, reutilizando`);
+      datosReporte = normalizarDatosEstructurados(fila.reporte_texto, auditoria_id, pesosCriterios);
+    }
+
+    // ── Grafo (Mapa Mental) — reutiliza si ya existe, regenera si no ──
+    let grafoDatos = fila.grafo_datos;
+    if (!grafoDatos) {
+      console.log(`   [REANUDAR] [${auditoria_id}] grafo_datos faltante, regenerando...`);
+      const promptGrafo = await obtenerPromptProducto('mapa_articulos');
+      const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id, promptGrafo);
+      grafoDatos = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id, pesosCriterios);
+      await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatos), auditoria_id]);
+    }
+
+    // ── Podcast ────────────────────────────────────────────────────────
+    let linkPodcast = fila.link_podcast;
+    if (!linkPodcast) {
+      console.log(`   [REANUDAR] [${auditoria_id}] Generando Podcast...`);
+      try {
+        const [textoVoces, textoReglas, textoCriteriosRevisor] = await Promise.all([
+          obtenerPromptProducto('podcast_generador_voces'),
+          obtenerPromptProducto('podcast_generador_reglas'),
+          obtenerPromptProducto('podcast_revisor_criterios'),
+        ]);
+        const resultadoGuion = await generarYRevisarGuion(datosReporte, metadatos, pesosCriterios, textoVoces, textoReglas, textoCriteriosRevisor);
+        const rutaMp3 = path.join(dir, 'podcast.mp3');
+        const piezasFijas = await prepararPiezasFijasPodcast(dir);
+        const fraseDinamica = `Hoy nos ocupamos de: ${fila.titulo_documento}.`;
+        await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica, ...piezasFijas });
+        linkPodcast = await subirArchivo(drive, rutaMp3, `Podcast_${identificadorLimpio}.mp3`, 'audio/mpeg', carpetaId);
+      } catch (errorPodcast) {
+        console.error(`   [REANUDAR] [${auditoria_id}] ⚠️ No se pudo generar el Podcast (no bloqueante):`, errorPodcast.message);
+      }
+    } else {
+      console.log(`   [REANUDAR] [${auditoria_id}] Podcast ya estaba subido, reutilizando`);
+    }
+
+    // ── Presentación ───────────────────────────────────────────────────
+    let linkPresentacion = fila.link_presentacion;
+    if (!linkPresentacion) {
+      console.log(`   [REANUDAR] [${auditoria_id}] Generando Presentación...`);
+      try {
+        const rutaPresentacionPDF = path.join(dir, 'presentacion.pdf');
+        const contactosApoyo = await obtenerContactosApoyoActivos();
+        const [estiloPersonaActivismo, reglasGeneracionActivismo] = await Promise.all([
+          obtenerPromptProducto('presentacion_activismo_estilo'),
+          obtenerPromptProducto('presentacion_activismo_reglas'),
+        ]);
+        await generarPresentacionPDF(
+          datosReporte, metadatos, rutaPresentacionPDF, auditoria_id,
+          grafoDatos, pesosCriterios, contactosApoyo,
+          { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo }
+        );
+        linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
+      } catch (errorPresentacion) {
+        console.error(`   [REANUDAR] [${auditoria_id}] ⚠️ No se pudo generar la Presentación (no bloqueante):`, errorPresentacion.message);
+      }
+    } else {
+      console.log(`   [REANUDAR] [${auditoria_id}] Presentación ya estaba subida, reutilizando`);
+    }
+
+    // ── Original ───────────────────────────────────────────────────────
+    let linkOriginal = fila.link_original;
+    if (!linkOriginal) {
+      const nombreOriginal = `${identificadorLimpio}_original.${esArchivoTexto ? 'txt' : 'pdf'}`;
+      const mimeOriginal = esArchivoTexto ? 'text/plain' : 'application/pdf';
+      linkOriginal = await subirArchivo(drive, rutaDocumentoOriginal, nombreOriginal, mimeOriginal, carpetaId);
+    }
+
+    // ── Metadatos adicionales (hash, identificador oficial, institución,
+    // período) — para que quede tan completa como una que termina de
+    // corrido. No bloqueante si algo de esto falla.
+    let hashDocumento = null, identificadorNormalizado = null, institucionEmisora = null, periodo = null;
+    try {
+      hashDocumento = calcularHashDocumento(textoPDF);
+      const metadatosCompletos = await extraerMetadatos(textoPDF);
+      identificadorNormalizado = normalizarIdentificadorOficial(metadatosCompletos.numeroOficial);
+      institucionEmisora = metadatosCompletos.institucionEmisora;
+      periodo = metadatosCompletos.periodo;
+    } catch (errorMetadatos) {
+      console.error(`   [REANUDAR] [${auditoria_id}] ⚠️ No se pudieron completar metadatos adicionales (no bloqueante):`, errorMetadatos.message);
+    }
+
+    // ── Cerrar la auditoría ────────────────────────────────────────────
+    try {
+      await db.query(
+        `UPDATE auditorias
+         SET estado = 'completada', link_original = $1, link_reporte = $2, link_podcast = $3,
+             link_presentacion = $4, drive_carpeta_id = $5, completada_en = NOW(), puntaje = $6,
+             hash_documento = $7, identificador_normalizado = $8, institucion_emisora = $9, periodo_documento = $10
+         WHERE id = $11`,
+        [linkOriginal, linkReporte, linkPodcast, linkPresentacion, carpetaId, datosReporte.puntaje,
+         hashDocumento, identificadorNormalizado, institucionEmisora, periodo, auditoria_id]
+      );
+    } catch (errorColumnasNuevas) {
+      console.error(`   [REANUDAR] [${auditoria_id}] ⚠️ No se pudieron guardar todas las columnas, completando con lo esencial:`, errorColumnasNuevas.message);
+      await db.query(
+        `UPDATE auditorias
+         SET estado = 'completada', link_original = $1, link_reporte = $2, link_podcast = $3,
+             link_presentacion = $4, drive_carpeta_id = $5, completada_en = NOW(), puntaje = $6
+         WHERE id = $7`,
+        [linkOriginal, linkReporte, linkPodcast, linkPresentacion, carpetaId, datosReporte.puntaje, auditoria_id]
+      );
+    }
+
+    const linksProductos = { reporte: linkReporte, podcast: linkPodcast, presentacion: linkPresentacion };
+    await enviarEmailFinal(fila.ciudadano_email, fila.ciudadano_nombre, fila.titulo_documento, auditoria_id, linksProductos);
+
+    try {
+      await enviarAvisoAuditoriaATodos(fila.ciudadano_id, fila.titulo_documento, auditoria_id, linksProductos);
+    } catch (errorAvisoMasivo) {
+      console.error(`   [REANUDAR] [${auditoria_id}] ⚠️ No se pudo enviar el aviso masivo (no bloqueante):`, errorAvisoMasivo.message);
+    }
+
+    console.log(`   [REANUDAR] ✅ [${auditoria_id}] Auditoría completada`);
+    res.type('text/plain').send(`✅ Listo — "${fila.titulo_documento}" quedó completada.\nReporte: ${linkReporte}\nPodcast: ${linkPodcast || '(no se pudo generar)'}\nPresentación: ${linkPresentacion || '(no se pudo generar)'}\nMapa Mental: https://liberalmente.app/auditoria/${auditoria_id}/grafo`);
+
+  } catch (error) {
+    console.error(`   [REANUDAR] ❌ [${auditoria_id}] Error:`, error.message);
+    res.status(500).type('text/plain').send('Error: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── Piezas fijas del podcast (cortina/cierre) — movido a Admin (2 ago 2026),
 // guardado directo en base de datos desde el 16 ago 2026 ──────────────────
 //
