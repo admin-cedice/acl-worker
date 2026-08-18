@@ -2158,9 +2158,9 @@ app.post('/procesar', async (req, res) => {
   if (!auditoria_id || !ciudadano_email || !pdf_drive_id) {
     return res.status(400).json({ error: 'Faltan datos requeridos' });
   }
-  res.json({ mensaje: 'Recibido, procesando en segundo plano', auditoria_id });
-  procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id).catch(err => {
-    console.error(`❌ [${auditoria_id}] Error no capturado:`, err.message);
+  res.json({ mensaje: 'Recibido, encolado para procesar', auditoria_id });
+  intentarProcesarSiguiente().catch(err => {
+    console.error(`❌ [${auditoria_id}] Error disparando la cola:`, err.message);
   });
 });
 
@@ -3761,6 +3761,76 @@ app.get('/continuar-procesamiento', async (req, res) => {
     res.status(500).type('text/html').send(paginaOptOut('Hubo un problema procesando tu solicitud. Intenta de nuevo más tarde, o escríbenos desde el formulario de contacto.'));
   }
 });
+
+// ── Cola de procesamiento — una auditoría a la vez (17 ago 2026) ─────────
+// Antes: /procesar disparaba procesarAuditoria() de inmediato, sin
+// esperarla — con dos subidas cercanas en el tiempo, Node quedaba con más
+// de una auditoría "viva" a la vez (alternándose cada vez que una quedaba
+// esperando un llamado externo — a Claude, a Drive, etc.), aunque el
+// worker corra en una sola réplica. Caso real: alguien subió el mismo
+// documento dos veces por error y las dos se procesaron en paralelo.
+//
+// Reclama, de forma atómica, la auditoría 'pendiente' más antigua que
+// todavía nadie haya tomado. FOR UPDATE SKIP LOCKED dentro de una
+// transacción CORTA (no mantiene ningún lock abierto durante los varios
+// minutos que dura procesar una auditoría completa, que agotaría rápido
+// el pool de conexiones compartido con el resto del worker) — es lo que
+// hace esto seguro incluso si algún día se sube el número de réplicas de
+// este servicio en Railway (hoy: 1 sola, confirmado en Settings → Scale).
+async function reclamarSiguienteAuditoria() {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `SELECT a.id, a.pdf_drive_id, c.email AS ciudadano_email
+       FROM auditorias a
+       JOIN ciudadanos c ON c.id = a.ciudadano_id
+       WHERE a.estado = 'pendiente' AND a.procesamiento_iniciado_en IS NULL
+       ORDER BY a.creada_en ASC
+       LIMIT 1
+       FOR UPDATE OF a SKIP LOCKED`
+    );
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    const siguiente = rows[0];
+    await client.query(`UPDATE auditorias SET procesamiento_iniciado_en = NOW() WHERE id = $1`, [siguiente.id]);
+    await client.query('COMMIT');
+    return siguiente;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// procesandoEnEstaReplica: protección adicional en memoria — evita que
+// esta misma réplica arranque dos ciclos de cola a la vez si /procesar se
+// llama varias veces seguidas muy rápido. No reemplaza al FOR UPDATE SKIP
+// LOCKED de arriba (esa es la protección real, a nivel de base de datos);
+// esto es solo para no hacer consultas de más dentro del mismo proceso.
+let procesandoEnEstaReplica = false;
+
+async function intentarProcesarSiguiente() {
+  if (procesandoEnEstaReplica) return;
+  procesandoEnEstaReplica = true;
+  try {
+    const siguiente = await reclamarSiguienteAuditoria();
+    if (!siguiente) return; // cola vacía
+    console.log(`   [COLA] Procesando: ${siguiente.id}`);
+    await procesarAuditoria(siguiente.id, siguiente.ciudadano_email, siguiente.pdf_drive_id);
+  } catch (err) {
+    console.error(`   [COLA] Error:`, err.message);
+  } finally {
+    procesandoEnEstaReplica = false;
+  }
+  // Fuera del finally, sin await: encadena para revisar si quedó algo más
+  // en la cola — después de liberar la bandera de arriba, para no
+  // bloquearse a sí misma.
+  intentarProcesarSiguiente().catch(err => console.error(`   [COLA] Error en el siguiente ciclo:`, err.message));
+}
 
 // ── Función principal ────────────────────────────────────────────────────────
 
