@@ -1884,7 +1884,7 @@ app.get('/reanudar-auditoria', async (req, res) => {
     }
 
     const linksProductos = { reporte: linkReporte, podcast: linkPodcast, presentacion: linkPresentacion };
-    await enviarEmailFinal(fila.ciudadano_email, fila.ciudadano_nombre, fila.titulo_documento, auditoria_id, linksProductos);
+    await enviarEmailFinal(fila.ciudadano_email, fila.ciudadano_nombre, fila.titulo_documento, auditoria_id, linksProductos, fila.ciudadano_id);
 
     try {
       await enviarAvisoAuditoriaATodos(fila.ciudadano_id, fila.titulo_documento, auditoria_id, linksProductos);
@@ -3832,6 +3832,60 @@ async function intentarProcesarSiguiente() {
   intentarProcesarSiguiente().catch(err => console.error(`   [COLA] Error en el siguiente ciclo:`, err.message));
 }
 
+// ── Baja de cuenta, autoservicio del ciudadano (17 ago 2026) ─────────────
+// Distinto de /notificaciones/optout (que SOLO calla el aviso masivo de
+// "otro ciudadano completó una auditoría"): este link desactiva la cuenta
+// completa (ciudadanos.activo = false) — mismo efecto que el botón
+// "Desactivar" de /admin/ciudadanos, pero disparado por el propio
+// ciudadano. Confirmado (17 ago 2026): /api/sesion/login y
+// /api/sesion/confirmar ya exigen activo = true en sus consultas — una
+// cuenta desactivada por esta vía pierde el acceso de verdad, no solo los
+// correos.
+//
+// BAJA SUAVE, a propósito (decisión de Moisés, 17 ago 2026): esto NO
+// borra el registro ni sus auditorías ya completadas — esas siguen
+// públicas, por la misma decisión de diseño de siempre. Si en el futuro
+// se quiere ofrecer borrado real de datos personales, es una pieza
+// aparte, deliberada, no un efecto secundario de este endpoint.
+//
+// Público, sin secreto — token firmado con WORKER_SECRET, namespaced con
+// el prefijo "baja:" para que nunca se confunda con generarTokenOptOut()
+// ni generarTokenContinuar() aunque coincida el id de ciudadano.
+function generarTokenBaja(ciudadanoId) {
+  return crypto.createHmac('sha256', WORKER_SECRET).update(`baja:${ciudadanoId}`).digest('hex');
+}
+
+function verificarTokenBaja(ciudadanoId, tokenRecibido) {
+  if (!ciudadanoId || !tokenRecibido) return false;
+  const esperado = generarTokenBaja(ciudadanoId);
+  const bufA = Buffer.from(String(tokenRecibido));
+  const bufB = Buffer.from(esperado);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+app.get('/ciudadano/darse-de-baja', async (req, res) => {
+  const { id, token } = req.query;
+  if (!id || !token || !verificarTokenBaja(id, token)) {
+    return res.status(400).type('text/html').send(
+      paginaOptOut('El enlace no es válido o está incompleto. Si quieres darte de baja de Auditoría Cívica Liberal, escríbenos desde <a href="https://liberalmente.app/#contacto">el formulario de contacto</a>.')
+    );
+  }
+  try {
+    const result = await db.query(`UPDATE ciudadanos SET activo = false WHERE id = $1 RETURNING nombre`, [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).type('text/html').send(paginaOptOut('No encontramos esa cuenta — puede que ya se haya dado de baja antes.'));
+    }
+    console.log(`   [ciudadano/darse-de-baja] ${id} desactivado por autoservicio`);
+    res.type('text/html').send(
+      paginaOptOut('Listo — tu cuenta quedó desactivada. Ya no recibirás correos de Auditoría Cívica Liberal, ni podrás iniciar sesión. Las auditorías que ya hayas completado siguen visibles públicamente, como todas las de la plataforma. Si fue un error, o quieres reactivarla más adelante, escríbenos desde el formulario de contacto y te ayudamos.')
+    );
+  } catch (error) {
+    console.error('[ciudadano/darse-de-baja] Error:', error.message);
+    res.status(500).type('text/html').send(paginaOptOut('Hubo un problema procesando tu solicitud. Intenta de nuevo más tarde, o escríbenos desde el formulario de contacto.'));
+  }
+});
+
 // ── Función principal ────────────────────────────────────────────────────────
 
 async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, saltarFiltro = false, saltarDuplicados = false) {
@@ -4237,8 +4291,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	      podcast: linkPodcast,
 	      presentacion: linkPresentacion,
 	    };
-	    await enviarEmailFinal(ciudadano_email, nombreCiudadano, metadatos.titulo, auditoria_id, linksProductos);
-
+        await enviarEmailFinal(ciudadano_email, nombreCiudadano, metadatos.titulo, auditoria_id, linksProductos, ciudadanoId);
 	    console.log(`📣 [${auditoria_id}] PASO 8.5: Avisando a otros ciudadanos registrados...`);
 	    try {
 	      await enviarAvisoAuditoriaATodos(ciudadanoId, metadatos.titulo, auditoria_id, linksProductos);
@@ -4541,9 +4594,15 @@ async function actualizarEstado(auditoria_id, estado) {
   await db.query(`UPDATE auditorias SET estado = $1 WHERE id = $2`, [estado, auditoria_id]);
 }
 
-async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links) {
+async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links, ciudadanoId = null) {
   const primerNombre = nombre ? nombre.split(' ')[0] : null;
   const saludo = primerNombre ? `Hola, ${primerNombre}.` : 'Hola,';
+
+  // 17 ago 2026: link de baja de cuenta, solo si tenemos el id del
+  // ciudadano (siempre debería venir).
+  const linkBajaHTML = ciudadanoId
+    ? `<p style="font-size:11px;color:#aaa;margin-top:14px">¿Ya no quieres seguir recibiendo estos correos? <a href="${WORKER_URL_PUBLICO}/ciudadano/darse-de-baja?id=${ciudadanoId}&token=${generarTokenBaja(ciudadanoId)}">Date de baja aquí</a>.</p>`
+    : '';
 
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -4564,9 +4623,10 @@ async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links) {
         <p>Accede a todos tus análisis en <a href="https://liberalmente.app/biblioteca">liberalmente.app/biblioteca</a>; y si quieres compartir este correo con otras personas, ¡no dudes en reenviárselos!</p>
         <p>Saludos,</p>
         <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>
-      `,
-    }),
-  });
+		        ${linkBajaHTML}
+		      `,
+		    }),
+		  });
   if (!res.ok) throw new Error(`Error enviando email final: ${await res.text()}`);
   console.log(`   ✅ Email final enviado a ${email}`);
 }
@@ -4624,7 +4684,8 @@ async function enviarAvisoAuditoriaATodos(ciudadanoExcluidoId, titulo, auditoria
     const primerNombre = c.nombre ? c.nombre.split(' ')[0] : null;
     const saludo = primerNombre ? `Hola, ${primerNombre}.` : 'Hola,';
     const tokenOptOut = generarTokenOptOut(c.id);
-    const linkOptOut = `${WORKER_URL_PUBLICO}/notificaciones/optout?id=${c.id}&token=${tokenOptOut}`;
+	    const linkOptOut = `${WORKER_URL_PUBLICO}/notificaciones/optout?id=${c.id}&token=${tokenOptOut}`;
+	    const linkBaja = `${WORKER_URL_PUBLICO}/ciudadano/darse-de-baja?id=${c.id}&token=${generarTokenBaja(c.id)}`;
 
     return {
       from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
@@ -4642,7 +4703,7 @@ async function enviarAvisoAuditoriaATodos(ciudadanoExcluidoId, titulo, auditoria
         <p>Si quieres compartir este correo con otras personas, ¡no dudes en reenviárselos!</p>
         <p>Saludos,</p>
         <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>
-        <p style="font-size:12px;color:#888">Si no quisieras continuar recibiendo auditorías hechas por otros ciudadanos, <a href="${linkOptOut}">haz click aquí</a>.</p>
+        <p style="font-size:12px;color:#888">Si no quisieras continuar recibiendo auditorías hechas por otros ciudadanos, <a href="${linkOptOut}">haz click aquí</a>. Si prefieres darte de baja por completo de Auditoría Cívica Liberal, <a href="${linkBaja}">haz click aquí</a>.</p>
       `,
     };
   });
