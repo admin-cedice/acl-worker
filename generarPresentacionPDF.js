@@ -61,6 +61,14 @@
 // calcularSeccionesHorizonte() (dead code ya desde antes de este cambio,
 // solo usado por generarLaminasHallazgosHTML(), que tampoco se llama
 // desde generarHTML()) quedan intactos sin tocar.
+//
+// v4.1 (20 ago 2026) — DISCLAIMER DE PORTADA: generarPresentacionPDF()
+// acepta un noveno parámetro opcional `disclaimer` (texto plano, ej.
+// desde prompts_productos, clave "disclaimer_presentacion") — mismo
+// mecanismo que generarReportePDF.js: se inyecta literal (escapado con
+// esc(), sin pasar por Claude), centrado bajo la portada. Si llega null
+// (la clave todavía no existe), no se muestra nada — no bloquea la
+// generación de la presentación.
 
 'use strict';
 
@@ -180,6 +188,16 @@ const CSS = `
   .motto-linea1 { font-family: Georgia, 'Times New Roman', serif; font-size: 25px; font-weight: 700; color: #1A1A1A; }
   .motto-linea2 { font-family: Georgia, 'Times New Roman', serif; font-size: 25px; font-style: italic; color: #C41230; }
 
+  .portada-disclaimer-pres {
+    flex: 0 0 auto;
+    padding: 0 52px 22px;
+    text-align: center;
+    font-size: 11px;
+    color: #8A8478;
+    line-height: 1.5;
+    font-style: italic;
+  }
+
   .lamina-hallazgo { break-before: page; height: 178mm; display: flex; flex-direction: column; }
   .hallazgo-header { flex: 0 0 auto; display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 10px; margin-bottom: 14px; }
   .hallazgo-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 22px; font-weight: 700; }
@@ -243,9 +261,16 @@ const CSS = `
 // El color sigue el mismo semáforo de siempre (rojo/dorado/verde) según el
 // rango del porcentaje, pero ya no está atado a ninguna decisión de
 // contenido — es puramente visual, igual que en el Reporte.
-function generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje) {
+// 20 ago 2026 (v4.1): quinto parámetro opcional `disclaimer` — mismo
+// mecanismo que generarReportePDF.js (prompts_productos, clave
+// "disclaimer_presentacion").
+function generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje, disclaimer = null) {
   const color = alineacionPorcentaje < 20 ? '#C41230' : alineacionPorcentaje > 80 ? '#2E7D32' : '#B8860B';
   const tituloHero = `Alineación Liberal: ${alineacionPorcentaje}%. Ideas de Activismo`;
+
+  const disclaimerHTML = disclaimer
+    ? `<div class="portada-disclaimer-pres">${esc(disclaimer)}</div>`
+    : '';
 
   return `
 <div class="portada-pres">
@@ -269,6 +294,7 @@ function generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje) {
       <div class="motto-linea2">Audita el poder.</div>
     </div>
   </div>
+  ${disclaimerHTML}
 </div>`;
 }
 
@@ -378,9 +404,9 @@ function generarLaminaContactoHTML(contactos, esDummy) {
 
 function generarHTML(datos, metadatos, contexto) {
   const { titulo = 'Documento auditado', pais = '', generadoEl = '' } = metadatos;
-  const { alineacionPorcentaje, ideasConCriterio, contactosApoyo, contactosSonDummy } = contexto;
+  const { alineacionPorcentaje, ideasConCriterio, contactosApoyo, contactosSonDummy, disclaimer } = contexto;
 
-  const portadaHTML   = generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje);
+  const portadaHTML   = generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje, disclaimer);
   const activismoHTML = generarLaminasIdeasHTML(ideasConCriterio);
   const contactoHTML  = generarLaminaContactoHTML(contactosApoyo, contactosSonDummy);
 
@@ -513,12 +539,14 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 }
 
 // ── Función principal exportada ───────────────────────────────────────────
-// Firma SIN CAMBIOS respecto al v3.0 — ningún llamador en worker.js
-// necesita modificarse por esto. `grafoDatos` (quinto parámetro) se sigue
-// aceptando pero ya no se usa — ver el changelog v4.0 al inicio del
-// archivo.
-async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}, contactosApoyo = null, promptsActivismo = {}) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v4.0`);
+// Firma: se agrega un noveno parámetro opcional `disclaimer` (20 ago
+// 2026, v4.1) — ningún llamador existente en worker.js necesita cambiar
+// salvo para empezar a pasarlo; si no lo pasa, sigue funcionando igual
+// que antes (sin disclaimer en la portada). `grafoDatos` (quinto
+// parámetro) se sigue aceptando pero ya no se usa — ver el changelog v4.0
+// al inicio del archivo.
+async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id, grafoDatos = null, pesosCriterios = {}, contactosApoyo = null, promptsActivismo = {}, disclaimer = null) {
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarPresentacionPDF v4.1 (disclaimer de portada)`);
 
   const seleccion = seleccionarPuntosDestacados(datos, pesosCriterios);
   console.log(`   [${auditoria_id}] Alineación: ${seleccion.alineacionPorcentaje}% — puntos seleccionados: ${seleccion.negativos.length} negativo(s), ${seleccion.positivos.length} positivo(s)`);
@@ -549,6 +577,7 @@ async function generarPresentacionPDF(datos, metadatos, rutaSalida, auditoria_id
     ideasConCriterio,
     contactosApoyo: contactos,
     contactosSonDummy,
+    disclaimer,
   });
   const rutaHTML = rutaSalida.replace('.pdf', '.html');
   fs.writeFileSync(rutaHTML, html, 'utf8');

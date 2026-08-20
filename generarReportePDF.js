@@ -1,4 +1,4 @@
-// generarReportePDF.js — ACL Worker v4.0
+// generarReportePDF.js — ACL Worker v4.1
 // Genera el reporte de auditoría en HTML y lo convierte a PDF con CloudConvert
 // Umbusk LLC · Auditoría Cívica Liberal
 //
@@ -111,6 +111,16 @@
 //      peso con normalidad — el campo descalificador, si existe, ya no se
 //      lee ni se usa para nada. generarPresentacionPDF.js (v2.9) recibe el
 //      mismo tratamiento — ver su propio changelog.
+//
+// CAMBIOS v4.1 (20 ago 2026) — DISCLAIMER DE PORTADA:
+//  47. generarReportePDF() acepta un sexto parámetro opcional
+//      `disclaimer` (texto plano, ej. desde prompts_productos, clave
+//      "disclaimer_reporte") — se inyecta literal (escapado con esc(),
+//      sin pasar por Claude) centrado al pie de la portada, aprovechando
+//      que .portada-body ya tiene flex:1 (cualquier hermano que venga
+//      después queda empujado al fondo, sin tocar el resto del layout).
+//      Si llega null (la clave todavía no existe en prompts_productos),
+//      no se muestra nada — no bloquea la generación del reporte.
 
 'use strict';
 
@@ -330,7 +340,7 @@ function colorAlerta(gravedad) {
   return                                     { fondo: '#E8F0F7', borde: '#B5CDE0', badge: '#2A6496' };
 }
 
-// ── CSS del reporte (sin cambios respecto a v3.1) ────────────────────────────
+// ── CSS del reporte (sin cambios respecto a v3.1, salvo .portada-disclaimer) ─
 
 const CSS = `
   @page {
@@ -422,6 +432,16 @@ const CSS = `
     padding: 40px 52px 0;
     display: flex;
     flex-direction: column;
+  }
+
+  .portada-disclaimer {
+    flex-shrink: 0;
+    padding: 14px 52px 26px;
+    text-align: center;
+    font-size: 10px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    font-style: italic;
   }
 
   .portada-etiqueta {
@@ -1042,11 +1062,12 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
 }
 
 // ── Generar HTML ─────────────────────────────────────────────────────────────
-// Sin cambios respecto a v3.1 — consume la misma forma de "datos" que
-// devolvía parsearReporte(), y normalizarDatosEstructurados() la respeta a
+// Sin cambios respecto a v3.1 salvo el tercer parámetro `disclaimer` (20
+// ago 2026) — consume la misma forma de "datos" que devolvía
+// parsearReporte(), y normalizarDatosEstructurados() la respeta a
 // propósito para no tener que tocar nada de esto.
 
-function generarHTML(datos, metadatos) {
+function generarHTML(datos, metadatos, disclaimer = null) {
   const {
     puntaje: puntajeRaw,
     siPlenos         = 0,
@@ -1149,6 +1170,14 @@ function generarHTML(datos, metadatos) {
   </table>
 </div>` : '';
 
+  // 20 ago 2026: disclaimer de portada — texto de Roberto, guardado en
+  // prompts_productos (clave "disclaimer_reporte"), inyectado literal, sin
+  // pasar por Claude. Si esa clave todavía no existe, llega null y no se
+  // muestra nada — no bloquea la generación del reporte.
+  const disclaimerHTML = disclaimer
+    ? `<div class="portada-disclaimer">${esc(disclaimer)}</div>`
+    : '';
+
   const htmlPortada = `
 <div class="portada">
   <div class="portada-cinta"></div>
@@ -1166,6 +1195,7 @@ function generarHTML(datos, metadatos) {
     ${puntosClaveHTML}
     ${htmlResumenCompacto}
   </div>
+  ${disclaimerHTML}
 </div>`;
 
   const htmlResumen = `
@@ -1427,9 +1457,12 @@ async function convertirHTMLaPDF(rutaHTML, rutaPDF, auditoria_id) {
 // v4.4 (31 jul 2026): quinto parámetro opcional `pesosCriterios`, pasado
 // tal cual a normalizarDatosEstructurados(). worker.js lo obtiene de
 // configuracion_doctrinal.pesos_criterios antes de llamar esta función.
+// v4.1 (20 ago 2026): sexto parámetro opcional `disclaimer`, pasado tal
+// cual a generarHTML(). worker.js lo obtiene de prompts_productos (clave
+// "disclaimer_reporte") antes de llamar esta función.
 
-async function generarReportePDF(reporteJSON, metadatos, rutaSalida, auditoria_id, pesosCriterios = {}) {
-  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v4.0 (salida estructurada)`);
+async function generarReportePDF(reporteJSON, metadatos, rutaSalida, auditoria_id, pesosCriterios = {}, disclaimer = null) {
+  console.log(`\n   ▶ [${auditoria_id}] INICIO generarReportePDF v4.1 (disclaimer de portada)`);
 
   console.log(`   [${auditoria_id}] Paso 1: Normalizando datos estructurados...`);
   const datos = normalizarDatosEstructurados(reporteJSON, auditoria_id, pesosCriterios);
@@ -1440,7 +1473,7 @@ async function generarReportePDF(reporteJSON, metadatos, rutaSalida, auditoria_i
   datos.puntosClave      = puntosClave;
 
   console.log(`   [${auditoria_id}] Paso 3: Generando HTML...`);
-  const html     = generarHTML(datos, metadatos);
+  const html     = generarHTML(datos, metadatos, disclaimer);
   const rutaHTML = rutaSalida.replace('.pdf', '.html');
   fs.writeFileSync(rutaHTML, html, 'utf8');
   console.log(`   [${auditoria_id}] HTML generado (${Math.round(html.length / 1024)} KB)`);
