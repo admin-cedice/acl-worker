@@ -1586,10 +1586,13 @@ app.get('/regenerar-presentacion', async (req, res) => {
     // 4 ago 2026: estilo de las ideas de activismo — si alguna clave todavía
     // no existe en prompts_productos, generarActivismo.js usa su propio
     // respaldo para esa pieza específica.
-    const [estiloPersonaActivismo, reglasGeneracionActivismo] = await Promise.all([
-      obtenerPromptProducto('presentacion_activismo_estilo'),
-      obtenerPromptProducto('presentacion_activismo_reglas'),
-    ]);
+    const [estiloPersonaActivismo, reglasGeneracionActivismo, disclaimerPresentacion] = await Promise.all([
+	  obtenerPromptProducto('presentacion_activismo_estilo'),
+	  obtenerPromptProducto('presentacion_activismo_reglas'),
+	  obtenerPromptProducto('disclaimer_presentacion'),
+	]);
+
+    console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
 
     console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
     await generarPresentacionPDF(
@@ -1604,7 +1607,8 @@ app.get('/regenerar-presentacion', async (req, res) => {
       grafo_datos,
       pesosCriterios,
       contactosApoyo,
-      { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo }
+      { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo },
+      disclaimerPresentacion
     );
 
     const driveAuth = autenticarDrive();
@@ -1775,11 +1779,12 @@ app.get('/reanudar-auditoria', async (req, res) => {
     let linkReporte = fila.link_reporte;
     if (!linkReporte) {
       console.log(`   [REANUDAR] [${auditoria_id}] Regenerando y subiendo Reporte...`);
-      const rutaReportePDF = path.join(dir, 'reporte.pdf');
+	  const rutaReportePDF = path.join(dir, 'reporte.pdf');
+	  const disclaimerReporte = await obtenerPromptProducto('disclaimer_reporte');
       datosReporte = await generarReportePDF(
         fila.reporte_texto,
         { ...metadatos, fecha: '', paginas: '', marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026' },
-        rutaReportePDF, auditoria_id, pesosCriterios
+        rutaReportePDF, auditoria_id, pesosCriterios, disclaimerReporte
       );
       linkReporte = await subirArchivo(drive, rutaReportePDF, `Auditoria_de_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
     } else {
@@ -1827,14 +1832,16 @@ app.get('/reanudar-auditoria', async (req, res) => {
       try {
         const rutaPresentacionPDF = path.join(dir, 'presentacion.pdf');
         const contactosApoyo = await obtenerContactosApoyoActivos();
-        const [estiloPersonaActivismo, reglasGeneracionActivismo] = await Promise.all([
-          obtenerPromptProducto('presentacion_activismo_estilo'),
-          obtenerPromptProducto('presentacion_activismo_reglas'),
-        ]);
+		const [estiloPersonaActivismo, reglasGeneracionActivismo, disclaimerPresentacion] = await Promise.all([
+		  obtenerPromptProducto('presentacion_activismo_estilo'),
+		  obtenerPromptProducto('presentacion_activismo_reglas'),
+		  obtenerPromptProducto('disclaimer_presentacion'),
+		]);
         await generarPresentacionPDF(
           datosReporte, metadatos, rutaPresentacionPDF, auditoria_id,
           grafoDatos, pesosCriterios, contactosApoyo,
-          { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo }
+          { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo },
+          disclaimerPresentacion
         );
         linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
       } catch (errorPresentacion) {
@@ -4130,7 +4137,12 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`✅ [${auditoria_id}] Reporte generado (${reporte.length} chars)`);
 
     console.log(`📄 [${auditoria_id}] PASO 6: Generando PDF del reporte (diseño institucional)...`);
-    const pesosCriterios = await obtenerPesosCriterios();
+	const pesosCriterios = await obtenerPesosCriterios();
+	// 20 ago 2026: disclaimer de portada — texto de Roberto, guardado en
+	// prompts_productos como cualquier otro producto comunicacional. Si
+	// la clave todavía no existe, llega null (mismo patrón de siempre) —
+	// generarReportePDF.js decide qué hacer en ese caso.
+	const disclaimerReporte = await obtenerPromptProducto('disclaimer_reporte');
     const datosReporte = await generarReportePDF(
       reporte,
       {
@@ -4142,9 +4154,10 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
         generadoEl:     new Date().toLocaleDateString('es-VE', { year:'numeric', month:'long', day:'numeric' }),
       },
       rutaReportePDF,
-      auditoria_id,
-      pesosCriterios
-    );
+	  auditoria_id,
+	  pesosCriterios,
+	  disclaimerReporte
+	);
     console.log(`✅ [${auditoria_id}] PDF del reporte generado — alineación: ${datosReporte.puntaje !== null ? datosReporte.puntaje + '%' : 'sin total general'}`);
 
     console.log(`🕸️  [${auditoria_id}] PASO 6.5: Generando datos del grafo (artículos + citas con Claude)...`);
@@ -4207,10 +4220,11 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	      // 4 ago 2026: estilo de las ideas de activismo — si alguna clave
 	      // todavía no existe en prompts_productos, generarActivismo.js usa
 	      // su propio respaldo para esa pieza específica.
-	      const [estiloPersonaActivismo, reglasGeneracionActivismo] = await Promise.all([
-	        obtenerPromptProducto('presentacion_activismo_estilo'),
-	        obtenerPromptProducto('presentacion_activismo_reglas'),
-	      ]);
+	      const [estiloPersonaActivismo, reglasGeneracionActivismo, disclaimerPresentacion] = await Promise.all([
+		    obtenerPromptProducto('presentacion_activismo_estilo'),
+		    obtenerPromptProducto('presentacion_activismo_reglas'),
+		    obtenerPromptProducto('disclaimer_presentacion'),
+		  ]);
 	      await generarPresentacionPDF(
 	        datosReporte,
 	        {
@@ -4219,11 +4233,12 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	          generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
 	        },
 	        rutaPresentacionPDF,
-	        auditoria_id,
-	        grafoDatosCompartido,
-	        pesosCriterios,
-	        contactosApoyo,
-	        { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo }
+		    auditoria_id,
+			grafoDatosCompartido,
+			pesosCriterios,
+			contactosApoyo,
+			{ estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo },
+		    disclaimerPresentacion
 	      );
 	      linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
 	      console.log(`✅ [${auditoria_id}] Presentación generada y subida`);
