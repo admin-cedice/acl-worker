@@ -569,6 +569,7 @@ function exigirAdminValido(req, res) {
 function extraerTextoRespuesta(response) {
   const bloqueTexto = response.content.find(b => b.type === 'text');
   if (!bloqueTexto) {
+    console.error('   [extraerTextoRespuesta] Sin bloque de texto — stop_reason:', response.stop_reason, '· tipos de bloque recibidos:', response.content.map(b => b.type).join(', ') || '(vacío)');
     throw new Error('La respuesta de Claude no incluyó ningún bloque de texto (revisar response.content completo)');
   }
   return bloqueTexto.text;
@@ -626,17 +627,21 @@ async function filtrarAdmisibilidad(textoDocumento, promptAdmisibilidad) {
     : PROMPT_ADMISIBILIDAD_RESPALDO;
   const promptFinal = promptBase + INSTRUCCION_ALCANCE_VENEZUELA;
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-5',
-    max_tokens: 300,
-    messages: [{
-      role: 'user',
-      content: `${promptFinal}\n\nDOCUMENTO A EVALUAR (primeros 8000 caracteres):\n${textoDocumento.slice(0, 8000)}`,
-    }],
-  });
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: `${promptFinal}\n\nDOCUMENTO A EVALUAR (primeros 8000 caracteres):\n${textoDocumento.slice(0, 8000)}`,
+      }],
+    });
 
-  const textoRespuesta = extraerTextoRespuesta(response);
-  return parsearVeredictoAdmisibilidad(textoRespuesta);
+    if (response.stop_reason === 'refusal') {
+      throw new Error('filtrarAdmisibilidad: Claude rehusó evaluar este documento (stop_reason: refusal) — revisar el documento manualmente antes de reintentar.');
+    }
+
+    const textoRespuesta = extraerTextoRespuesta(response);
+    return parsearVeredictoAdmisibilidad(textoRespuesta);
 }
 
 // ── Autenticación Google Cloud (cuenta de servicio) ──────────────────────────
