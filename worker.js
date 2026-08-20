@@ -1883,14 +1883,9 @@ app.get('/reanudar-auditoria', async (req, res) => {
       );
     }
 
-    const linksProductos = { reporte: linkReporte, podcast: linkPodcast, presentacion: linkPresentacion };
-    await enviarEmailFinal(fila.ciudadano_email, fila.ciudadano_nombre, fila.titulo_documento, auditoria_id, linksProductos, fila.ciudadano_id);
-
-    try {
-      await enviarAvisoAuditoriaATodos(fila.ciudadano_id, fila.titulo_documento, auditoria_id, linksProductos);
-    } catch (errorAvisoMasivo) {
-      console.error(`   [REANUDAR] [${auditoria_id}] ⚠️ No se pudo enviar el aviso masivo (no bloqueante):`, errorAvisoMasivo.message);
-    }
+        const linksProductos = { reporte: linkReporte, podcast: linkPodcast, presentacion: linkPresentacion };
+	    await enviarEmailFinal(fila.ciudadano_email, fila.ciudadano_nombre, fila.titulo_documento, auditoria_id, linksProductos, fila.ciudadano_id);
+    // Aviso masivo desactivado — ver nota en procesarAuditoria() PASO 8.5 (19 ago 2026).
 
     console.log(`   [REANUDAR] ✅ [${auditoria_id}] Auditoría completada`);
     res.type('text/plain').send(`✅ Listo — "${fila.titulo_documento}" quedó completada.\nReporte: ${linkReporte}\nPodcast: ${linkPodcast || '(no se pudo generar)'}\nPresentación: ${linkPresentacion || '(no se pudo generar)'}\nMapa Mental: https://liberalmente.app/auditoria/${auditoria_id}/grafo`);
@@ -4292,12 +4287,11 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	      presentacion: linkPresentacion,
 	    };
         await enviarEmailFinal(ciudadano_email, nombreCiudadano, metadatos.titulo, auditoria_id, linksProductos, ciudadanoId);
-	    console.log(`📣 [${auditoria_id}] PASO 8.5: Avisando a otros ciudadanos registrados...`);
-	    try {
-	      await enviarAvisoAuditoriaATodos(ciudadanoId, metadatos.titulo, auditoria_id, linksProductos);
-	    } catch (errorAvisoMasivo) {
-	      console.error(`⚠️  [${auditoria_id}] No se pudo enviar el aviso masivo (no bloqueante):`, errorAvisoMasivo.message);
-	    }
+	    // PASO 8.5 ELIMINADO (19 ago 2026, feedback de beta-testers): el aviso
+	    // masivo a "todos los ciudadanos activos" se sentía como spam — el
+	    // opt-out no bastaba. Se desactiva la llamada mientras se diseña un
+	    // opt-in real. enviarAvisoAuditoriaATodos() y /notificaciones/optout
+	    // se dejan intactos, sin usar, para reutilizarlos en esa función.
 
     console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
 
