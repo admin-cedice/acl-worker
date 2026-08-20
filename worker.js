@@ -1781,8 +1781,7 @@ app.get('/reanudar-auditoria', async (req, res) => {
       console.log(`   [REANUDAR] [${auditoria_id}] Regenerando y subiendo Reporte...`);
 	  const rutaReportePDF = path.join(dir, 'reporte.pdf');
 	  const disclaimerReporte = await obtenerPromptProducto('disclaimer_reporte');
-	  console.log(`   [DEBUG DISCLAIMER] Reporte: "${disclaimerReporte}"`);
-      datosReporte = await generarReportePDF(
+	  datosReporte = await generarReportePDF(
         fila.reporte_texto,
         { ...metadatos, fecha: '', paginas: '', marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026' },
         rutaReportePDF, auditoria_id, pesosCriterios, disclaimerReporte
@@ -1837,7 +1836,6 @@ app.get('/reanudar-auditoria', async (req, res) => {
 		  obtenerPromptProducto('presentacion_activismo_estilo'),
 		  obtenerPromptProducto('presentacion_activismo_reglas'),
 		  obtenerPromptProducto('disclaimer_presentacion'),
-		  console.log(`   [DEBUG DISCLAIMER] Presentación: "${disclaimerPresentacion}"`);
 		]);
         await generarPresentacionPDF(
           datosReporte, metadatos, rutaPresentacionPDF, auditoria_id,
