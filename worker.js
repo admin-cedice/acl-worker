@@ -1489,6 +1489,123 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', version: '3.36', timestamp: new Date().toISOString() });
 });
 
+// ENDPOINT DE RECUPERACIÓN — reclasifica tipo_instrumento/materia (y de
+// paso título/país/categoría, con el fix de "Gaceta Oficial como título")
+// de una auditoría YA COMPLETADA, sin repetir el análisis de los 39
+// criterios. Pensado sobre todo para las auditorías que ya existían antes
+// de la migracion-clasificacion-tematica.sql (20 ago 2026) — esas quedan
+// sin tipo_instrumento/materia hasta que se les corra esto una vez.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/reclasificar-metadatos?secret=TU_SECRETO&auditoria_id=ID_AQUI
+app.get('/reclasificar-metadatos', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+  const auditoria_id = req.query.auditoria_id;
+  if (!auditoria_id) {
+    return res.status(400).type('text/plain').send('Falta ?auditoria_id en la URL');
+  }
+
+  const dir = path.join(DIRECTORIO_TEMP, `reclasificar-${auditoria_id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const result = await db.query(
+      `SELECT pdf_drive_id, titulo_documento FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).type('text/plain').send('Auditoría no encontrada.');
+    }
+    const { pdf_drive_id, titulo_documento } = result.rows[0];
+    if (!pdf_drive_id) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene pdf_drive_id guardado — no se puede reclasificar.');
+    }
+
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const { texto: textoPDF } = await descargarYExtraerTexto(drive, pdf_drive_id, dir);
+
+    const metadatos = await extraerMetadatos(textoPDF);
+    await db.query(
+      `UPDATE auditorias SET titulo_documento = $1, pais = $2, categoria = $3, tipo_instrumento = $4, materia = $5 WHERE id = $6`,
+      [metadatos.titulo, metadatos.pais, metadatos.categoria, metadatos.tipoInstrumento, metadatos.materia, auditoria_id]
+    );
+
+    console.log(`   [RECLASIFICAR] ✅ [${auditoria_id}] "${titulo_documento}" → "${metadatos.titulo}" (${metadatos.tipoInstrumento || 'sin tipo'} / ${metadatos.materia || 'sin materia'})`);
+    res.type('text/plain').send(`✅ Listo.\nTítulo: "${titulo_documento}" → "${metadatos.titulo}"\nTipo de instrumento: ${metadatos.tipoInstrumento || '(no identificado)'}\nMateria: ${metadatos.materia || '(no identificada / no aplica)'}`);
+
+  } catch (error) {
+    console.error(`   [RECLASIFICAR] ❌ [${auditoria_id}] Error:`, error.message);
+    res.status(500).type('text/plain').send('Error: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ENDPOINT DE RECUPERACIÓN (masivo) — corre /reclasificar-metadatos sobre
+// TODAS las auditorías completadas que todavía no tengan tipo_instrumento
+// (típicamente, una sola vez, justo después de correr
+// migracion-clasificacion-tematica.sql). Secuencial, no en paralelo — cada
+// una implica un llamado a Claude y una descarga de Drive; correrlas
+// todas a la vez arriesgaría rate limits. Si la lista es larga esto puede
+// tardar varios minutos — es una operación de una sola vez, se acepta que
+// la respuesta tarde.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/reclasificar-metadatos-todas?secret=TU_SECRETO
+app.get('/reclasificar-metadatos-todas', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+
+  try {
+    const { rows } = await db.query(
+      `SELECT id, titulo_documento, pdf_drive_id FROM auditorias
+       WHERE estado = 'completada' AND tipo_instrumento IS NULL AND pdf_drive_id IS NOT NULL
+       ORDER BY completada_en ASC`
+    );
+
+    if (rows.length === 0) {
+      return res.type('text/plain').send('No hay auditorías pendientes de reclasificar (todas las completadas ya tienen tipo_instrumento, o no tienen pdf_drive_id guardado).');
+    }
+
+    console.log(`   [RECLASIFICAR-TODAS] Empezando — ${rows.length} auditoría(s) pendientes`);
+    const resultados = [];
+
+    for (const fila of rows) {
+      const dir = path.join(DIRECTORIO_TEMP, `reclasificar-todas-${fila.id}`);
+      fs.mkdirSync(dir, { recursive: true });
+      try {
+        const driveAuth = autenticarDrive();
+        const drive = google.drive({ version: 'v3', auth: driveAuth });
+        const { texto: textoPDF } = await descargarYExtraerTexto(drive, fila.pdf_drive_id, dir);
+
+        const metadatos = await extraerMetadatos(textoPDF);
+        await db.query(
+          `UPDATE auditorias SET titulo_documento = $1, pais = $2, categoria = $3, tipo_instrumento = $4, materia = $5 WHERE id = $6`,
+          [metadatos.titulo, metadatos.pais, metadatos.categoria, metadatos.tipoInstrumento, metadatos.materia, fila.id]
+        );
+        console.log(`   [RECLASIFICAR-TODAS] ✅ [${fila.id}] "${fila.titulo_documento}" → tipo: ${metadatos.tipoInstrumento || '—'} / materia: ${metadatos.materia || '—'}`);
+        resultados.push(`✅ ${metadatos.titulo} — ${metadatos.tipoInstrumento || '(sin tipo)'} / ${metadatos.materia || '(sin materia)'}`);
+      } catch (errorUno) {
+        console.error(`   [RECLASIFICAR-TODAS] ❌ [${fila.id}] Error:`, errorUno.message);
+        resultados.push(`❌ ${fila.titulo_documento || fila.id} — Error: ${errorUno.message}`);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+
+    console.log(`   [RECLASIFICAR-TODAS] Terminado — ${rows.length} procesadas`);
+    res.type('text/plain').send(`Listo — ${rows.length} auditoría(s) procesadas:\n\n${resultados.join('\n')}`);
+
+  } catch (error) {
+    console.error('   [RECLASIFICAR-TODAS] Error general:', error.message);
+    res.status(500).type('text/plain').send('Error: ' + error.message);
+  }
+});
+
 // ENDPOINT DE RECUPERACIÓN — recalcula grafo_datos para una auditoría ya
 // completada cuyo Paso 6.5 falló.
 //
