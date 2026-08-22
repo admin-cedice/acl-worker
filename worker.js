@@ -4068,8 +4068,8 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     await actualizarEstado(auditoria_id, 'procesando');
     const metadatos = await extraerMetadatos(textoPDF);
     await db.query(
-      `UPDATE auditorias SET titulo_documento = $1, pais = $2, categoria = $3 WHERE id = $4`,
-      [metadatos.titulo, metadatos.pais, metadatos.categoria, auditoria_id]
+      `UPDATE auditorias SET titulo_documento = $1, pais = $2, categoria = $3, tipo_instrumento = $4, materia = $5 WHERE id = $6`,
+      [metadatos.titulo, metadatos.pais, metadatos.categoria, metadatos.tipoInstrumento, metadatos.materia, auditoria_id]
     );
     console.log(`✅ [${auditoria_id}] Metadatos: "${metadatos.titulo}"`);
 
@@ -4384,6 +4384,35 @@ async function obtenerPesosCriterios() {
   return rows[0]?.pesos_criterios || {};
 }
 
+// ── Clasificación temática (Ala Doctrinal, 20 ago 2026) ────────────────────
+// Nivel 1 (tipo de instrumento) y Nivel 2 (materia). Los ids son fijos —
+// el frontend (app/BibliotecaAuditorias.js) tiene su propia copia de los
+// nombres/descripciones en ambos idiomas para mostrar y para el
+// buscador; acá solo hace falta lo necesario para armar el prompt y
+// validar la respuesta de Claude.
+const TIPOS_INSTRUMENTO = [
+  { id: 'leyes_marcos',         nombre: 'Leyes y Marcos Normativos',       ejemplos: 'Constituciones, leyes orgánicas, ordinarias, códigos, ordenanzas' },
+  { id: 'decretos_regulacion',  nombre: 'Decretos y Regulación Ejecutiva', ejemplos: 'Decretos, resoluciones ministeriales, providencias, reglamentos' },
+  { id: 'politicas_planes',     nombre: 'Políticas Públicas y Planes',     ejemplos: 'Planes de desarrollo, programas sectoriales, estrategias oficiales' },
+  { id: 'discursos_narrativas', nombre: 'Discursos y Narrativas',          ejemplos: 'Alocuciones, proyectos en discusión, declaraciones públicas' },
+];
+
+// Nivel 2 — solo aplica si tipo_instrumento es leyes_marcos,
+// decretos_regulacion o politicas_planes (NO aplica a discursos_narrativas).
+const MATERIAS = [
+  { id: 'macro_fiscal',              nombre: 'Macroeconómico, Fiscal y Financiero',                      ejemplos: 'Impuestos, banca, moneda, divisas, presupuesto' },
+  { id: 'productivo_mercados',       nombre: 'Productivo, Comercio y Mercados',                           ejemplos: 'Precios, competencia, comercio exterior, régimen laboral' },
+  { id: 'propiedad_recursos',        nombre: 'Propiedad, Suelo y Recursos Naturales',                     ejemplos: 'Garantías patrimoniales, tierras, inmuebles, energía' },
+  { id: 'infraestructura_servicios', nombre: 'Infraestructura, Servicios Públicos y Redes',               ejemplos: 'Servicios básicos, transporte, telecomunicaciones' },
+  { id: 'institucional_gobernanza',  nombre: 'Institucional, Gobernanza y Burocracia',                    ejemplos: 'Estructura del Estado, sistema de justicia, trámites' },
+  { id: 'derechos_civicos',          nombre: 'Derechos Cívicos, Participación Política y Sociedad Civil', ejemplos: 'Partidos, elecciones, medios, ONGs' },
+  { id: 'defensa_seguridad',         nombre: 'Defensa, Sector Militar y Seguridad Ciudadana',             ejemplos: 'Fuerza Armada, orden público, inteligencia' },
+  { id: 'internacional_soberania',   nombre: 'Ámbito Internacional y Soberanía',                          ejemplos: 'Tratados comerciales, migración, relaciones exteriores' },
+];
+
+const IDS_TIPO_INSTRUMENTO = TIPOS_INSTRUMENTO.map(t => t.id);
+const IDS_MATERIA = MATERIAS.map(m => m.id);
+
 // Lee un prompt editable de productos comunicacionales (podcast, mapa
 // mental) por su clave. Devuelve null si no existe todavía — cada
 // llamador decide su propio texto de respaldo (mismo patrón que
@@ -4494,21 +4523,36 @@ async function descargarYExtraerTexto(drive, fileId, dir) {
 
 async function extraerMetadatos(textoPDF) {
   const muestra = textoPDF.slice(0, 3000);
+
+  const listaTipos = TIPOS_INSTRUMENTO.map(t => `- "${t.id}": ${t.nombre} — ${t.ejemplos}`).join('\n');
+  const listaMaterias = MATERIAS.map(m => `- "${m.id}": ${m.nombre} — ${m.ejemplos}`).join('\n');
+
   const respuesta = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 350,
+    max_tokens: 450,
     system: `Eres un clasificador de documentos jurídicos y de políticas públicas. Responde ÚNICAMENTE con JSON válido, sin texto adicional, sin backticks.`,
     messages: [{
       role: 'user',
       content: `Analiza este fragmento y responde SOLO con este JSON:
-{"titulo":"título oficial completo","identificador":"versión muy corta, máx. 6 palabras, priorizando números de decreto/ley/gaceta si existen (ej: 'Decreto 5364 Gaceta 7039')","pais":"país o General","categoria":"pais|comparativo|doctrinal","numero_oficial":"el número de decreto, ley, resolución o gaceta EXACTO tal como aparece en el documento, solo si el documento lo declara explícitamente, o null si no tiene numeración oficial (ej: un plan o programa de gobierno sin número)","institucion_emisora":"nombre del ministerio, organismo o institución que emite el documento, o null si no se identifica con claridad","periodo":"el período, año o rango de años que cubre el documento tal como se declara (ej. '2025-2031'), o null si no se especifica"}
+{"titulo":"título oficial completo","identificador":"versión muy corta, máx. 6 palabras, priorizando números de decreto/ley/gaceta si existen (ej: 'Decreto 5364 Gaceta 7039')","pais":"país o General","categoria":"pais|comparativo|doctrinal","numero_oficial":"el número de decreto, ley, resolución o gaceta EXACTO tal como aparece en el documento, solo si el documento lo declara explícitamente, o null si no tiene numeración oficial (ej: un plan o programa de gobierno sin número)","institucion_emisora":"nombre del ministerio, organismo o institución que emite el documento, o null si no se identifica con claridad","periodo":"el período, año o rango de años que cubre el documento tal como se declara (ej. '2025-2031'), o null si no se especifica","tipo_instrumento":"uno de los ids de la lista TIPO DE INSTRUMENTO de abajo","materia":"uno de los ids de la lista MATERIA de abajo, o null si tipo_instrumento es 'discursos_narrativas' (a esa categoría nunca le corresponde materia)"}
+
+IMPORTANTE sobre "titulo": debe ser el nombre PROPIO del instrumento o documento (ej. "Ley Orgánica de...", "Decreto N° 1.234 mediante el cual se...", "Plan de la Patria 2025-2031"). NUNCA uses como título la referencia de la Gaceta Oficial en la que se publicó (ej. NO escribas "Gaceta Oficial Extraordinaria N° 7.018" como título), aunque esa referencia aparezca primero o en letra más grande que el resto del documento — sigue leyendo hasta encontrar el nombre real del instrumento que esa gaceta está publicando. Ese número de gaceta va en "numero_oficial", no en "titulo".
+
+TIPO DE INSTRUMENTO (elige exactamente un id):
+${listaTipos}
+
+MATERIA (elige exactamente un id, solo si tipo_instrumento no es "discursos_narrativas"):
+${listaMaterias}
 
 Fragmento:\n${muestra}`,
-  }],
-});
+    }],
+  });
   try {
     const limpio = extraerTextoRespuesta(respuesta).trim().replace(/```json|```/g, '').trim();
     const datos  = JSON.parse(limpio);
+    const tipoInstrumento = IDS_TIPO_INSTRUMENTO.includes(datos.tipo_instrumento) ? datos.tipo_instrumento : null;
+    // materia solo es válida si el tipo elegido admite Nivel 2 (no aplica a discursos_narrativas)
+    const materiaValida = tipoInstrumento && tipoInstrumento !== 'discursos_narrativas' && IDS_MATERIA.includes(datos.materia);
     return {
       titulo:             datos.titulo             || 'Documento sin título',
       identificador:      datos.identificador       || datos.titulo || 'Documento',
@@ -4517,9 +4561,11 @@ Fragmento:\n${muestra}`,
       numeroOficial:      datos.numero_oficial       || null,
       institucionEmisora: datos.institucion_emisora  || null,
       periodo:            datos.periodo              || null,
+      tipoInstrumento,
+      materia:            materiaValida ? datos.materia : null,
     };
   } catch {
-    return { titulo: 'Documento sin título', identificador: 'Documento', pais: 'General', categoria: 'pais', numeroOficial: null, institucionEmisora: null, periodo: null };
+    return { titulo: 'Documento sin título', identificador: 'Documento', pais: 'General', categoria: 'pais', numeroOficial: null, institucionEmisora: null, periodo: null, tipoInstrumento: null, materia: null };
   }
 }
 
