@@ -4668,8 +4668,10 @@ ${listaMaterias}
 Fragmento:\n${muestra}`,
     }],
   });
+  let textoRespuestaCruda = null;
   try {
-    const limpio = extraerTextoRespuesta(respuesta).trim().replace(/```json|```/g, '').trim();
+    textoRespuestaCruda = extraerTextoRespuesta(respuesta);
+    const limpio = textoRespuestaCruda.trim().replace(/```json|```/g, '').trim();
     const datos  = JSON.parse(limpio);
     const tipoInstrumento = IDS_TIPO_INSTRUMENTO.includes(datos.tipo_instrumento) ? datos.tipo_instrumento : null;
     // materia solo es válida si el tipo elegido admite Nivel 2 (no aplica a discursos_narrativas)
@@ -4685,7 +4687,9 @@ Fragmento:\n${muestra}`,
       tipoInstrumento,
       materia:            materiaValida ? datos.materia : null,
     };
-  } catch {
+  } catch (err) {
+    console.error('   [extraerMetadatos] ⚠️ No se pudo parsear la respuesta de Claude — stop_reason:', respuesta.stop_reason, '· error:', err.message);
+    console.error('   [extraerMetadatos] Texto crudo recibido (primeros 500 caracteres):', (textoRespuestaCruda || '(no se obtuvo ningún texto)').slice(0, 500));
     return { titulo: 'Documento sin título', identificador: 'Documento', pais: 'General', categoria: 'pais', numeroOficial: null, institucionEmisora: null, periodo: null, tipoInstrumento: null, materia: null };
   }
 }
