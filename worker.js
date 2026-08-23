@@ -599,7 +599,9 @@ Ante la duda razonable, prefiere ADMITIR.`;
 const INSTRUCCION_ALCANCE_VENEZUELA = `
 
 INSTRUCCIÓN ADICIONAL DE ALCANCE (vigente desde el 31 jul 2026):
-Además de lo anterior, evalúa si el documento corresponde a Venezuela (leyes, decretos, reglamentos o políticas públicas venezolanas, de cualquier nivel — nacional, estadal o municipal). Si el documento es pertinente pero es claramente de otro país, RECHAZA usando MOTIVO: fuera_de_alcance_geografico (no uses no_pertinente en ese caso). Ante la duda razonable sobre si un documento aplica a Venezuela, prefiere ADMITIR.`;
+Además de lo anterior, evalúa si el documento corresponde a Venezuela (leyes, decretos, reglamentos o políticas públicas venezolanas, de cualquier nivel — nacional, estadal o municipal). Si el documento es pertinente pero es claramente de otro país, RECHAZA usando MOTIVO: fuera_de_alcance_geografico (no uses no_pertinente en ese caso). Ante la duda razonable sobre si un documento aplica a Venezuela, prefiere ADMITIR.
+
+TRATADOS Y CONVENIOS INTERNACIONALES (agregado 21 ago 2026): un tratado, convenio o convención internacional SÍ es pertinente y aplica a Venezuela — y por tanto ADMISIBLE — si el propio documento indica que Venezuela lo suscribió, lo está tramitando ante la Asamblea Nacional, o lo ratificó (Art. 154 y 23 de la Constitución: los tratados requieren aprobación de la Asamblea Nacional antes de su ratificación, y una vez aprobados se incorporan al ordenamiento jurídico interno). Trátalo igual que un Proyecto de Ley: no hace falta que ya esté ratificado, basta con que Venezuela sea parte del proceso. RECHAZA con MOTIVO: fuera_de_alcance_geografico solo si el documento no menciona ninguna participación venezolana (ej. un convenio bilateral entre otros dos países, o un instrumento puramente multilateral sin indicio de que Venezuela lo haya suscrito o esté tramitándolo).`;
 
 function parsearVeredictoAdmisibilidad(textoRespuesta) {
   const limpio = textoRespuesta.replace(/[*_`#]/g, '');
@@ -627,21 +629,33 @@ async function filtrarAdmisibilidad(textoDocumento, promptAdmisibilidad) {
     : PROMPT_ADMISIBILIDAD_RESPALDO;
   const promptFinal = promptBase + INSTRUCCION_ALCANCE_VENEZUELA;
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-5',
-      max_tokens: 300,
-      messages: [{
-        role: 'user',
-        content: `${promptFinal}\n\nDOCUMENTO A EVALUAR (primeros 8000 caracteres):\n${textoDocumento.slice(0, 8000)}`,
-      }],
-    });
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-5',
+    // 21 ago 2026 — FIX: subido de 300 a 2000. Un documento genuinamente
+    // ambiguo (ej. un convenio internacional de la OIT, donde hay que
+    // sopesar a la vez "¿es un instrumento normativo?" y "¿aplica a
+    // Venezuela?") puede hacer que el modelo use varios cientos de tokens
+    // de pensamiento adaptativo antes de escribir el veredicto — con el
+    // tope viejo, el pensamiento se comía todo el presupuesto y no quedaba
+    // espacio para el texto final (stop_reason: 'max_tokens', content solo
+    // con un bloque 'thinking', sin ningún bloque 'text'). Caso real:
+    // Convenio 193 OIT — Trabajo en la Economía de Plataforma, 21 ago 2026.
+    max_tokens: 2000,
+    messages: [{
+      role: 'user',
+      content: `${promptFinal}\n\nDOCUMENTO A EVALUAR (primeros 8000 caracteres):\n${textoDocumento.slice(0, 8000)}`,
+    }],
+  });
 
-    if (response.stop_reason === 'refusal') {
-      throw new Error('filtrarAdmisibilidad: Claude rehusó evaluar este documento (stop_reason: refusal) — revisar el documento manualmente antes de reintentar.');
-    }
+  if (response.stop_reason === 'refusal') {
+    throw new Error('filtrarAdmisibilidad: Claude rehusó evaluar este documento (stop_reason: refusal) — revisar el documento manualmente antes de reintentar.');
+  }
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error('filtrarAdmisibilidad: la respuesta se cortó por max_tokens (2000) antes de llegar al veredicto — si esto se repite, el límite necesita subir más.');
+  }
 
-    const textoRespuesta = extraerTextoRespuesta(response);
-    return parsearVeredictoAdmisibilidad(textoRespuesta);
+  const textoRespuesta = extraerTextoRespuesta(response);
+  return parsearVeredictoAdmisibilidad(textoRespuesta);
 }
 
 // ── Autenticación Google Cloud (cuenta de servicio) ──────────────────────────
@@ -2326,6 +2340,48 @@ app.post('/reintentar-rechazada', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error revirtiendo rechazo:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/reintentar-fallida', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { auditoria_id } = req.body;
+  if (!auditoria_id) return res.status(400).json({ error: 'Falta auditoria_id' });
+
+  try {
+    const result = await db.query(
+      `SELECT a.pdf_drive_id, c.email AS ciudadano_email
+       FROM auditorias a
+       JOIN ciudadanos c ON c.id = a.ciudadano_id
+       WHERE a.id = $1 AND a.estado = 'fallida'`,
+      [auditoria_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No se encontró una auditoría fallida con ese id' });
+    }
+    const { pdf_drive_id, ciudadano_email } = result.rows[0];
+    if (!pdf_drive_id) {
+      return res.status(400).json({ error: 'Esta auditoría no tiene un pdf_drive_id guardado — no se puede reprocesar automáticamente' });
+    }
+
+    await db.query(
+      `UPDATE auditorias
+       SET estado = 'admitida', admitida_en = NOW(), error_mensaje = NULL
+       WHERE id = $1`,
+      [auditoria_id]
+    );
+
+    res.json({ ok: true, mensaje: 'Reprocesando en segundo plano' });
+
+    procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, false, true).catch(err => {
+      console.error(`❌ [${auditoria_id}] Error reprocesando tras falla técnica:`, err.message);
+    });
+
+  } catch (error) {
+    console.error('❌ Error reintentando auditoría fallida:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
