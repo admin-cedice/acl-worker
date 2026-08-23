@@ -4508,10 +4508,10 @@ async function obtenerPesosCriterios() {
 // buscador; acá solo hace falta lo necesario para armar el prompt y
 // validar la respuesta de Claude.
 const TIPOS_INSTRUMENTO = [
-  { id: 'leyes_marcos',         nombre: 'Leyes y Marcos Normativos',       ejemplos: 'Constituciones, leyes orgánicas, ordinarias, códigos, ordenanzas' },
+  { id: 'leyes_marcos',         nombre: 'Leyes y Marcos Normativos',       ejemplos: 'Constituciones, leyes orgánicas, ordinarias, códigos, ordenanzas, proyectos de ley' },
   { id: 'decretos_regulacion',  nombre: 'Decretos y Regulación Ejecutiva', ejemplos: 'Decretos, resoluciones ministeriales, providencias, reglamentos' },
   { id: 'politicas_planes',     nombre: 'Políticas Públicas y Planes',     ejemplos: 'Planes de desarrollo, programas sectoriales, estrategias oficiales' },
-  { id: 'discursos_narrativas', nombre: 'Discursos y Narrativas',          ejemplos: 'Alocuciones, proyectos en discusión, declaraciones públicas' },
+  { id: 'discursos_narrativas', nombre: 'Discursos y Narrativas',          ejemplos: 'Alocuciones, declaraciones públicas, programas de gobierno o de campaña' },
 ];
 
 // Nivel 2 — solo aplica si tipo_instrumento es leyes_marcos,
@@ -4654,6 +4654,10 @@ async function extraerMetadatos(textoPDF) {
 {"titulo":"título oficial completo","identificador":"versión muy corta, máx. 6 palabras, priorizando números de decreto/ley/gaceta si existen (ej: 'Decreto 5364 Gaceta 7039')","pais":"país o General","categoria":"pais|comparativo|doctrinal","numero_oficial":"el número de decreto, ley, resolución o gaceta EXACTO tal como aparece en el documento, solo si el documento lo declara explícitamente, o null si no tiene numeración oficial (ej: un plan o programa de gobierno sin número)","institucion_emisora":"nombre del ministerio, organismo o institución que emite el documento, o null si no se identifica con claridad","periodo":"el período, año o rango de años que cubre el documento tal como se declara (ej. '2025-2031'), o null si no se especifica","tipo_instrumento":"uno de los ids de la lista TIPO DE INSTRUMENTO de abajo","materia":"uno de los ids de la lista MATERIA de abajo, o null si tipo_instrumento es 'discursos_narrativas' (a esa categoría nunca le corresponde materia)"}
 
 IMPORTANTE sobre "titulo": debe ser el nombre PROPIO del instrumento o documento (ej. "Ley Orgánica de...", "Decreto N° 1.234 mediante el cual se...", "Plan de la Patria 2025-2031"). NUNCA uses como título la referencia de la Gaceta Oficial en la que se publicó (ej. NO escribas "Gaceta Oficial Extraordinaria N° 7.018" como título), aunque esa referencia aparezca primero o en letra más grande que el resto del documento — sigue leyendo hasta encontrar el nombre real del instrumento que esa gaceta está publicando. Ese número de gaceta va en "numero_oficial", no en "titulo".
+
+IMPORTANTE sobre "tipo_instrumento" — dos aclaraciones:
+- Un "Proyecto de Ley" o anteproyecto (todavía sin aprobación final) va en "leyes_marcos", NO en "discursos_narrativas": lo que importa es que el texto esté estructurado como un instrumento normativo (con artículos y disposiciones), no si ya entró en vigor.
+- Un "Programa de Gobierno" de un candidato o partido político (propuesta o promesa de campaña, sin que quien lo emite esté en funciones de gobierno) va en "discursos_narrativas", NO en "politicas_planes": "politicas_planes" es solo para planes, programas o estrategias YA ADOPTADOS por un gobierno o institución del Estado en funciones.
 
 TIPO DE INSTRUMENTO (elige exactamente un id):
 ${listaTipos}
