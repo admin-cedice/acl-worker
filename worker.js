@@ -1497,6 +1497,226 @@ async function generarMapaMental(estructura, rutaSalida, auditoria_id) {
   console.log(`   [${auditoria_id}] Mapa mental generado: ${rutaSalida}`);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ── Cupos semanales (27 ago 2026, v2 — con devolución en rechazo) ────────
+// ═══════════════════════════════════════════════════════════════════════
+// PEGAR ESTE BLOQUE COMPLETO en worker.js, justo antes de la sección
+// "── Rutas ──". Si ya habías pegado la v1 (sin devolución), BORRA ese
+// bloque completo primero y pega este — cambiaron varias firmas de
+// función (verificarYReservarCupo ahora recibe auditoriaId también).
+//
+// Requiere migracion-cupos-semanales.sql (v2) corrida ANTES de
+// desplegar esto — la v2 corrige un FK que habría hecho fallar toda
+// reserva de cupo (ver el comentario en la propia migración).
+//
+// Decisión de Moisés/Roberto/Felipe (27 ago 2026): 1 auditoría gratis por
+// ciudadano por semana, sujeta a un tope de PLATAFORMA. Calendario de las
+// primeras 12 semanas pensado para sumar exactamente 100 auditorías
+// (= $500 a $5 c/u); semana 13 en adelante, tope fijo de 5/semana.
+//
+// "QUE EL RECHAZO NO CONSUMA EL CUPO" (decisión de Moisés, 27 ago 2026):
+// si una auditoría termina 'rechazada' (Filtro de Admisibilidad,
+// duplicado, texto no extraíble) o 'fallida' (error técnico), el cupo
+// que se le había reservado al ciudadano se DEVUELVE automáticamente —
+// no le cuesta su única auditoría gratis de la semana. Ver
+// devolverCupoPorAuditoria() más abajo y la lista de 7 puntos de
+// procesarAuditoria() donde hay que llamarla (fuera de este bloque, ver
+// el mensaje de Claude que acompaña esto).
+//
+// NO se devuelve en 'pendiente_confirmacion' (posible duplicado blando)
+// a propósito: ese estado no es un rechazo, es una pausa a la espera de
+// que el ciudadano confirme — mientras no decida, el cupo queda
+// reservado. Si esto no es lo que quieres, avísame y lo ajustamos.
+//
+// INTERRUPTOR DE EMERGENCIA: CUPOS_ACTIVOS=false en Railway desactiva
+// todo el mecanismo al instante, sin desplegar — mismo patrón que
+// MODO_BETA_CERRADA en el frontend.
+
+const CUPOS_ACTIVOS = process.env.CUPOS_ACTIVOS !== 'false';
+
+const TOPES_SEMANALES_PLATAFORMA = [20, 18, 13, 8, 6, 5, 5, 5, 5, 5, 5, 5];
+const TOPE_SEMANAL_PISO = 5; // semana 13 en adelante, indefinidamente
+
+// Fecha desde la que se cuenta la "semana 1" — variable de entorno para
+// poder ajustarla sin tocar código el día que se confirme la fecha real
+// de lanzamiento público. Formato: 'YYYY-MM-DD'. Respaldo: 1 sept 2026.
+function obtenerFechaInicioCupos() {
+  const desdeEnv = process.env.CUPOS_FECHA_INICIO;
+  return desdeEnv ? new Date(`${desdeEnv}T00:00:00Z`) : new Date('2026-09-01T00:00:00Z');
+}
+
+// Lunes de la semana ISO a la que pertenece una fecha.
+function inicioDeSemanaISO(fecha) {
+  const d = new Date(Date.UTC(fecha.getUTCFullYear(), fecha.getUTCMonth(), fecha.getUTCDate()));
+  const diaSemana = d.getUTCDay() || 7; // domingo=0 → 7
+  if (diaSemana !== 1) d.setUTCDate(d.getUTCDate() - (diaSemana - 1));
+  return d;
+}
+
+function formatoFechaSQL(d) {
+  return d.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+}
+
+// Tope de plataforma vigente para la semana que empieza en `semanaInicio`.
+function topeSemanalPlataforma(semanaInicio) {
+  const inicio = inicioDeSemanaISO(obtenerFechaInicioCupos());
+  const semanasTranscurridas = Math.round((semanaInicio - inicio) / (7 * 24 * 60 * 60 * 1000));
+  if (semanasTranscurridas < 0) return TOPES_SEMANALES_PLATAFORMA[0];
+  if (semanasTranscurridas < TOPES_SEMANALES_PLATAFORMA.length) return TOPES_SEMANALES_PLATAFORMA[semanasTranscurridas];
+  return TOPE_SEMANAL_PISO;
+}
+
+// Verifica y RESERVA, en una sola transacción, el cupo de un ciudadano
+// para auditar ahora mismo — y guarda a qué auditoria_id corresponde esa
+// reserva, para poder devolverla más tarde si hace falta (ver
+// devolverCupoPorAuditoria). Devuelve:
+//   { ok: true }
+//   { ok: false, motivo: 'cupo_semanal_agotado' }
+//   { ok: false, motivo: 'plataforma_llena', tope, usados }
+async function verificarYReservarCupo(ciudadanoId, auditoriaId) {
+  if (!CUPOS_ACTIVOS) return { ok: true, motivo: 'cupos_desactivados' };
+
+  const semanaInicio = inicioDeSemanaISO(new Date());
+  const semanaInicioSQL = formatoFechaSQL(semanaInicio);
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    const yaUsado = await client.query(
+      `SELECT 1 FROM cupo_semanal_ciudadano WHERE ciudadano_id = $1 AND semana_inicio = $2`,
+      [ciudadanoId, semanaInicioSQL]
+    );
+    if (yaUsado.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return { ok: false, motivo: 'cupo_semanal_agotado' };
+    }
+
+    const tope = topeSemanalPlataforma(semanaInicio);
+    let fila = await client.query(
+      `SELECT usados FROM cupo_semanal_plataforma WHERE semana_inicio = $1 FOR UPDATE`,
+      [semanaInicioSQL]
+    );
+    if (fila.rows.length === 0) {
+      await client.query(
+        `INSERT INTO cupo_semanal_plataforma (semana_inicio, tope, usados) VALUES ($1, $2, 0)`,
+        [semanaInicioSQL, tope]
+      );
+      fila = { rows: [{ usados: 0 }] };
+    }
+    if (fila.rows[0].usados >= tope) {
+      await client.query('ROLLBACK');
+      return { ok: false, motivo: 'plataforma_llena', tope, usados: fila.rows[0].usados };
+    }
+
+    await client.query(
+      `INSERT INTO cupo_semanal_ciudadano (ciudadano_id, semana_inicio, auditoria_id) VALUES ($1, $2, $3)`,
+      [ciudadanoId, semanaInicioSQL, auditoriaId || null]
+    );
+    await client.query(
+      `UPDATE cupo_semanal_plataforma SET usados = usados + 1, actualizado_en = NOW() WHERE semana_inicio = $1`,
+      [semanaInicioSQL]
+    );
+
+    await client.query('COMMIT');
+    return { ok: true };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Devuelve el cupo semanal reservado para una auditoría — se llama desde
+// procesarAuditoria() en cada punto donde el resultado es 'rechazada' o
+// 'fallida' (ver la lista de 7 puntos, fuera de este bloque). Nunca
+// lanza — cualquier problema queda en el log, no bloquea ni afecta el
+// resto del pipeline (mismo criterio que el resto de los chequeos "no
+// bloqueantes" de este archivo).
+async function devolverCupoPorAuditoria(auditoriaId) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const fila = await client.query(
+      `DELETE FROM cupo_semanal_ciudadano WHERE auditoria_id = $1 RETURNING semana_inicio`,
+      [auditoriaId]
+    );
+    if (fila.rows.length === 0) {
+      // Normal si era un admin/editor exento, o si CUPOS_ACTIVOS estaba
+      // en false cuando se subió — no había ningún cupo que devolver.
+      await client.query('ROLLBACK');
+      return;
+    }
+    const semanaInicioSQL = formatoFechaSQL(fila.rows[0].semana_inicio);
+    await client.query(
+      `UPDATE cupo_semanal_plataforma SET usados = GREATEST(usados - 1, 0), actualizado_en = NOW() WHERE semana_inicio = $1`,
+      [semanaInicioSQL]
+    );
+    await client.query('COMMIT');
+    console.log(`   [devolverCupoPorAuditoria] ✅ Cupo devuelto — auditoría ${auditoriaId}, semana ${semanaInicioSQL}`);
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(`   [devolverCupoPorAuditoria] ⚠️ No se pudo devolver el cupo de ${auditoriaId} (no bloqueante):`, err.message);
+  } finally {
+    client.release();
+  }
+}
+
+// GET /cupos/estado?ciudadano_id=... — solo lectura. Requiere
+// x-worker-secret (solo se llama server-to-server, desde Next.js).
+app.get('/cupos/estado', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const ciudadanoId = req.query.ciudadano_id;
+  if (!ciudadanoId) return res.status(400).json({ error: 'Falta ciudadano_id' });
+
+  if (!CUPOS_ACTIVOS) {
+    return res.json({ ok: true, cuposActivos: false, cupoPersonalDisponible: true, plataforma: { disponible: true } });
+  }
+
+  try {
+    const semanaInicio = inicioDeSemanaISO(new Date());
+    const semanaInicioSQL = formatoFechaSQL(semanaInicio);
+    const tope = topeSemanalPlataforma(semanaInicio);
+
+    const [yaUsado, fila] = await Promise.all([
+      db.query(`SELECT 1 FROM cupo_semanal_ciudadano WHERE ciudadano_id = $1 AND semana_inicio = $2`, [ciudadanoId, semanaInicioSQL]),
+      db.query(`SELECT usados FROM cupo_semanal_plataforma WHERE semana_inicio = $1`, [semanaInicioSQL]),
+    ]);
+    const usados = fila.rows[0]?.usados || 0;
+
+    res.json({
+      ok: true,
+      cuposActivos: true,
+      cupoPersonalDisponible: yaUsado.rows.length === 0,
+      plataforma: { tope, usados, disponible: usados < tope },
+      semanaInicio: semanaInicioSQL,
+    });
+  } catch (error) {
+    console.error('❌ Error en /cupos/estado:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /cupos/reservar — llamar justo antes de crear la fila de
+// auditorias. Requiere x-worker-secret. Body: { ciudadano_id, auditoria_id }.
+app.post('/cupos/reservar', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { ciudadano_id, auditoria_id } = req.body || {};
+  if (!ciudadano_id) return res.status(400).json({ error: 'Falta ciudadano_id' });
+  try {
+    const resultado = await verificarYReservarCupo(ciudadano_id, auditoria_id);
+    res.json(resultado);
+  } catch (error) {
+    console.error('❌ Error en /cupos/reservar:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
@@ -4122,7 +4342,8 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 		        );
 		        await enviarEmailRechazo(ciudadano_email, 'texto_no_extraible');
 		        console.log(`🔒 [${auditoria_id}] Rechazada — archivo .txt con muy poco contenido`);
-		        return;
+                await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
+                return;
 		      }
 
 		      console.log(`⚠️  [${auditoria_id}] Extracción normal insuficiente (${textoPDF.trim().length} caracteres) — intentando transcripción de respaldo con Claude...`);
@@ -4145,6 +4366,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 		        );
 		        await enviarEmailRechazo(ciudadano_email, 'texto_no_extraible');
 		        console.log(`🔒 [${auditoria_id}] Rechazada — texto no extraíble ni por el método normal ni por el de respaldo`);
+		        await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
 		        return;
 		      }
     }
@@ -4180,6 +4402,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	          );
 	          await enviarEmailDocumentoEnProceso(ciudadano_email, duplicadoEnProceso.titulo_documento);
 	          console.log(`🔁 [${auditoria_id}] Rechazada — el mismo documento ya se está procesando en ${duplicadoEnProceso.id}`);
+	          await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
 	          return;
 	        }
 	        console.log(`✅ [${auditoria_id}] Nadie más está procesando este documento ahora mismo`);
@@ -4199,6 +4422,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	          );
 	          await enviarEmailDocumentoDuplicado(ciudadano_email, duplicadoPorHash);
 	          console.log(`🔁 [${auditoria_id}] Rechazada — documento idéntico a ${duplicadoPorHash.id}`);
+	          await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
 	          return;
 	        }
 	        console.log(`✅ [${auditoria_id}] Sin duplicado exacto ya completado`);
@@ -4229,6 +4453,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
         );
         await enviarEmailRechazo(ciudadano_email, veredicto.motivo);
         console.log(`🔒 [${auditoria_id}] Rechazada en el filtro de admisibilidad: ${veredicto.motivo} — ${veredicto.explicacion}`);
+        await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
         return;
       }
       await db.query(`UPDATE auditorias SET estado = 'admitida', admitida_en = NOW() WHERE id = $1`, [auditoria_id]);
@@ -4264,6 +4489,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
           );
           await enviarEmailDocumentoDuplicado(ciudadano_email, duplicadoPorIdentificador);
           console.log(`🔁 [${auditoria_id}] Rechazada — mismo número oficial que ${duplicadoPorIdentificador.id}`);
+          await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
           return;
         }
         console.log(`✅ [${auditoria_id}] Sin duplicado por identificador oficial`);
@@ -4492,7 +4718,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.error(`❌ [${auditoria_id}] Error:`, error.message);
     await actualizarEstado(auditoria_id, 'fallida').catch(() => {});
     await db.query(`UPDATE auditorias SET error_mensaje = $1 WHERE id = $2`, [error.message, auditoria_id]).catch(() => {});
-
+    await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
     const filaActual = await db.query(`SELECT titulo_documento FROM auditorias WHERE id = $1`, [auditoria_id]).catch(() => null);
     const tituloConocido = filaActual?.rows?.[0]?.titulo_documento || null;
 
