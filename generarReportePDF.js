@@ -121,6 +121,19 @@
 //      después queda empujado al fondo, sin tocar el resto del layout).
 //      Si llega null (la clave todavía no existe en prompts_productos),
 //      no se muestra nada — no bloquea la generación del reporte.
+//
+// CAMBIOS v4.1.1 (naming, 27 ago 2026) — RENOMBRE PÚBLICO DEL PRODUCTO:
+//  48. El producto que este archivo genera pasa a llamarse "Auditoría" de
+//      cara al ciudadano (antes "Reporte") — decisión de Moisés/Roberto/
+//      Felipe. Solo se tocó texto VISIBLE en el HTML/PDF final (etiqueta
+//      de portada, título de la sección de criterios, <title> del
+//      documento) — nada de la lógica, el schema, ni los nombres internos
+//      de función/variable, que siguen diciendo "Reporte" a propósito
+//      (cambiarlos habría sido un refactor sin beneficio real, con riesgo
+//      de romper algo). Dos frases se reescribieron en vez de solo
+//      sustituir la palabra, porque un reemplazo literal de "Reporte" por
+//      "Auditoría" ahí habría chocado con el nombre del proyecto entero
+//      ("Auditoría Cívica Liberal") — ver el detalle en cada punto.
 
 'use strict';
 
@@ -1178,6 +1191,11 @@ function generarHTML(datos, metadatos, disclaimer = null) {
     ? `<div class="portada-disclaimer">${esc(disclaimer)}</div>`
     : '';
 
+  // 27 ago 2026 (naming): la etiqueta de portada decía "Reporte de
+  // Auditoría · Test de Libertad · Generado el ...". Con el nombre nuevo
+  // del producto ("Auditoría"), esa frase quedaría "Auditoría de
+  // Auditoría" al sustituir la palabra sin más — se simplifica a
+  // "Auditoría · Test de Libertad · ..." en vez de eso.
   const htmlPortada = `
 <div class="portada">
   <div class="portada-cinta"></div>
@@ -1189,7 +1207,7 @@ function generarHTML(datos, metadatos, disclaimer = null) {
     </div>
   </div>
   <div class="portada-body">
-    <div class="portada-etiqueta">Reporte de Auditoría · Test de Libertad · Generado el ${esc(generadoEl)}</div>
+    <div class="portada-etiqueta">Auditoría · Test de Libertad · Generado el ${esc(generadoEl)}</div>
     <h1 class="portada-titulo">${esc(titulo)}</h1>
     <div class="portada-subtitulo">${esc(subtitulo || [pais, fecha].filter(Boolean).join(' · '))}</div>
     ${puntosClaveHTML}
@@ -1221,13 +1239,19 @@ function generarHTML(datos, metadatos, disclaimer = null) {
     ${crit.analisis ? `<div class="criterio-analisis">${conNotaComadreja(crit.analisis)}</div>` : ''}
   </div>`).join('');
 
+    // 27 ago 2026 (naming): el título de esta sección decía "Reporte de
+    // Auditoría Cívica Liberal: Análisis por Criterio del Test de
+    // Libertad" — "Reporte de" + "Auditoría Cívica Liberal" (el nombre
+    // del proyecto) sonaba a "Auditoría de Auditoría Cívica Liberal" con
+    // el nombre nuevo. Se simplifica manteniendo el mismo contenido
+    // informativo, sin la ambigüedad.
     const cabecera = idxCat === 0 ? `
   <div class="seccion-cabecera">
     <div class="seccion-label">Análisis por criterio</div>
     <div class="seccion-referencia">Test de Libertad — ${totalCriterios} criterios · 12 categorías</div>
   </div>
   <div class="seccion-titulo-principal">
-    Reporte de Auditoría Cívica Liberal: Análisis por Criterio del Test de Libertad
+    Auditoría: Análisis por Criterio del Test de Libertad
   </div>
   <div class="leyenda-resultados">
     <div class="leyenda-titulo">Cómo leer los resultados</div>
@@ -1316,12 +1340,14 @@ function generarHTML(datos, metadatos, disclaimer = null) {
   </table>
 </div>`;
 
+  // 27 ago 2026 (naming): <title> del documento — "Reporte de Auditoría —
+  // X" pasa a "Auditoría — X", mismo criterio que la etiqueta de portada.
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=794">
-  <title>Reporte de Auditoría — ${esc(titulo)}</title>
+  <title>Auditoría — ${esc(titulo)}</title>
   <style>${CSS}</style>
 </head>
 <body>

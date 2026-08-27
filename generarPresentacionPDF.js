@@ -69,6 +69,14 @@
 // esc(), sin pasar por Claude), centrado bajo la portada. Si llega null
 // (la clave todavía no existe), no se muestra nada — no bloquea la
 // generación de la presentación.
+//
+// v4.1.1 (naming, 27 ago 2026) — RENOMBRE PÚBLICO DEL PRODUCTO: este
+// archivo genera lo que ahora se llama "Activismo" de cara al ciudadano
+// (antes "Presentación") — decisión de Moisés/Roberto/Felipe. Solo se
+// tocó texto VISIBLE en el PDF final (etiqueta de portada y <title> del
+// documento) — nombres de función/variable, clases CSS y el resto del
+// changelog de arriba siguen diciendo "Presentación"/"presentacion" a
+// propósito, sin ningún cambio de comportamiento.
 
 'use strict';
 
@@ -264,6 +272,11 @@ const CSS = `
 // 20 ago 2026 (v4.1): quinto parámetro opcional `disclaimer` — mismo
 // mecanismo que generarReportePDF.js (prompts_productos, clave
 // "disclaimer_presentacion").
+// 27 ago 2026 (naming): la etiqueta de portada pasa de "Ideas para el
+// activismo · Generado el ..." a "Activismo · Generado el ...", mismo
+// formato que usa ahora la etiqueta de portada del Reporte ("Auditoría ·
+// Test de Libertad · ..."), para que los cuatro productos se vean
+// consistentes entre sí.
 function generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje, disclaimer = null) {
   const color = alineacionPorcentaje < 20 ? '#C41230' : alineacionPorcentaje > 80 ? '#2E7D32' : '#B8860B';
   const tituloHero = `Alineación Liberal: ${alineacionPorcentaje}%. Ideas de Activismo`;
@@ -283,7 +296,7 @@ function generarPortadaHTML(titulo, pais, generadoEl, alineacionPorcentaje, disc
     </div>
   </div>
   <div class="portada-body">
-    <div class="portada-etiqueta">Ideas para el activismo · Generado el ${esc(generadoEl)}</div>
+    <div class="portada-etiqueta">Activismo · Generado el ${esc(generadoEl)}</div>
     <h1 class="portada-titulo">${esc(titulo)}</h1>
     <div class="portada-subtitulo">${esc(pais)}</div>
   </div>
@@ -410,12 +423,14 @@ function generarHTML(datos, metadatos, contexto) {
   const activismoHTML = generarLaminasIdeasHTML(ideasConCriterio);
   const contactoHTML  = generarLaminaContactoHTML(contactosApoyo, contactosSonDummy);
 
+  // 27 ago 2026 (naming): <title> del documento — "Presentación — X" pasa
+  // a "Activismo — X".
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=1122">
-  <title>Presentación — ${esc(titulo)}</title>
+  <title>Activismo — ${esc(titulo)}</title>
   <style>${CSS}</style>
 </head>
 <body>

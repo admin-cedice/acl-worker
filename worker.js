@@ -3813,9 +3813,9 @@ async function enviarEmailDocumentoDuplicado(email, duplicado) {
   const cuerpo = `<p>Hola,</p>
        <p>El documento que subiste a Auditoría Cívica Liberal ya fue auditado anteriormente${fecha ? ` (el ${fecha})` : ''}: <strong>${duplicado.titulo_documento}</strong>. Para evitar auditorías repetidas del mismo documento, no lo volvimos a procesar — aquí tienes los materiales de esa auditoría:</p>
        <ul>
-         ${duplicado.link_reporte      ? `<li><a href="${duplicado.link_reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
-         ${duplicado.link_podcast      ? `<li><a href="${duplicado.link_podcast}">🎙️ Podcast </a>(mp3)</li>` : ''}
-         ${duplicado.link_presentacion ? `<li><a href="${duplicado.link_presentacion}">📊 Presentación </a>(PDF)</li>` : ''}
+         ${duplicado.link_reporte      ? `<li><a href="${duplicado.link_reporte}">📋 Auditoría (PDF)</a></li>` : ''}
+         ${duplicado.link_podcast      ? `<li><a href="${duplicado.link_podcast}">🎙️ Diálogo (mp3)</a></li>` : ''}
+         ${duplicado.link_presentacion ? `<li><a href="${duplicado.link_presentacion}">📊 Activismo (PDF)</a></li>` : ''}
          <li><a href="https://liberalmente.app/auditoria/${duplicado.id}/grafo">🌐 Mapa Mental (Web, Grafo3D interactivo)</a></li>
        </ul>
        <p>Si crees que esto es un error — por ejemplo, si es una versión o reforma distinta del mismo documento — escríbenos desde <a href="https://liberalmente.app/#contacto">nuestro formulario de contacto</a>.</p>
@@ -3867,9 +3867,9 @@ async function enviarEmailPosibleDuplicado(email, auditoria_id, titulo, parecido
   const listaParecidos = parecidos.map(p => `
        <li style="margin-bottom:10px">
          <strong>${p.titulo_documento}</strong><br>
-         ${p.link_reporte      ? `<a href="${p.link_reporte}">📋 Reporte</a> ` : ''}
-         ${p.link_podcast      ? `<a href="${p.link_podcast}">🎙️ Podcast</a> ` : ''}
-         ${p.link_presentacion ? `<a href="${p.link_presentacion}">📊 Presentación</a>` : ''}
+         ${p.link_reporte      ? `<a href="${p.link_reporte}">📋 Auditoría</a> ` : ''}
+         ${p.link_podcast      ? `<a href="${p.link_podcast}">🎙️ Diálogo</a> ` : ''}
+         ${p.link_presentacion ? `<a href="${p.link_presentacion}">📊 Activismo</a>` : ''}
        </li>`).join('');
 
   const cuerpo = `<p>Hola,</p>
@@ -4375,13 +4375,13 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 		  const fraseDinamica = `Hoy nos ocupamos de: ${metadatos.titulo}.`;
 		  const piezasFijas = await prepararPiezasFijasPodcast(dir);
 	      await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica, ...piezasFijas });
-	      linkPodcast = await subirArchivo(drive, rutaMp3, `Podcast_${identificadorLimpio}.mp3`, 'audio/mpeg', carpetaId);
+	      linkPodcast = await subirArchivo(drive, rutaMp3, `Dialogo_${identificadorLimpio}.mp3`, 'audio/mpeg', carpetaId);
 	      console.log(`✅ [${auditoria_id}] Podcast generado y subido — veredicto del revisor: ${resultadoGuion.veredicto}`);
 	    } catch (errorPodcast) {
-	      console.error(`⚠️  [${auditoria_id}] No se pudo generar el podcast (no bloqueante):`, errorPodcast.message);
+	      console.error(`⚠️  [${auditoria_id}] No se pudo generar el diálogo (no bloqueante):`, errorPodcast.message);
 	    }
 
-	    console.log(`📊 [${auditoria_id}] PASO 6.7: Generando Presentación...`);
+	    console.log(`📊 [${auditoria_id}] PASO 6.7: Generando Presentación de Activismo...`);
 	    let linkPresentacion = null;
 	    try {
 	      const rutaPresentacionPDF = path.join(dir, 'presentacion.pdf');
@@ -4413,10 +4413,10 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 			{ estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo },
 		    disclaimerPresentacion
 	      );
-	      linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
-	      console.log(`✅ [${auditoria_id}] Presentación generada y subida`);
+	      linkPresentacion = await subirArchivo(drive, rutaPresentacionPDF, `Activismo_${identificadorLimpio}.pdf`, 'application/pdf', carpetaId);
+	      console.log(`✅ [${auditoria_id}] Presentación de Activismo generada y subida`);
 	    } catch (errorPresentacion) {
-	      console.error(`⚠️  [${auditoria_id}] No se pudo generar la Presentación (no bloqueante):`, errorPresentacion.message);
+	      console.error(`⚠️  [${auditoria_id}] No se pudo generar la Presentación de Activismo(no bloqueante):`, errorPresentacion.message);
     }
 
     console.log(`☁️  [${auditoria_id}] PASO 7: Subiendo original y reporte a Drive...`);
@@ -4856,10 +4856,10 @@ async function enviarEmailFinal(email, nombre, titulo, auditoria_id, links, ciud
         <p>${saludo}</p>
         <p>Tu auditoría de <strong>${titulo}</strong> está lista. Aquí están tus materiales:</p>
         <ul>
-          ${links.reporte      ? `<li><a href="${links.reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
-          ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Podcast </a>(mp3)</li>` : ''}
-          ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Presentación </a>(PDF)</li>` : ''}
-          <li><a href="https://liberalmente.app/auditoria/${auditoria_id}/grafo">🌐 Mapa Mental (Web, Grafo3D interactivo)</a></li>
+		  ${links.reporte      ? `<li><a href="${links.reporte}">📋 Auditoría (PDF)</a></li>` : ''}
+		  ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Diálogo </a>(mp3)</li>` : ''}
+		  ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Activismo </a>(PDF)</li>` : ''}
+		  <li><a href="https://liberalmente.app/auditoria/${auditoria_id}/grafo">🌐 Mapa3D (interactivo)</a></li>
         </ul>
         <p>Accede a todos tus análisis en <a href="https://liberalmente.app/biblioteca">liberalmente.app/biblioteca</a>; y si quieres compartir este correo con otras personas, ¡no dudes en reenviárselos!</p>
         <p>Saludos,</p>
@@ -4936,10 +4936,10 @@ async function enviarAvisoAuditoriaATodos(ciudadanoExcluidoId, titulo, auditoria
         <p>${saludo}</p>
         <p>Una nueva auditoría ciudadana, esta vez sobre <strong>${titulo}</strong>, está lista. Aquí están los materiales:</p>
         <ul>
-          ${links.reporte      ? `<li><a href="${links.reporte}">📋 Reporte de Auditoría (PDF)</a></li>` : ''}
-          ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Podcast </a>(mp3)</li>` : ''}
-          ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Presentación </a>(PDF)</li>` : ''}
-          <li><a href="https://liberalmente.app/auditoria/${auditoria_id}/grafo">🌐 Mapa Mental (Web, Grafo3D interactivo)</a></li>
+		  ${links.reporte      ? `<li><a href="${links.reporte}">📋 Auditoría (PDF)</a></li>` : ''}
+		  ${links.podcast      ? `<li><a href="${links.podcast}">🎙️ Diálogo </a>(mp3)</li>` : ''}
+		  ${links.presentacion ? `<li><a href="${links.presentacion}">📊 Activismo </a>(PDF)</li>` : ''}
+		  <li><a href="https://liberalmente.app/auditoria/${auditoria_id}/grafo">🌐 Mapa3D (interactivo)</a></li>
         </ul>
         <p>Si quieres compartir este correo con otras personas, ¡no dudes en reenviárselos!</p>
         <p>Saludos,</p>
