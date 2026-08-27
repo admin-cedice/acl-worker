@@ -4301,38 +4301,31 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`📥 [${auditoria_id}] PASO 1: Descargando documento...`);
 	const driveAuth = autenticarDrive();
 	const drive = google.drive({ version: 'v3', auth: driveAuth });
-	let { texto: textoPDF, esTexto: esArchivoTexto, rutaOriginal: rutaDocumentoOriginal } = await descargarYExtraerTexto(drive, pdf_drive_id, dir);
+	let { texto: textoPDF, esTexto: esArchivoTexto, rutaOriginal: rutaDocumentoOriginal, paginas: paginasPDF } = await descargarYExtraerTexto(drive, pdf_drive_id, dir);
 	console.log(`✅ [${auditoria_id}] Documento descargado (${esArchivoTexto ? 'TXT' : 'PDF'})`);
 
 	console.log(`📝 [${auditoria_id}] PASO 2: Texto listo (${esArchivoTexto ? 'ya venía en texto plano' : 'extraído del PDF'})`);
 		fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
-	    console.log(`✅ [${auditoria_id}] Texto extraído (${textoPDF.length} chars)`);
+	    console.log(`✅ [${auditoria_id}] Texto extraído (${textoPDF.length} chars, ${paginasPDF || '?'} páginas)`);
 
-	    // 17 ago 2026 — NUEVO: detección de extracción de texto fallida.
-	    // Caso real (Ley del Régimen Especial de Arrendamiento de Inmuebles
-	    // Destinados a Vivienda, Gaceta 7.065): un PDF "impreso" desde una
-	    // página web con Microsoft Print to PDF puede verse perfectamente
-	    // legible a simple vista, pero tener el texto dibujado como trazos
-	    // vectoriales (letras convertidas en dibujos) en vez de caracteres
-	    // reales — ni pdf-parse ni pdftotext pueden extraer nada de ahí,
-	    // aunque no sea un escaneo ni tenga imágenes incrustadas.
-	    //
-	    // Sin este chequeo, ese texto casi vacío pasaba de largo hasta el
-	    // Filtro de Admisibilidad (PASO 3.5), que —correctamente, dado lo
-	    // poco que se le mandó— rechazaba el documento con el motivo
-	    // "no_pertinente" ("no parece tratarse de una ley..."), un mensaje
-	    // engañoso: el problema nunca fue el contenido, fue que nunca llegó
-	    // a leerse.
-	    //
-	    // Umbral de 200 caracteres: arbitrario pero generoso — cualquier
-	    // documento real de una sola página ya lo supera con margen; nunca
-	    // debería descalificar un documento legítimo, solo atrapar
-	    // extracciones genuinamente vacías o casi vacías.
-	    const UMBRAL_MINIMO_TEXTO_EXTRAIDO = 200;
-		    if (textoPDF.trim().length < UMBRAL_MINIMO_TEXTO_EXTRAIDO) {
+	    // 27 ago 2026 — FIX: antes, el umbral era 200 caracteres fijos, sin
+	    // importar cuántas páginas tuviera el documento. Un PDF de imagen
+	    // puede juntar 200+ caracteres de puro membrete repetido (caso real:
+	    // 336 caracteres, "Gaceta Oficial..." nada más) sin tener ni una
+	    // palabra de contenido real, y con el umbral viejo eso pasaba de
+	    // largo sin activar la transcripción de respaldo. Dos umbrales
+	    // distintos a propósito: el INICIAL decide si vale la pena intentar
+	    // la lectura visual con Claude (subirlo casi no cuesta nada de más);
+	    // el de RESPALDO valida lo que esa lectura visual encontró (se deja
+	    // bajo, para no rechazar documentos legítimamente cortos que Claude
+	    // sí pudo leer bien).
+	    const UMBRAL_INICIAL_PDF = paginasPDF ? Math.max(800, paginasPDF * 300) : 800;
+	    const UMBRAL_TXT_MINIMO  = 200;
+	    const UMBRAL_RESPALDO    = 200;
+	    const umbralInicial = esArchivoTexto ? UMBRAL_TXT_MINIMO : UMBRAL_INICIAL_PDF;
+
+		    if (textoPDF.trim().length < umbralInicial) {
 		      if (esArchivoTexto) {
-		        // Un .txt corto no tiene "versión visual" que rescatar — no hay
-		        // nada más que intentar.
 		        const mensaje = 'El archivo de texto que subiste tiene muy poco contenido para auditar. Revisa que se haya subido completo.';
 		        await db.query(
 		          `UPDATE auditorias
@@ -4342,16 +4335,16 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 		        );
 		        await enviarEmailRechazo(ciudadano_email, 'texto_no_extraible');
 		        console.log(`🔒 [${auditoria_id}] Rechazada — archivo .txt con muy poco contenido`);
-                await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
-                return;
+		        await devolverCupoPorAuditoria(auditoria_id).catch(() => {});
+		        return;
 		      }
 
-		      console.log(`⚠️  [${auditoria_id}] Extracción normal insuficiente (${textoPDF.trim().length} caracteres) — intentando transcripción de respaldo con Claude...`);
+		      console.log(`⚠️  [${auditoria_id}] Extracción normal insuficiente (${textoPDF.trim().length} caracteres, ${paginasPDF || '?'} páginas, umbral ${umbralInicial}) — intentando transcripción de respaldo con Claude...`);
 		      try {
 		        const textoTranscrito = await transcribirPDFConClaude(rutaDocumentoOriginal, auditoria_id);
-		        if (!textoTranscrito || textoTranscrito.trim().length < UMBRAL_MINIMO_TEXTO_EXTRAIDO) {
+		        if (!textoTranscrito || textoTranscrito.trim().length < UMBRAL_RESPALDO) {
 		          throw new Error(`la transcripción de respaldo también resultó insuficiente (${textoTranscrito ? textoTranscrito.trim().length : 0} caracteres)`);
-		        }
+		      }
 		        textoPDF = textoTranscrito.trim();
 		        fs.writeFileSync(rutaTXT, textoPDF, 'utf8');
 		        console.log(`✅ [${auditoria_id}] Transcripción de respaldo exitosa (${textoPDF.length} chars) — el pipeline continúa con normalidad`);
@@ -4840,7 +4833,8 @@ async function obtenerContactosApoyoActivos() {
 async function extraerTextoPDF(rutaPDF) {
   const buffer = fs.readFileSync(rutaPDF);
   const data   = await pdfParse(buffer);
-  return data.text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  const texto  = data.text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { texto, paginas: data.numpages || null };
 }
 
 // ── Transcripción de respaldo vía Claude (visión) — 17 ago 2026 ─────────
@@ -4914,10 +4908,12 @@ async function descargarYExtraerTexto(drive, fileId, dir) {
   const { esTexto } = await obtenerTipoArchivoDrive(drive, fileId);
   const rutaOriginal = path.join(dir, esTexto ? 'original-subido.txt' : 'original.pdf');
   await descargarPDF(drive, fileId, rutaOriginal); // descargarPDF() es un descargador genérico de bytes, pese al nombre — sirve igual para un .txt
-  const texto = esTexto
-    ? fs.readFileSync(rutaOriginal, 'utf8').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
-    : await extraerTextoPDF(rutaOriginal);
-  return { texto, esTexto, rutaOriginal };
+  if (esTexto) {
+    const texto = fs.readFileSync(rutaOriginal, 'utf8').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { texto, esTexto, rutaOriginal, paginas: null };
+  }
+  const { texto, paginas } = await extraerTextoPDF(rutaOriginal);
+  return { texto, esTexto, rutaOriginal, paginas };
 }
 
 async function extraerMetadatos(textoPDF) {
