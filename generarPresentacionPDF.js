@@ -95,6 +95,10 @@ function esc(str) {
 
 const RUTA_BASE_IMAGENES = 'https://liberalmente.app/presentacion';
 
+// ── SUPERADO (27 ago 2026) — ya no se usa, ver sistema Contacto/Calle más
+// abajo. Se conserva por si algún día se retoma un tratamiento ilustrado
+// (mismo criterio que el resto del archivo con código superado: no se
+// borra, solo deja de llamarse).
 const ILUSTRACION_POR_CATEGORIA = {
   redes_sociales:            'activismo-redes-sociales.png',
   contacto_representantes:   'activismo-contacto-representantes.png',
@@ -111,6 +115,57 @@ const ILUSTRACION_POR_CATEGORIA = {
   creativo_cultural:         'activismo-creativo-cultural.png',
   coaliciones:               'activismo-coaliciones.png',
 };
+
+// ── EN USO (27 ago 2026) — Sistema tipográfico Contacto/Calle ────────────
+// Reemplaza las ilustraciones de arriba. Valores exactos del manual
+// gráfico aprobado por el Ala Doctrinal (mockup HTML compartido el 27 de
+// agosto) — colores, tipografía y estructura de lámina copiados de ahí,
+// no inventados. A diferencia del primer borrador de este mismo día, el
+// diseño real NO lleva ningún ícono dentro de la lámina — la única marca
+// por categoría es la barra de acento vertical (idea-barra-acento) a la
+// izquierda del texto. Los íconos del manual solo existen en la página
+// de referencia que se le mostró al Ala Doctrinal, no en el producto.
+//
+// ADVERTENCIA DE PRODUCCIÓN: el mockup usa la fuente 'Anton' (Google
+// Fonts) para los títulos del modo Calle. Ya existe una decisión
+// documentada del 15 jun 2026: "Fuentes en reporte PDF: Georgia + Arial
+// (sistema) en lugar de Playfair/Source Sans (no cargan en CloudConvert)"
+// — Playfair Display y Source Sans 3 fallaron a cargar ahí antes. Anton
+// es el mismo tipo de fuente (Google Fonts) y podría fallar igual. Se
+// deja 'Impact' como respaldo (fuente de sistema con un aire visual
+// parecido: condensada y de trazo grueso) en el mismo font-family, pero
+// esto HAY QUE PROBARLO con una conversión real (/test-reporte o una
+// auditoría real) antes de darlo por bueno — si Anton no carga, el título
+// de las láminas "Calle" va a verse con Impact en vez del look de cartel
+// del mockup.
+const MODOS_ACTIVISMO = {
+  contacto: { nombre: 'Contacto', bg: '#0F2A3D', texto: '#F5F3EE', textoMid: 'rgba(245,243,238,0.72)' },
+  calle:    { nombre: 'Calle',    bg: '#C41230', texto: '#FFFFFF', textoMid: 'rgba(255,255,255,0.85)' },
+};
+
+const CATEGORIA_ACTIVISMO = {
+  // Modo Contacto — vías institucionales (6)
+  accion_juridica:           { modo: 'contacto', nombre: 'Acción Jurídica',             color: '#5D82B0' },
+  contacto_representantes:   { modo: 'contacto', nombre: 'Contacto con Representantes', color: '#6FA3B8' },
+  electoral:                 { modo: 'contacto', nombre: 'Electoral',                   color: '#8A8FD1' },
+  deliberacion_publica:      { modo: 'contacto', nombre: 'Deliberación Pública',        color: '#5FAFC7' },
+  coaliciones:               { modo: 'contacto', nombre: 'Coaliciones',                 color: '#4E85AE' },
+  evidencia_argumentos:      { modo: 'contacto', nombre: 'Evidencia y Argumentos',      color: '#9DA9BD' },
+  // Modo Calle — vías de movilización pública (8)
+  movilizacion_ciudadana:    { modo: 'calle', nombre: 'Movilización Ciudadana',      color: '#FF8A65' },
+  comunitario_territorial:   { modo: 'calle', nombre: 'Comunitario y Territorial',    color: '#E0A458' },
+  creativo_cultural:         { modo: 'calle', nombre: 'Creativo y Cultural',          color: '#D46FA0' },
+  redes_sociales:            { modo: 'calle', nombre: 'Redes Sociales',              color: '#FF7A5C' },
+  prensa_medios:             { modo: 'calle', nombre: 'Prensa y Medios',             color: '#E8B44A' },
+  peticiones_adhesiones:     { modo: 'calle', nombre: 'Peticiones y Adhesiones',      color: '#E88AA0' },
+  economico:                 { modo: 'calle', nombre: 'Económico',                   color: '#D4B24C' },
+  educacion_multiplicadores: { modo: 'calle', nombre: 'Educación y Multiplicadores',  color: '#F0956B' },
+};
+
+// Ícono fijo del pie de cada lámina ("¿Y tú, qué piensas?") — el mismo en
+// los dos modos, tal como en el mockup (globo de diálogo, color rojo
+// institucional, sin variar por categoría).
+const ICONO_FOOTER_ACTIVISMO = `<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-8.4 8.4 8.3 8.3 0 0 1-3.8-.9L3 21l1.9-5.7a8.3 8.3 0 0 1-.9-3.8A8.4 8.4 0 0 1 12.6 3a8.4 8.4 0 0 1 8.4 8.5z"/></svg>`;
 
 // ── SUPERADO / dead code, sin tocar (ver nota en el changelog de arriba) ──
 // HORIZONTES y AREA_POR_RESULTADO ya no alimentan la portada ni la sección
@@ -150,10 +205,12 @@ function partirEnBloques(lista, tam) {
   return bloques;
 }
 
-// ── EN USO (16 ago 2026) — tipo y color de idea, directo por resultado ───
-// Reemplaza a TIPO_ACTIVISMO_POR_HORIZONTE/COLOR_POR_HORIZONTE/ORDEN_HORIZONTE
-// del v3.0 (que pasaban por AREA_POR_RESULTADO) — ahora es un único paso,
-// sin el concepto de horizonte de por medio.
+// ── EN USO (16 ago 2026) — tipo de idea por resultado, para el ORDEN ─────
+// (rechazo primero, mejora, promoción al final). 27 ago 2026: con el
+// sistema Contacto/Calle, el color de la lámina ya no depende de esto —
+// COLOR_ACTIVISMO_POR_RESULTADO queda sin usarse en el render (la barra
+// de acento ahora es el color de CATEGORIA_ACTIVISMO), se conserva por si
+// hace falta reintroducir esa señal en otro lugar.
 const TIPO_ACTIVISMO_POR_RESULTADO  = { NO: 'rechazo', SI_MATIZ: 'mejora', SI: 'promocion' };
 const COLOR_ACTIVISMO_POR_RESULTADO = { NO: '#C41230', SI_MATIZ: '#B8860B', SI: '#2E7D32' };
 const ORDEN_TIPO_ACTIVISMO          = { rechazo: 0, mejora: 1, promocion: 2 };
@@ -226,15 +283,55 @@ const CSS = `
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
 
-  .lamina-idea-activismo { break-before: page; height: 178mm; display: flex; align-items: center; gap: 36px; padding: 0 12mm; }
-  .idea-ilustracion {
-    flex: 0 0 42%; height: 140mm; border-radius: 8px;
-    background-color: #EFEBE0; background-size: contain; background-position: center; background-repeat: no-repeat;
+  /* 27 ago 2026 — estructura exacta del manual gráfico aprobado: cinta
+     roja (3mm) → header crema (15mm, logo + "Ideas de Activismo") →
+     cuerpo (color de modo, con textura) → footer crema (22mm, "¿Y tú,
+     qué piensas?"). Reemplaza por completo al layout anterior (imagen a
+     un lado + texto al otro). */
+  .lamina-idea-activismo { break-before: page; height: 178mm; display: flex; flex-direction: column; overflow: hidden; }
+
+  .lamina-idea-cinta { height: 3mm; background: #C41230; flex-shrink: 0; }
+
+  .lamina-idea-header { height: 15mm; background: #F7F5F0; display: flex; align-items: center; justify-content: space-between; padding: 0 14mm; flex-shrink: 0; }
+  .lamina-idea-header .logo-mini { font-family: 'Playfair Display', Georgia, serif; font-size: 15px; letter-spacing: -0.01em; color: #1A1A1A; }
+  .lamina-idea-header .logo-mini strong { font-weight: 700; }
+  .lamina-idea-header .encabezado-fijo { font-size: 9.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: #8A8478; }
+
+  .lamina-idea-cuerpo { flex: 1; position: relative; display: flex; align-items: center; justify-content: center; padding: 0 18mm; overflow: hidden; }
+  .lamina-idea-cuerpo.modo-contacto { background: #0F2A3D; }
+  .lamina-idea-cuerpo.modo-contacto::before {
+    content: ''; position: absolute; inset: 0;
+    background-image: repeating-linear-gradient(180deg, rgba(255,255,255,0.045) 0px, rgba(255,255,255,0.045) 1px, transparent 1px, transparent 9mm);
   }
-  .idea-contenido { flex: 1 1 auto; }
-  .idea-numero { font-size: 13px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #8A8478; margin-bottom: 14px; }
-  .idea-titulo { font-family: Georgia, 'Times New Roman', serif; font-size: 28px; font-weight: 700; line-height: 1.3; margin-bottom: 18px; max-width: 480px; }
-  .idea-descripcion { font-size: 17px; color: #4A4A4A; line-height: 1.6; max-width: 480px; }
+  .lamina-idea-cuerpo.modo-calle { background: #C41230; }
+  .lamina-idea-cuerpo.modo-calle::before {
+    content: ''; position: absolute; inset: 0;
+    background-image: radial-gradient(rgba(255,255,255,0.10) 1.4px, transparent 1.4px); background-size: 6mm 6mm;
+  }
+
+  .idea-contenido-wrap { position: relative; z-index: 1; display: flex; align-items: stretch; gap: 6mm; }
+  .idea-barra-acento { width: 4.5mm; flex-shrink: 0; border-radius: 1px; }
+  .idea-contenido { width: 131mm; flex-shrink: 0; text-align: left; }
+
+  .idea-modo-tag { display: inline-block; font-size: 9.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; border-radius: 2px; padding: 4px 9px; margin-bottom: 10px; }
+  .idea-modo-tag.modo-contacto { color: #F5F3EE; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.2); }
+  .idea-modo-tag.modo-calle { color: #FFFFFF; background: rgba(0,0,0,0.18); }
+
+  /* Contacto — voz formal/procedimental: monoespaciada para el expediente. */
+  .idea-exp-contacto { font-family: 'Courier New', monospace; font-size: 10px; color: rgba(245,243,238,0.55); margin-bottom: 8px; }
+  .idea-titulo-contacto { font-family: Georgia, 'Times New Roman', serif; font-size: 24px; font-weight: 700; color: #F5F3EE; line-height: 1.3; margin-bottom: 10px; }
+  .idea-desc-contacto { font-size: 12.5px; color: rgba(245,243,238,0.72); line-height: 1.62; }
+
+  /* Calle — voz directa/imperativa: Anton (ver advertencia de CloudConvert
+     en el comentario de CATEGORIA_ACTIVISMO, más arriba). */
+  .idea-exp-calle { font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; color: rgba(255,255,255,0.78); margin-bottom: 8px; text-transform: uppercase; }
+  .idea-titulo-calle { font-family: 'Anton', Impact, 'Arial Narrow', Arial, sans-serif; font-size: 27px; color: #FFFFFF; line-height: 1.14; text-transform: uppercase; margin-bottom: 10px; }
+  .idea-desc-calle { font-size: 12.5px; color: rgba(255,255,255,0.85); line-height: 1.6; font-weight: 500; }
+
+  .lamina-idea-footer { height: 22mm; background: #F7F5F0; display: flex; align-items: center; justify-content: center; gap: 12px; flex-shrink: 0; }
+  .lamina-idea-footer .icono-footer { flex-shrink: 0; color: #C41230; opacity: 0.8; }
+  .texto-invitacion-contacto { font-family: Georgia, 'Times New Roman', serif; font-weight: 700; font-size: 24px; color: #1A1A1A; }
+  .texto-invitacion-calle { font-family: 'Anton', Impact, 'Arial Narrow', Arial, sans-serif; font-size: 27px; text-transform: uppercase; color: #1A1A1A; letter-spacing: 0.01em; }
 
   .lamina-activismo-horizonte { break-before: page; min-height: 178mm; }
   .activismo-header { display: flex; align-items: baseline; gap: 10px; border-bottom: 3px solid; padding-bottom: 12px; margin-bottom: 22px; }
@@ -352,16 +449,57 @@ function generarLaminasHallazgosHTML(secciones, articulosPorCriterio) {
     }).join('\n');
 }
 
-function generarLaminaIdeaHTML(idea, numero, total, color) {
-  const archivo = ILUSTRACION_POR_CATEGORIA[idea.categoria] || ILUSTRACION_POR_CATEGORIA.redes_sociales;
-  const src = `${RUTA_BASE_IMAGENES}/${archivo}`;
+// 27 ago 2026 — reescrita para calzar exactamente con el manual gráfico
+// aprobado (mockup del 27 ago). Ya no recibe `color` — el rojo/dorado/
+// verde de rechazo/mejora/promoción ya no se dibuja en la lámina (el
+// mockup lo reemplazó por el color de la categoría, en la barra de
+// acento); ese eje sigue existiendo solo como criterio de ORDEN en
+// generarLaminasIdeasHTML(), no de color.
+function generarLaminaIdeaHTML(idea, numero, total) {
+  const cat = CATEGORIA_ACTIVISMO[idea.categoria] || CATEGORIA_ACTIVISMO.redes_sociales;
+  const modoClave = cat.modo; // 'contacto' | 'calle'
+  const esCalle = modoClave === 'calle';
+  const catNombreMayus = esc(cat.nombre.toUpperCase());
+
+  // Voz distinta por modo, tal como el mockup: Contacto habla en términos
+  // de expediente ("EXP. N/total"), Calle habla directo ("Idea N de total").
+  const expHTML = esCalle
+    ? `<div class="idea-exp-calle">Idea ${numero} de ${total} · ${catNombreMayus}</div>`
+    : `<div class="idea-exp-contacto">EXP. ${numero}/${total} · ${catNombreMayus}</div>`;
+
+  const tituloHTML = esCalle
+    ? `<div class="idea-titulo-calle">${esc(idea.titulo)}</div>`
+    : `<div class="idea-titulo-contacto">${esc(idea.titulo)}</div>`;
+
+  const descHTML = esCalle
+    ? `<div class="idea-desc-calle">${esc(idea.descripcion)}</div>`
+    : `<div class="idea-desc-contacto">${esc(idea.descripcion)}</div>`;
+
+  const invitacionHTML = esCalle
+    ? `<span class="texto-invitacion-calle">Y tú, ¿qué piensas?</span>`
+    : `<span class="texto-invitacion-contacto">Y tú, ¿qué piensas?</span>`;
+
   return `
 <div class="lamina-idea-activismo">
-  <div class="idea-ilustracion" style="background-image:url('${src}')"></div>
-  <div class="idea-contenido" style="border-left:5px solid ${color}; padding-left:26px;">
-    <div class="idea-numero">Idea ${numero} de ${total}</div>
-    <div class="idea-titulo">${esc(idea.titulo)}</div>
-    <div class="idea-descripcion">${esc(idea.descripcion)}</div>
+  <div class="lamina-idea-cinta"></div>
+  <div class="lamina-idea-header">
+    <div class="logo-mini"><strong>Liberal</strong>mente</div>
+    <div class="encabezado-fijo">Ideas de Activismo</div>
+  </div>
+  <div class="lamina-idea-cuerpo modo-${modoClave}">
+    <div class="idea-contenido-wrap">
+      <div class="idea-barra-acento" style="background:${cat.color}"></div>
+      <div class="idea-contenido">
+        <div class="idea-modo-tag modo-${modoClave}">Modo ${esc(MODOS_ACTIVISMO[modoClave].nombre)}</div>
+        ${expHTML}
+        ${tituloHTML}
+        ${descHTML}
+      </div>
+    </div>
+  </div>
+  <div class="lamina-idea-footer">
+    ${ICONO_FOOTER_ACTIVISMO}
+    ${invitacionHTML}
   </div>
 </div>`;
 }
@@ -371,9 +509,11 @@ function generarLaminaIdeaHTML(idea, numero, total, color) {
 // + generarLaminasHibridoHTML() del v3.0 — antes había una rama para el
 // caso "total" (color único para toda la Presentación) y otra para el
 // caso "híbrido" (color por criterio). Ahora solo existe este camino:
-// siempre una idea por criterio, siempre coloreada según su propio
-// resultado. Orden: rechazo primero, mejora, promoción al final — mismo
-// criterio de urgencia que ya usaba el caso híbrido.
+// siempre una idea por criterio. Orden: rechazo primero, mejora,
+// promoción al final — mismo criterio de urgencia que ya usaba el caso
+// híbrido (27 ago 2026: el orden se conserva; el color por resultado que
+// antes se pintaba en el borde ya no se usa — ver la nota en
+// generarLaminaIdeaHTML).
 function generarLaminasIdeasHTML(ideasConCriterio) {
   const lista = ideasConCriterio || [];
   const ordenadas = [...lista].sort((a, b) => {
@@ -381,10 +521,7 @@ function generarLaminasIdeasHTML(ideasConCriterio) {
     const tb = TIPO_ACTIVISMO_POR_RESULTADO[b.resultado] || 'promocion';
     return (ORDEN_TIPO_ACTIVISMO[ta] ?? 9) - (ORDEN_TIPO_ACTIVISMO[tb] ?? 9);
   });
-  return ordenadas.map((item, i) => {
-    const color = COLOR_ACTIVISMO_POR_RESULTADO[item.resultado] || '#8A8478';
-    return generarLaminaIdeaHTML(item.idea, i + 1, ordenadas.length, color);
-  }).join('\n');
+  return ordenadas.map((item, i) => generarLaminaIdeaHTML(item.idea, i + 1, ordenadas.length)).join('\n');
 }
 
 // ── Lámina de contacto — sin cambios ──────────────────────────────────────
@@ -425,12 +562,21 @@ function generarHTML(datos, metadatos, contexto) {
 
   // 27 ago 2026 (naming): <title> del documento — "Presentación — X" pasa
   // a "Activismo — X".
+  //
+  // 27 ago 2026 (Contacto/Calle): se intenta cargar 'Anton' de Google
+  // Fonts para los títulos del modo Calle (preconnect + link, igual que
+  // el mockup aprobado) — HAY QUE CONFIRMAR con una conversión real si
+  // CloudConvert la carga o no; el font-family de cada estilo ya trae
+  // 'Impact' como respaldo por si no. Ver el aviso completo junto a
+  // CATEGORIA_ACTIVISMO, arriba.
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=1122">
   <title>Activismo — ${esc(titulo)}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet">
   <style>${CSS}</style>
 </head>
 <body>
