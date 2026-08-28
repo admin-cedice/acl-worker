@@ -3818,6 +3818,150 @@ app.post('/manual/activar', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// ── Opt-in de avisos masivos (27 ago 2026) ────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// PEGAR ESTE BLOQUE COMPLETO en worker.js — junto a la sección de
+// "Baja de avisos masivos" que ya existe (busca "generarTokenOptOut" y
+// pega este bloque justo después de esa sección completa, antes de la
+// sección "── Detección de documentos duplicados ──").
+//
+// Requiere migracion-notificaciones-optin.sql corrida ANTES de
+// desplegar esto.
+//
+// Cómo funciona: el ciudadano aprieta "Suscribirme" en Tu Biblioteca →
+// esto le manda un correo con un link firmado → cuando hace clic en ESE
+// link (no antes) queda con recibir_notificaciones_auditorias = true.
+// Para darse de baja no hace falta ningún correo — ni el link firmado de
+// siempre (/notificaciones/optout, para cuando llega desde uno de los
+// avisos), ni el botón nuevo de Tu Biblioteca (sesión ya autenticada, sin
+// token) exigen confirmación — solo para SUSCRIBIRSE hace falta
+// confirmar, nunca para darse de baja.
+
+function generarTokenOptin(ciudadanoId) {
+  return crypto.createHmac('sha256', WORKER_SECRET).update(`optin:${ciudadanoId}`).digest('hex');
+}
+
+function verificarTokenOptin(ciudadanoId, tokenRecibido) {
+  if (!ciudadanoId || !tokenRecibido) return false;
+  const esperado = generarTokenOptin(ciudadanoId);
+  const bufA = Buffer.from(String(tokenRecibido));
+  const bufB = Buffer.from(esperado);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+async function enviarEmailConfirmacionOptin(email, nombre, ciudadanoId) {
+  const primerNombre = nombre ? nombre.split(' ')[0] : null;
+  const saludo = primerNombre ? `Hola, ${primerNombre}.` : 'Hola,';
+  const token = generarTokenOptin(ciudadanoId);
+  const linkConfirmar = `${WORKER_URL_PUBLICO}/notificaciones/confirmar-optin?id=${ciudadanoId}&token=${token}`;
+
+  const cuerpo = `<p>${saludo}</p>
+       <p>Pediste recibir un aviso cada vez que otro ciudadano complete una auditoría en Auditoría Cívica Liberal. Para confirmar, haz clic aquí:</p>
+       <p><a href="${linkConfirmar}" style="display:inline-block;background:#C41230;color:#fff;padding:10px 20px;border-radius:2px;text-decoration:none;font-weight:600">Sí, quiero recibir los avisos →</a></p>
+       <p>Si no fuiste tú, ignora este correo — no se activa nada hasta que hagas clic en el enlace de arriba.</p>
+       <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+    body: JSON.stringify({
+      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+      to: email,
+      subject: 'Confirma que quieres recibir avisos de otras auditorías',
+      html: cuerpo,
+    }),
+  });
+  if (!res.ok) throw new Error(`Error enviando email de confirmación de opt-in: ${await res.text()}`);
+  console.log(`   ✅ Email de confirmación de opt-in enviado a ${email}`);
+}
+
+// POST /notificaciones/enviar-confirmacion-optin — server-to-server
+// (llamado desde Next.js, con la identidad ya verificada por sesión ahí).
+// Requiere x-worker-secret.
+app.post('/notificaciones/enviar-confirmacion-optin', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { ciudadano_id } = req.body || {};
+  if (!ciudadano_id) return res.status(400).json({ error: 'Falta ciudadano_id' });
+  try {
+    const { rows } = await db.query(`SELECT email, nombre FROM ciudadanos WHERE id = $1`, [ciudadano_id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Ciudadano no encontrado' });
+    await enviarEmailConfirmacionOptin(rows[0].email, rows[0].nombre, ciudadano_id);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error en /notificaciones/enviar-confirmacion-optin:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /notificaciones/confirmar-optin — público, se abre directo desde
+// el enlace del correo, sin sesión (mismo patrón que /notificaciones/optout
+// y /continuar-procesamiento).
+app.get('/notificaciones/confirmar-optin', async (req, res) => {
+  const { id, token } = req.query;
+  if (!id || !token || !verificarTokenOptin(id, token)) {
+    return res.status(400).type('text/html').send(
+      paginaOptOut('El enlace no es válido o está incompleto. Puedes volver a pedir la confirmación desde Tu Biblioteca en liberalmente.app.')
+    );
+  }
+  try {
+    const result = await db.query(
+      `UPDATE ciudadanos SET recibir_notificaciones_auditorias = true WHERE id = $1 RETURNING nombre`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).type('text/html').send(paginaOptOut('No encontramos esa cuenta.'));
+    }
+    console.log(`   [notificaciones/confirmar-optin] ${id} confirmó su suscripción a avisos masivos`);
+    res.type('text/html').send(
+      paginaOptOut('Listo — a partir de ahora recibirás un aviso cada vez que otro ciudadano complete una auditoría. Puedes darte de baja cuando quieras, desde el enlace de esos mismos correos o desde Tu Biblioteca.')
+    );
+  } catch (error) {
+    console.error('[notificaciones/confirmar-optin] Error:', error.message);
+    res.status(500).type('text/html').send(paginaOptOut('Hubo un problema procesando tu solicitud. Intenta de nuevo más tarde.'));
+  }
+});
+
+// GET /notificaciones/estado?ciudadano_id=... — server-to-server, solo
+// lectura. Requiere x-worker-secret.
+app.get('/notificaciones/estado', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const ciudadanoId = req.query.ciudadano_id;
+  if (!ciudadanoId) return res.status(400).json({ error: 'Falta ciudadano_id' });
+  try {
+    const { rows } = await db.query(`SELECT recibir_notificaciones_auditorias FROM ciudadanos WHERE id = $1`, [ciudadanoId]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Ciudadano no encontrado' });
+    res.json({ ok: true, suscrito: rows[0].recibir_notificaciones_auditorias === true });
+  } catch (error) {
+    console.error('❌ Error en /notificaciones/estado:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /notificaciones/desuscribir-sesion — server-to-server. A
+// diferencia de /notificaciones/confirmar-optin, darse de baja NO exige
+// ningún correo de confirmación — el ciudadano ya está autenticado por
+// sesión del lado de Next.js. Requiere x-worker-secret.
+app.post('/notificaciones/desuscribir-sesion', async (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  const { ciudadano_id } = req.body || {};
+  if (!ciudadano_id) return res.status(400).json({ error: 'Falta ciudadano_id' });
+  try {
+    await db.query(`UPDATE ciudadanos SET recibir_notificaciones_auditorias = false WHERE id = $1`, [ciudadano_id]);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('❌ Error en /notificaciones/desuscribir-sesion:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Baja de avisos masivos (11 ago 2026) ──────────────────────────────────
 // Público, sin secreto — se abre directo desde el link del correo, en un
 // navegador sin sesión. Idempotente: si ya estaba dado de baja, muestra
@@ -4699,11 +4843,16 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	      presentacion: linkPresentacion,
 	    };
         await enviarEmailFinal(ciudadano_email, nombreCiudadano, metadatos.titulo, auditoria_id, linksProductos, ciudadanoId);
-	    // PASO 8.5 ELIMINADO (19 ago 2026, feedback de beta-testers): el aviso
-	    // masivo a "todos los ciudadanos activos" se sentía como spam — el
-	    // opt-out no bastaba. Se desactiva la llamada mientras se diseña un
-	    // opt-in real. enviarAvisoAuditoriaATodos() y /notificaciones/optout
-	    // se dejan intactos, sin usar, para reutilizarlos en esa función.
+        // PASO 8.5 REACTIVADO (27 ago 2026) — ya con opt-in real: la
+        // consulta de enviarAvisoAuditoriaATodos() (sin cambios en su
+        // propia lógica) filtra por recibir_notificaciones_auditorias =
+        // true, que desde hoy solo queda en true para quien confirmó por
+        // correo (ver /notificaciones/confirmar-optin, arriba). No
+        // bloqueante — un fallo acá nunca debe afectar el estado
+        // 'completada' de la auditoría ni el correo normal al ciudadano.
+        await enviarAvisoAuditoriaATodos(ciudadanoId, metadatos.titulo, auditoria_id, linksProductos).catch(err => {
+          console.error(`   [${auditoria_id}] ⚠️ No se pudo enviar el aviso masivo (no bloqueante):`, err.message);
+        });
 
     console.log(`\n🎉 [${auditoria_id}] Auditoría completada`);
 
