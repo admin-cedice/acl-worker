@@ -4699,17 +4699,22 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     console.log(`🕸️  [${auditoria_id}] PASO 6.5: Generando datos del grafo (artículos + citas con Claude)...`);
     let grafoDatosCompartido = null;
     try {
-      // 4 ago 2026: se lee el prompt personalizado de "mapa_articulos"
-      // antes de llamar a generarGrafoConClaude() — si prompts_productos
-      // todavía no tiene esa clave, promptGrafo llega null y la función
-      // usa PROMPT_GRAFO_RESPALDO (comportamiento idéntico al de antes).
       const promptGrafo = await obtenerPromptProducto('mapa_articulos');
-      const analisisGrafo = await generarGrafoConClaude(textoPDF, datosReporte, auditoria_id, promptGrafo);
+      // 28 ago 2026 — reintenta hasta 3 veces (5s de pausa entre cada
+      // una) antes de darse por vencido — antes, un solo fallo pasajero
+      // de Claude dejaba el Mapa3D vacío hasta una intervención manual
+      // con /regenerar-grafo. Sigue siendo no bloqueante si los 3
+      // intentos fallan: la auditoría se completa igual, solo sin
+      // Mapa3D, como ya pasaba antes de este cambio.
+      const analisisGrafo = await conReintentos(
+        () => generarGrafoConClaude(textoPDF, datosReporte, auditoria_id, promptGrafo),
+        3, 5000
+      );
       grafoDatosCompartido = calcularDatosGrafo(datosReporte, analisisGrafo, auditoria_id, pesosCriterios);
       await db.query(`UPDATE auditorias SET grafo_datos = $1 WHERE id = $2`, [JSON.stringify(grafoDatosCompartido), auditoria_id]);
       console.log(`✅ [${auditoria_id}] Datos del grafo guardados (${grafoDatosCompartido.nodos.length} nodos, ${grafoDatosCompartido.enlaces.length} enlaces)`);
     } catch (errorGrafo) {
-      console.error(`⚠️  [${auditoria_id}] No se pudieron generar los datos del grafo (no bloqueante):`, errorGrafo.message);
+      console.error(`⚠️  [${auditoria_id}] No se pudieron generar los datos del grafo tras 3 intentos (no bloqueante):`, errorGrafo.message);
     }
 
     console.log(`📁 [${auditoria_id}] Preparando carpeta de Drive...`);
@@ -4977,6 +4982,29 @@ async function obtenerContactosApoyoActivos() {
     `SELECT nombre, contacto, descripcion FROM contactos_apoyo WHERE activo = true ORDER BY orden ASC`
   );
   return rows;
+}
+
+// Reintenta una función asíncrona hasta `intentos` veces, con una pausa
+// fija entre cada intento — pensado para llamados a Claude/servicios
+// externos que a veces fallan por una razón pasajera (timeout, una
+// sobrecarga puntual) y funcionan bien al segundo intento, sin que haga
+// falta ninguna intervención manual. Si TODOS los intentos fallan,
+// relanza el último error — el llamador decide qué hacer con eso (en el
+// caso del grafo, ya existe un catch "no bloqueante" alrededor, así que
+// la auditoría se completa igual, solo sin Mapa3D, exactamente como
+// pasaba antes de este cambio).
+async function conReintentos(fn, intentos = 3, esperaMs = 5000) {
+  let ultimoError;
+  for (let i = 1; i <= intentos; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      ultimoError = err;
+      console.warn(`   ⚠️ Intento ${i}/${intentos} falló: ${err.message}${i < intentos ? ` — reintentando en ${esperaMs / 1000}s...` : ''}`);
+      if (i < intentos) await new Promise(r => setTimeout(r, esperaMs));
+    }
+  }
+  throw ultimoError;
 }
 
 async function extraerTextoPDF(rutaPDF) {
