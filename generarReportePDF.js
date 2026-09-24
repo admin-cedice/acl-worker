@@ -135,6 +135,35 @@
 //      "Auditoría" ahí habría chocado con el nombre del proyecto entero
 //      ("Auditoría Cívica Liberal") — ver el detalle en cada punto.
 
+// CAMBIOS v4.1.2 (24 sep 2026) — AUDITORÍA DEL CÁLCULO DEL PUNTAJE:
+//  49. Resumen ejecutivo: generarResumenEjecutivo() todavía hacía
+//      resumirParaPrompt(datos).slice(0, 6000) (el punto 41 de v4.0 decía
+//      que ese corte se había eliminado, pero seguía en el código). Con 39
+//      criterios el texto pasa de 25.000 caracteres, así que el modelo solo
+//      veía los primeros ~9-10 criterios y el resumen/puntos clave ignoraban
+//      las categorías V a XII (incluidos el único SÍ y varios SÍ*). Ahora se
+//      envía el análisis completo (con tope de seguridad de 60.000
+//      caracteres y aviso en el log) y se agrega al prompt la lista explícita
+//      de criterios con SÍ o SÍ*, para que las fortalezas no se omitan.
+//  50. Titular "X de 39": el prompt contaba los N/A dentro de "criterios
+//      evaluados". Ahora recibe "N aplicables de 39" y una regla que exige
+//      cuantificar siempre sobre los aplicables.
+//  51. Se elimina la compuerta `siPlenos > 0` del puntaje: una auditoría
+//      con 0 SÍ y varios SÍ* quedaba "sin total general", mientras que una
+//      con 1 SÍ y 27 NO tenía puntaje. Ahora el puntaje es null solo si no
+//      hay ningún criterio aplicable (denominador 0).
+//  52. Transparencia: la Ficha y la leyenda explican la fórmula (SÍ=1,
+//      SÍ*=0,5, NO=0, N/A fuera), muestran la suma ponderada exacta
+//      (numerador/denominador) y si los pesos son uniformes o variables.
+//      normalizarDatosEstructurados() devuelve el objeto `calculo` con esos
+//      datos.
+//  53. Integridad: normalizarDatosEstructurados() lanza un Error con
+//      codigo 'REPORTE_INCOMPLETO' (y err.detalle) si los ids recibidos no
+//      son exactamente los C-01..C-39 una sola vez cada uno, o si algún
+//      `resultado` no es SI|SI_MATIZ|NO|NA. Antes solo avisaba en el log y
+//      calculaba el puntaje con lo que hubiera llegado. worker.js debería
+//      capturar ese código y reintentar la llamada a Claude.
+
 'use strict';
 
 const fs      = require('fs');
@@ -235,6 +264,11 @@ const CRITERIO_A_CATEGORIA = (() => {
   }
   return mapa;
 })();
+
+// v4.1.2: total de criterios que debe traer toda auditoría, derivado del mapa
+// (fuente única de verdad) en vez de un 39 escrito a mano en varios sitios.
+const TOTAL_CRITERIOS_ESPERADO = Object.keys(CRITERIO_A_CATEGORIA).length;
+const RESULTADOS_VALIDOS = ['SI', 'SI_MATIZ', 'NO', 'NA'];
 
 function schemaCriterios() {
   return {
@@ -860,23 +894,44 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
   // Claude — se mantiene esta reclasificación aunque el schema ya no
   // anide por categoría, como red de seguridad ante un id inesperado
   // (ver el aviso de sinMapeoConocido más abajo).
+  // v4.1.2 (punto 53) — VERIFICACIÓN DE INTEGRIDAD. Antes, un id duplicado,
+  // faltante o desconocido solo generaba un aviso en el log y el puntaje se
+  // calculaba igual con lo que hubiera llegado (un id desconocido incluso
+  // desaparecía del cálculo). Un puntaje sobre un conjunto incompleto no es
+  // el puntaje del Test: se rechaza la auditoría para que el llamador
+  // (worker.js) reintente la llamada a Claude.
+  const conteoIds = new Map();
+  for (const crit of todosLosCriteriosRecibidos) {
+    conteoIds.set(crit.id, (conteoIds.get(crit.id) || 0) + 1);
+  }
+  const idsEsperados        = Object.keys(CRITERIO_A_CATEGORIA);
+  const duplicados          = [...conteoIds].filter(([, n]) => n > 1).map(([id]) => id);
+  const faltantes           = idsEsperados.filter(id => !conteoIds.has(id));
+  const desconocidos        = [...conteoIds.keys()].filter(id => !CRITERIO_A_CATEGORIA[id]).map(String);
+  const resultadosInvalidos = todosLosCriteriosRecibidos
+    .filter(c => !RESULTADOS_VALIDOS.includes(c.resultado))
+    .map(c => `${c.id}=${String(c.resultado)}`);
+
+  if (duplicados.length || faltantes.length || desconocidos.length || resultadosInvalidos.length) {
+    const partes = [];
+    if (faltantes.length)           partes.push(`faltan ${faltantes.length}: ${faltantes.join(', ')}`);
+    if (duplicados.length)          partes.push(`duplicados: ${duplicados.join(', ')}`);
+    if (desconocidos.length)        partes.push(`ids no reconocidos: ${desconocidos.join(', ')}`);
+    if (resultadosInvalidos.length) partes.push(`resultado inválido: ${resultadosInvalidos.join(', ')}`);
+    const err = new Error(
+      `[${auditoria_id}] Reporte incompleto o inconsistente (se esperaban ${TOTAL_CRITERIOS_ESPERADO} ` +
+      `criterios únicos, llegaron ${todosLosCriteriosRecibidos.length}) — ${partes.join(' | ')}. ` +
+      `No se calcula el puntaje sobre un conjunto incompleto; reintentar la llamada a Claude.`
+    );
+    err.codigo  = 'REPORTE_INCOMPLETO';
+    err.detalle = { duplicados, faltantes, desconocidos, resultadosInvalidos };
+    throw err;
+  }
+
   const criteriosPorCategoria = {};
   NUMEROS_CATEGORIA.forEach(num => { criteriosPorCategoria[num] = []; });
-
-  const sinMapeoConocido = [];
   for (const crit of todosLosCriteriosRecibidos) {
-    const categoriaReal = CRITERIO_A_CATEGORIA[crit.id];
-    if (!categoriaReal) {
-      sinMapeoConocido.push(crit.id);
-      continue;
-    }
-    criteriosPorCategoria[categoriaReal].push(crit);
-  }
-  if (sinMapeoConocido.length > 0) {
-    // Solo puede pasar si Claude inventa un id fuera de C-01..C-40 —
-    // no debería ocurrir, pero si pasa, mejor que quede visible en el log
-    // a que el criterio desaparezca en silencio.
-    console.warn(`   ⚠️ [${auditoria_id}] Criterios con id no reconocido (no mapean a C-01..C-39): ${sinMapeoConocido.join(', ')}`);
+    criteriosPorCategoria[CRITERIO_A_CATEGORIA[crit.id]].push(crit);
   }
 
   // Orden interno estable dentro de cada categoría, sin importar el orden
@@ -901,10 +956,7 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
   console.log(`   ║ DIAGNÓSTICO [${auditoria_id}] (salida estructurada)`);
   console.log(`   ╠══════════════════════════════════════════════════`);
   console.log(`   ║ Categorías : ${categorias.length} (se esperan 12)`);
-  console.log(`   ║ Criterios  : ${todos.length} (se esperan 39)`);
-    if (todos.length !== 39) {
-      console.warn(`   ⚠️ [${auditoria_id}] Se esperaban 39 criterios en total, llegaron ${todos.length}.`);
-  }
+  console.log(`   ║ Criterios  : ${todos.length} (se esperan ${TOTAL_CRITERIOS_ESPERADO})`);
   categorias.forEach(cat => console.log(`   ║   Cat. ${cat.num.padEnd(3)}: ${cat.criterios.length} criterios`));
   console.log(`   ╠──────────────────────────────────────────────────`);
   console.log(`   ║ SÍ plenos  : ${siPlenos}`);
@@ -945,23 +997,48 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
     return (valor !== undefined && !Number.isNaN(numero)) ? numero : PESO_POR_DEFECTO;
   }
 
+  // — 24 sep 2026 (v4.1.2, punto 51): se elimina la compuerta
+  //   `siPlenos > 0`. Un SÍ con matiz ya suma 0,5 al numerador desde el 20
+  //   jul, así que una auditoría sin ningún SÍ pleno tiene un puntaje bien
+  //   definido; devolver null creaba un salto absurdo (0 SÍ + 10 SÍ* = "sin
+  //   total"; 1 SÍ + 27 NO = 1,8 %). Ahora es null solo si no hay ningún
+  //   criterio aplicable (denominador 0).
   let numeradorPonderado = 0;
   let denominadorPonderado = 0;
+  let aplicables = 0;
+  let pesoMin = Infinity;
+  let pesoMax = -Infinity;
   todos.forEach(c => {
     if (c.resultado === 'NA') return;
     const peso = leerPeso(c.id);
+    aplicables += 1;
+    pesoMin = Math.min(pesoMin, peso);
+    pesoMax = Math.max(pesoMax, peso);
     denominadorPonderado += peso;
     if (c.resultado === 'SI')            numeradorPonderado += peso * 1;
     else if (c.resultado === 'SI_MATIZ') numeradorPonderado += peso * 0.5;
     // NO suma 0 al numerador, pero sí pesa en el denominador — igual que antes.
   });
 
-  const puntaje = (denominadorPonderado > 0 && siPlenos > 0)
+  const puntaje = denominadorPonderado > 0
     ? Math.round((numeradorPonderado / denominadorPonderado) * 100)
     : null;
 
+  // v4.1.2 (punto 52): datos para explicar el cálculo en la Ficha, de modo
+  // que cualquiera pueda reproducir el número desde los veredictos.
+  const calculo = {
+    aplicables,
+    numerador:     numeradorPonderado,
+    denominador:   denominadorPonderado,
+    porcentajeExacto: denominadorPonderado > 0 ? (numeradorPonderado / denominadorPonderado) * 100 : null,
+    pesoMin:       aplicables > 0 ? pesoMin : null,
+    pesoMax:       aplicables > 0 ? pesoMax : null,
+    pesosUniformes: aplicables > 0 ? pesoMin === pesoMax : true,
+    pesoSiMatiz:   0.5,
+  };
+
   return {
-    puntaje, siPlenos, siMatiz, noCount, naCount,
+    puntaje, calculo, siPlenos, siMatiz, noCount, naCount,
     resumenEjecutivo: '', puntosClave: [],
     categorias,
     alertas: resultado.alertas || [],
@@ -972,10 +1049,17 @@ function normalizarDatosEstructurados(reporteJSON, auditoria_id = 'N/A', pesosCr
 // para usar como contexto en el llamado de generarResumenEjecutivo(). Ya no
 // depende de reporteTexto.slice(0, 6000) — ese corte podía caer a mitad de
 // un criterio en un texto narrativo largo.
+// v4.1.2 (punto 49): incluye SIEMPRE los 39 criterios. Los N/A van sin
+// análisis (solo id y resultado) para ahorrar espacio, y se agregan los
+// artículos citados, que el resumen puede reutilizar.
 function resumirParaPrompt(datos) {
   return datos.categorias.map(cat =>
     `CATEGORÍA ${cat.num} — ${cat.nombre}\n` +
-    cat.criterios.map(c => `${c.id} [${c.resultado}]: ${c.analisis}`).join('\n')
+    cat.criterios.map(c => {
+      if (c.resultado === 'NA') return `${c.id} [NA]`;
+      const arts = c.articulos ? ` (Arts.: ${c.articulos})` : '';
+      return `${c.id} [${c.resultado}]${arts}: ${c.analisis}`;
+    }).join('\n')
   ).join('\n\n');
 }
 
@@ -990,20 +1074,38 @@ function resumirParaPrompt(datos) {
 async function generarResumenEjecutivo(datos, metadatos) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-  const { puntaje, siPlenos, siMatiz, noCount, naCount, alertas } = datos;
+  const { puntaje, calculo, siPlenos, siMatiz, noCount, naCount, alertas } = datos;
   const totalCriterios = datos.categorias.reduce((acc, c) => acc + c.criterios.length, 0);
+  const aplicables     = siPlenos + siMatiz + noCount;
   const { titulo, pais, fecha } = metadatos;
+
+  // v4.1.2 (punto 49): el análisis completo, sin slice(0, 6000). Tope de
+  // seguridad de 60.000 caracteres (≈15.000 tokens) con aviso en el log.
+  const TOPE_CONTEXTO = 60000;
+  let textoCriterios = resumirParaPrompt(datos);
+  if (textoCriterios.length > TOPE_CONTEXTO) {
+    console.warn(`   ⚠️ generarResumenEjecutivo: contexto de ${textoCriterios.length} caracteres supera el tope de ${TOPE_CONTEXTO}; se recorta el final.`);
+    textoCriterios = textoCriterios.slice(0, TOPE_CONTEXTO);
+  }
+
+  // v4.1.2 (punto 49): lista explícita de criterios favorables, para que las
+  // fortalezas no dependan de que el modelo las encuentre dentro del texto.
+  const favorables = datos.categorias
+    .flatMap(cat => cat.criterios)
+    .filter(c => c.resultado === 'SI' || c.resultado === 'SI_MATIZ')
+    .map(c => `${c.id} (${c.resultado === 'SI' ? 'SÍ' : 'SÍ*'})`);
 
   const prompt = `Eres el redactor institucional de la plataforma Auditoría Cívica Liberal (liberalmente.app), operada por CEDICE y la Fundación Friedrich Naumann. Tu tarea es escribir el RESUMEN EJECUTIVO y los PUNTOS CLAVE del reporte de auditoría de un documento jurídico o de política pública venezolana/latinoamericana.
 
 DATOS DEL ANÁLISIS:
 - Documento auditado: ${titulo}${pais ? ` (${pais})` : ''}${fecha ? `, ${fecha}` : ''}
-- Alineación con postulados liberales: ${puntaje !== null ? puntaje + '%' : 'sin total general — ningún criterio con SÍ pleno; ver desglose SÍ/SÍ con matiz/NO'}
-- Criterios evaluados: ${totalCriterios} (${siPlenos} SÍ plenos, ${siMatiz} SÍ con reserva, ${noCount} NO, ${naCount} N/A)
+- Alineación con postulados liberales: ${puntaje !== null ? puntaje + '% (promedio ponderado por criterio)' : 'sin total general — ningún criterio aplicable'}
+- Criterios aplicables: ${aplicables} de ${totalCriterios} (${naCount} N/A no cuentan en el puntaje): ${siPlenos} SÍ plenos, ${siMatiz} SÍ con reserva, ${noCount} NO
+- Criterios con SÍ o SÍ con reserva (las fortalezas deben reflejarse en el resumen): ${favorables.length > 0 ? favorables.join(', ') : 'ninguno'}
 ${alertas.length > 0 ? `- Alertas principales: ${alertas.map(a => a.titulo).join('; ')}` : ''}
 
-ANÁLISIS COMPLETO POR CRITERIO (del cual debes extraer las ideas más importantes):
-${resumirParaPrompt(datos).slice(0, 6000)}
+ANÁLISIS COMPLETO POR CRITERIO — los ${totalCriterios} criterios, de la Categoría I a la XII (debes extraer las ideas más importantes de TODAS las categorías, no solo de las primeras):
+${textoCriterios}
 
 INSTRUCCIONES:
 Responde ÚNICAMENTE con el siguiente formato de texto plano — NO uses JSON, ni backticks, ni markdown. Empieza directamente con "PUNTOS_CLAVE:", sin nada antes:
@@ -1021,6 +1123,7 @@ párrafo 2
 párrafo 3
 
 Reglas:
+- CUANTIFICACIÓN: cuando cites cuántos criterios se cumplen o no, usa siempre "X de ${aplicables} criterios aplicables" (nunca "de ${totalCriterios}" si hay N/A). Los N/A no cuentan ni a favor ni en contra.
 - PUNTOS_CLAVE: entre 3 y 5 frases muy breves (máximo 14 palabras cada una), cada una en su propia línea empezando con "- ". Cada una debe aportar un dato o hallazgo distinto — no repitas la misma idea con otras palabras.
 - RESUMEN: exactamente 3 párrafos, separados entre sí por una línea completamente en blanco. Sin títulos, sin viñetas, sin asteriscos ni markdown dentro de los párrafos.
   Párrafo 1 (2-3 oraciones): qué es el documento, su alcance y contexto político-jurídico.
@@ -1064,7 +1167,7 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
     const aplicables = siPlenos + siMatiz + noCount;
     let resumen = puntaje !== null
       ? `El documento obtuvo un ${puntaje}% de alineación con los postulados liberales. `
-      : `El documento no registró ningún criterio con SÍ pleno, por lo que no se calcula un total general de alineación liberal. `;
+      : `El documento no registró ningún criterio aplicable, por lo que no se calcula un total general de alineación liberal. `;
     resumen += `De ${aplicables} criterios aplicables: ${totalSI} SÍ (${siPlenos} plenos, ${siMatiz} con reserva)`;
     if (noCount > 0) resumen += `, ${noCount} NO`;
     if (naCount > 0) resumen += `, ${naCount} N/A`;
@@ -1083,6 +1186,7 @@ Tono: institucional, riguroso, combativo desde la dignidad. Sin eufemismos con e
 function generarHTML(datos, metadatos, disclaimer = null) {
   const {
     puntaje: puntajeRaw,
+    calculo          = null,
     siPlenos         = 0,
     siMatiz          = 0,
     noCount          = 0,
@@ -1108,6 +1212,24 @@ function generarHTML(datos, metadatos, disclaimer = null) {
   const criteriosParseados  = categorias.reduce((acc, cat) => acc + cat.criterios.length, 0);
   const totalCriterios      = criteriosParseados || 39;
   const criteriosDetectados = criteriosParseados > 0;
+
+  // v4.1.2 (punto 52): explicación reproducible del cálculo para la Ficha y
+  // la leyenda. Formato numérico es-VE (coma decimal) a mano para no depender
+  // de los datos de localización del runtime.
+  const fmtNum = n => String(Math.round(n * 100) / 100).replace('.', ',');
+  const textoPesos = (calculo && calculo.aplicables > 0)
+    ? (calculo.pesosUniformes
+        ? 'Todos los criterios pesan lo mismo.'
+        : `Cada criterio pesa entre ${fmtNum(calculo.pesoMin)} y ${fmtNum(calculo.pesoMax)} puntos, según el Test de Libertad vigente.`)
+    : '';
+  const textoCalculo = (calculo && calculo.denominador > 0)
+    ? `Promedio ponderado por criterio: SÍ suma 1, SÍ con matiz suma ${fmtNum(calculo.pesoSiMatiz)}, NO suma 0 y los N/A no cuentan. ${textoPesos} ` +
+      `Resultado: ${fmtNum(calculo.numerador)} de ${fmtNum(calculo.denominador)} puntos ponderados posibles = ${fmtNum(calculo.porcentajeExacto)}%` +
+      `${puntaje !== null && Math.round(calculo.porcentajeExacto) !== calculo.porcentajeExacto ? ` (se muestra redondeado a ${puntaje}%)` : ''}.`
+    : '';
+  const textoAplicables = (calculo && naCount > 0)
+    ? ` (${calculo.aplicables} aplicables a este documento, ${naCount} N/A)`
+    : '';
 
   const desgloseFicha = criteriosDetectados
     ? ` · ${siPlenos} SÍ plenos · ${siMatiz} SÍ con matiz · ${noCount} NO${naCount > 0 ? ` · ${naCount} N/A` : ''}`
@@ -1135,7 +1257,8 @@ function generarHTML(datos, metadatos, disclaimer = null) {
     .join('');
 
   // v3.4: reemplaza la leyenda de 4 niveles de riesgo por el número de
-  // alineación (o solo el desglose si no hay ningún SÍ pleno). El link al
+  // alineación (o solo el desglose si no hay ningún criterio aplicable; ver
+  // v4.1.2, punto 51 — antes era "si no hay ningún SÍ pleno"). El link al
   // Manual sigue siendo fijo (no depende de la frase "efecto comadreja").
   const htmlAlineacion = criteriosDetectados ? `
 <div class="alineacion-bloque">
@@ -1267,6 +1390,9 @@ function generarHTML(datos, metadatos, disclaimer = null) {
       <span class="criterio-resultado no">✗ NO</span>
       <span>El criterio no se cumple — resta del puntaje de alineación liberal.</span>
     </div>
+    ${textoCalculo ? `<div class="leyenda-item">
+      <span>El puntaje es un promedio ponderado: no todos los criterios pesan igual y los N/A no cuentan. El detalle del cálculo está en la Ficha del documento, al final.</span>
+    </div>` : ''}
   </div>` : '';
 
     return `
@@ -1330,7 +1456,8 @@ function generarHTML(datos, metadatos, disclaimer = null) {
     <tr><td>Marco doctrinal</td><td><a href="${URL_MANUAL}" class="nota-doctrinal">${esc(marcaDoctrinal)}</a></td></tr>
     <tr><td>Auditor</td><td>Auditor Cívico Liberal — liberalmente.app</td></tr>
     <tr><td>Generado el</td><td>${esc(generadoEl)}</td></tr>
-    <tr><td>Criterios aplicados</td><td>${totalCriterios} criterios en 12 categorías del Test de Libertad</td></tr>
+    <tr><td>Criterios aplicados</td><td>${totalCriterios} criterios en 12 categorías del Test de Libertad${textoAplicables}</td></tr>
+    ${textoCalculo ? `<tr><td>Cálculo del puntaje</td><td>${esc(textoCalculo)}</td></tr>` : ''}
     <tr>
       <td>Resultado</td>
       <td>
@@ -1518,6 +1645,7 @@ async function generarReportePDF(reporteJSON, metadatos, rutaSalida, auditoria_i
 module.exports = {
   generarReportePDF,
   normalizarDatosEstructurados,
+  generarResumenEjecutivo, // v4.1.2: exportada para poder probar el prompt
   generarHTML,
   registrarRutaHTMLTemporal,
   SCHEMA_ANALISIS_AUDITORIA,

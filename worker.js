@@ -1,6 +1,35 @@
-// worker.js — ACL Worker v3.36
+// worker.js — ACL Worker v3.37
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.37 (24 sep 2026) — REINTENTO AUTOMÁTICO SI EL ANÁLISIS LLEGA INCOMPLETO.
+// Contraparte de generarReportePDF.js v4.1.2 (punto 53):
+// normalizarDatosEstructurados() ahora lanza un Error con codigo
+// 'REPORTE_INCOMPLETO' si el JSON de Claude no trae exactamente los 39
+// criterios C-01..C-39 una vez cada uno (o trae un resultado inválido), en
+// vez de calcular el puntaje con lo que hubiera llegado.
+// Sin este cambio ese error caía al catch general de procesarAuditoria():
+// la auditoría quedaba 'fallida', se devolvía el cupo y se le enviaba al
+// ciudadano el correo de error — por algo que un simple reintento casi
+// siempre resuelve, y DESPUÉS de haber guardado en la BD un reporte_texto
+// incompleto.
+// Fix: analizarConClaude() ahora valida la respuesta ANTES de devolverla
+// (con normalizarDatosEstructurados(), que es pura: no toca BD ni red) y, si
+// el código es 'REPORTE_INCOMPLETO', vuelve a llamar a Claude hasta 2 veces
+// más (3 llamadas como máximo), esperando 90 s entre intentos (misma ventana
+// de rate limit que antes del PASO 5). Como la validación ocurre antes del
+// INSERT de reporte_texto, un reporte incompleto nunca llega a la BD. Solo
+// se reintenta ese código: cualquier otro error (max_tokens, refusal, JSON
+// inválido) sigue propagándose de inmediato, como antes. Si se agotan los
+// intentos, el error final conserva `codigo` y `detalle` y su mensaje dice
+// cuántos intentos se hicieron — llega al correo interno y a error_mensaje.
+// El nombre viejo se conserva: analizarConClaude() sigue siendo lo que llama
+// procesarAuditoria(), ahora con un cuarto parámetro auditoria_id (solo
+// para los logs); la llamada real a la API pasó a llamarClaudeParaAnalisis().
+// Nota: /metricas/resumen sigue contando aparte los `puntaje IS NULL`; desde
+// generarReportePDF.js v4.1.2 eso solo ocurre si ningún criterio es
+// aplicable (todos N/A). Las auditorías anteriores con 0 SÍ plenos conservan
+// su puntaje NULL en la BD hasta que se regeneren.
 //
 // v3.36 (15 ago 2026) — 2 FIXES en /metricas/resumen, reportados por
 // Moisés al revisar el dashboard:
@@ -3263,10 +3292,12 @@ app.get('/metricas/resumen', async (req, res) => {
         `SELECT puntaje FROM auditorias WHERE estado = 'completada' AND puntaje IS NOT NULL`,
         [], []
       ),
-      // Recordatorio: puntaje puede ser NULL en una 'completada' — pasa
-      // cuando el documento no tiene ningún SÍ pleno (la fórmula requiere
-      // al menos uno), no es un error. Se cuenta aparte para no mezclarlo
-      // con el promedio.
+      // Recordatorio: puntaje puede ser NULL en una 'completada', no es un
+      // error. Desde generarReportePDF.js v4.1.2 (24 sep 2026) solo pasa si
+      // ningún criterio es aplicable (todos N/A); antes también pasaba cuando
+      // el documento no tenía ningún SÍ pleno (la fórmula exigía al menos
+      // uno), y esas auditorías viejas conservan su NULL hasta que se
+      // regeneren. Se cuenta aparte para no mezclarlo con el promedio.
       consultaSegura(
         `SELECT COUNT(*)::int AS total FROM auditorias WHERE estado = 'completada' AND puntaje IS NULL`,
         [], [{ total: 0 }]
@@ -4664,7 +4695,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
     await new Promise(r => setTimeout(r, 90_000));
 
     console.log(`🧠 [${auditoria_id}] PASO 5: Analizando con Claude...`);
-    const reporte = await analizarConClaude(textoPDF, config, manualActivo);
+    const reporte = await analizarConClaude(textoPDF, config, manualActivo, auditoria_id);
     fs.writeFileSync(rutaReporte, reporte, 'utf8');
     await db.query(
       `UPDATE auditorias SET reporte_texto = $1, prompt_version = $2, manual_version_id = $3 WHERE id = $4`,
@@ -5149,7 +5180,52 @@ Fragmento:\n${muestra}`,
   }
 }
 
-async function analizarConClaude(textoPDF, config, manualActivo = null) {
+// >>> ANALISIS_CON_REINTENTO_INICIO
+// v3.37 (24 sep 2026): ver el changelog de arriba.
+const REINTENTOS_ANALISIS_INCOMPLETO = 2;       // reintentos ADEMÁS del primer intento (máx. 3 llamadas)
+const ESPERA_REINTENTO_ANALISIS_MS   = 90_000;  // misma ventana de rate limit que antes del PASO 5
+
+async function analizarConClaude(textoPDF, config, manualActivo = null, auditoria_id = 'N/A') {
+  const intentosMaximos = 1 + REINTENTOS_ANALISIS_INCOMPLETO;
+  let ultimoError = null;
+
+  for (let intento = 1; intento <= intentosMaximos; intento++) {
+    const reporte = await llamarClaudeParaAnalisis(textoPDF, config, manualActivo);
+    try {
+      // Validación de integridad: normalizarDatosEstructurados() es pura (no
+      // toca BD ni red). Se llama sin pesos porque aquí solo interesa que
+      // estén los 39 criterios; el puntaje real se calcula después, en
+      // generarReportePDF(), con los pesos vigentes.
+      normalizarDatosEstructurados(reporte, auditoria_id, {});
+      if (intento > 1) {
+        console.log(`   ✅ [${auditoria_id}] El análisis llegó completo en el intento ${intento}/${intentosMaximos}`);
+      }
+      return reporte;
+    } catch (error) {
+      // Solo se reintenta lo que un reintento puede arreglar. Un JSON
+      // inválido u otro error inesperado se propaga tal cual, como antes.
+      if (error.codigo !== 'REPORTE_INCOMPLETO') throw error;
+      ultimoError = error;
+      console.warn(`   ⚠️ [${auditoria_id}] Intento ${intento}/${intentosMaximos} — análisis incompleto: ${error.message}`);
+      if (intento < intentosMaximos) {
+        console.warn(`   ↻ [${auditoria_id}] Reintentando en ${ESPERA_REINTENTO_ANALISIS_MS / 1000} s...`);
+        await esperarMs(ESPERA_REINTENTO_ANALISIS_MS);
+      }
+    }
+  }
+
+  const errorFinal = new Error(
+    `${ultimoError.message} [Ya se reintentó automáticamente: ${intentosMaximos} intentos, todos incompletos]`
+  );
+  errorFinal.codigo  = ultimoError.codigo;
+  errorFinal.detalle = ultimoError.detalle;
+  throw errorFinal;
+}
+// <<< ANALISIS_CON_REINTENTO_FIN
+
+// La llamada real a la API (antes se llamaba analizarConClaude). Sin cambios
+// de comportamiento respecto a v3.36.
+async function llamarClaudeParaAnalisis(textoPDF, config, manualActivo = null) {
   const systemFinal = manualActivo
     ? `${config.prompt_sistema}\n\n---\n\nMANUAL CÍVICO LIBERAL (versión ${manualActivo.version}) — fuente doctrinal completa para este análisis:\n\n${manualActivo.contenido_texto}`
     : config.prompt_sistema;
@@ -5485,7 +5561,9 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.36 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.37 corriendo en puerto ${PORT}`);
+  console.log(`   NUEVO 24 sep: analizarConClaude() valida que lleguen los 39 criterios y reintenta hasta`);
+  console.log(`   2 veces (90 s entre intentos) si faltan/duplican — el reporte incompleto no llega a la BD`);
   console.log(`   Duplicados — DURO (hash, identificador oficial): rechazo automático con links,`);
   console.log(`   sin Claude, motivo 'documento_duplicado'. BLANDO (v3.35): preselección por`);
   console.log(`   similitud de título (pg_trgm) + juicio semántico de Claude — el resultado más`);
