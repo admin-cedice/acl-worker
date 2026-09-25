@@ -1,6 +1,28 @@
-// worker.js — ACL Worker v3.37
+// worker.js — ACL Worker v3.38
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.38 (24 sep 2026) — EL NOMBRE DE LOS ARCHIVOS SIEMPRE INCLUYE EL NOMBRE
+// DE LA LEY. Los archivos de una auditoría (Auditoria_de_X.pdf, Dialogo_X.mp3,
+// Activismo_X.pdf, X_original.pdf) se nombran con `metadatos.identificador`,
+// que extraerMetadatos() le pide a Claude con esta instrucción: "versión muy
+// corta, máx. 6 palabras, priorizando números de decreto/ley/gaceta" — y cuyo
+// único ejemplo era solo números ('Decreto 5364 Gaceta 7039'). Para la Ley de
+// Reforma de la Ley Orgánica de Hidrocarburos, una corrida dio "Gaceta 6978
+// Reforma Hidrocarburos" y otra "Gaceta 6978 Extraordinario": misma ley,
+// distinto nombre de archivo, y el segundo sin decir de qué trata.
+// Fix en dos capas: (1) el prompt ahora pide número oficial MÁS palabras
+// clave del nombre del instrumento (máx. 8 palabras), con ejemplo que incluye
+// ambos; (2) red de seguridad en código, construirIdentificadorArchivo(): si
+// el identificador que devuelva Claude no comparte ninguna palabra
+// significativa con el título, se le agregan hasta 3 palabras del título
+// (sin artículos, preposiciones ni "Ley"/"Decreto"/"Orgánica"), respetando
+// el tope de 60 caracteres sin cortar palabras a la mitad. Si el
+// identificador ya trae el tema, no se toca. limpiarIdentificador() conserva
+// su comportamiento exacto (ahora apoyada en limpiarIdentificadorSinTope()).
+// Nota: los endpoints /regenerar-* nombran con el título completo
+// (limpiarIdentificador(titulo_documento)), no con el identificador corto;
+// no se tocaron.
 //
 // v3.37 (24 sep 2026) — REINTENTO AUTOMÁTICO SI EL ANÁLISIS LLEGA INCOMPLETO.
 // Contraparte de generarReportePDF.js v4.1.2 (punto 53):
@@ -806,7 +828,10 @@ function slugificar(texto) {
     .slice(0, 60);
 }
 
-function limpiarIdentificador(identificador) {
+// >>> IDENTIFICADOR_ARCHIVO_INICIO
+// v3.38: limpiarIdentificador() se parte en dos para poder medir el largo
+// real antes del tope de 60 caracteres. Comportamiento idéntico al anterior.
+function limpiarIdentificadorSinTope(identificador) {
   return (identificador || 'Documento')
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-zA-Z0-9\s]/g, '')
@@ -814,9 +839,56 @@ function limpiarIdentificador(identificador) {
     .split(/\s+/)
     .filter(Boolean)
     .map(palabra => palabra.charAt(0).toUpperCase() + palabra.slice(1))
-    .join('_')
-    .slice(0, 60) || 'Documento';
+    .join('_');
 }
+
+function limpiarIdentificador(identificador) {
+  return limpiarIdentificadorSinTope(identificador).slice(0, 60) || 'Documento';
+}
+
+// Palabras que no aportan al nombre de un archivo cuando se toman del título.
+const PALABRAS_SIN_VALOR_EN_NOMBRE = new Set([
+  'de', 'del', 'la', 'las', 'el', 'los', 'lo', 'y', 'e', 'o', 'u', 'en', 'para', 'por', 'con', 'sin',
+  'a', 'al', 'que', 'se', 'su', 'sus', 'un', 'una', 'sobre', 'entre', 'cual', 'cuales', 'mediante',
+  'ley', 'leyes', 'decreto', 'organica', 'organico', 'rango', 'valor', 'fuerza', 'numero', 'dicta',
+  'dictan', 'establece', 'crea', 'presente', 'articulo', 'oficial', 'republica', 'bolivariana',
+]);
+
+const sinAcentosMin = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+const separarPalabras = s => s.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+
+// Devuelve el texto (aún sin limpiar) con el que se nombrarán los archivos de
+// una auditoría. Garantiza que el nombre diga de qué trata el documento.
+function construirIdentificadorArchivo(metadatos) {
+  const identificador = String(metadatos?.identificador || '').trim();
+  const titulo        = String(metadatos?.titulo || '').trim();
+  if (!identificador) return titulo;
+  if (!titulo) return identificador;
+
+  const palabrasTitulo = separarPalabras(titulo)
+    .map(original => ({ original, norm: sinAcentosMin(original) }))
+    .filter(p => p.norm.length >= 3 && !/^\d+$/.test(p.norm) && !PALABRAS_SIN_VALOR_EN_NOMBRE.has(p.norm));
+  if (palabrasTitulo.length === 0) return identificador;
+
+  // ¿El identificador ya menciona alguna palabra del título? Se compara por
+  // raíz (6 letras) para tolerar singular/plural (Hidrocarburo/Hidrocarburos).
+  const raicesIdentificador = new Set(separarPalabras(sinAcentosMin(identificador)).map(p => p.slice(0, 6)));
+  if (palabrasTitulo.some(p => raicesIdentificador.has(p.norm.slice(0, 6)))) return identificador;
+
+  // No lo menciona: se agregan hasta 3 palabras del título, sin pasarse de 60.
+  const agregadas = [];
+  const vistas = new Set();
+  for (const p of palabrasTitulo) {
+    if (agregadas.length >= 3) break;
+    if (vistas.has(p.norm)) continue;
+    const candidato = [identificador, ...agregadas, p.original].join(' ');
+    if (limpiarIdentificadorSinTope(candidato).length > 60) break;
+    agregadas.push(p.original);
+    vistas.add(p.norm);
+  }
+  return [identificador, ...agregadas].join(' ');
+}
+// <<< IDENTIFICADOR_ARCHIVO_FIN
 
 async function convertirWavAMp3(rutaWav, rutaMp3) {
   return new Promise((resolve, reject) => {
@@ -4750,7 +4822,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 
     console.log(`📁 [${auditoria_id}] Preparando carpeta de Drive...`);
 	    const carpetaId           = await obtenerCarpetaAuditoria(drive, auditoria_id);
-	    const identificadorLimpio = limpiarIdentificador(metadatos.identificador || metadatos.titulo);
+	    const identificadorLimpio = limpiarIdentificador(construirIdentificadorArchivo(metadatos));
 
 	    console.log(`🎙️  [${auditoria_id}] PASO 6.6: Generando guion y audio del podcast...`);
 	    let linkPodcast = null;
@@ -5137,7 +5209,7 @@ async function extraerMetadatos(textoPDF) {
     messages: [{
       role: 'user',
       content: `Analiza este fragmento y responde SOLO con este JSON:
-{"titulo":"título oficial completo","identificador":"versión muy corta, máx. 6 palabras, priorizando números de decreto/ley/gaceta si existen (ej: 'Decreto 5364 Gaceta 7039')","pais":"país o General","categoria":"pais|comparativo|doctrinal","numero_oficial":"el número de decreto, ley, resolución o gaceta EXACTO tal como aparece en el documento, solo si el documento lo declara explícitamente, o null si no tiene numeración oficial (ej: un plan o programa de gobierno sin número)","institucion_emisora":"nombre del ministerio, organismo o institución que emite el documento, o null si no se identifica con claridad","periodo":"el período, año o rango de años que cubre el documento tal como se declara (ej. '2025-2031'), o null si no se especifica","tipo_instrumento":"uno de los ids de la lista TIPO DE INSTRUMENTO de abajo","materia":"uno de los ids de la lista MATERIA de abajo, o null si tipo_instrumento es 'discursos_narrativas' (a esa categoría nunca le corresponde materia)"}
+{"titulo":"título oficial completo","identificador":"nombre corto para nombrar archivos, máx. 8 palabras: el número oficial (decreto/ley/gaceta) si existe MÁS el nombre propio del instrumento en palabras clave (su tema o materia), ej: 'Decreto 5364 Gaceta 7039 Reforma Ley Hidrocarburos'. Nunca solo números ni solo 'Gaceta N'","pais":"país o General","categoria":"pais|comparativo|doctrinal","numero_oficial":"el número de decreto, ley, resolución o gaceta EXACTO tal como aparece en el documento, solo si el documento lo declara explícitamente, o null si no tiene numeración oficial (ej: un plan o programa de gobierno sin número)","institucion_emisora":"nombre del ministerio, organismo o institución que emite el documento, o null si no se identifica con claridad","periodo":"el período, año o rango de años que cubre el documento tal como se declara (ej. '2025-2031'), o null si no se especifica","tipo_instrumento":"uno de los ids de la lista TIPO DE INSTRUMENTO de abajo","materia":"uno de los ids de la lista MATERIA de abajo, o null si tipo_instrumento es 'discursos_narrativas' (a esa categoría nunca le corresponde materia)"}
 
 IMPORTANTE sobre "titulo": debe ser el nombre PROPIO del instrumento o documento (ej. "Ley Orgánica de...", "Decreto N° 1.234 mediante el cual se...", "Plan de la Patria 2025-2031"). NUNCA uses como título la referencia de la Gaceta Oficial en la que se publicó (ej. NO escribas "Gaceta Oficial Extraordinaria N° 7.018" como título), aunque esa referencia aparezca primero o en letra más grande que el resto del documento — sigue leyendo hasta encontrar el nombre real del instrumento que esa gaceta está publicando. Ese número de gaceta va en "numero_oficial", no en "titulo".
 
@@ -5561,7 +5633,9 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.37 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.38 corriendo en puerto ${PORT}`);
+  console.log(`   NUEVO 24 sep (v3.38): los nombres de archivo (Auditoria_de_…, Dialogo_…, Activismo_…) siempre`);
+  console.log(`   incluyen el nombre de la ley — prompt de identificador + construirIdentificadorArchivo()`);
   console.log(`   NUEVO 24 sep: analizarConClaude() valida que lleguen los 39 criterios y reintenta hasta`);
   console.log(`   2 veces (90 s entre intentos) si faltan/duplican — el reporte incompleto no llega a la BD`);
   console.log(`   Duplicados — DURO (hash, identificador oficial): rechazo automático con links,`);

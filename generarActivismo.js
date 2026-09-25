@@ -79,6 +79,28 @@
 // que genera cada idea individual; lo único que cambió es CUÁNTOS
 // criterios se seleccionan y CÓMO se decide cuáles.
 
+// v9 (24 sep 2026) — FIX max_tokens EN generarIdeaActivismoCriterio() (MISMO
+// PROBLEMA QUE v7 CORRIGIÓ EN generarIdeasActivismoTotal()):
+// Caso real: auditoría 0c26f45d, criterio C-12 — la respuesta se cortó por
+// max_tokens (1000) y, como el llamador ejecuta una idea por cada punto
+// destacado (~10 por auditoría), UN solo criterio cortado abortó toda la
+// Presentación de Activismo: el PASO 6.7 es no bloqueante, así que la
+// auditoría quedó 'completada' pero sin el botón "Activismo".
+// La idea final es un JSON diminuto (título + 1-3 oraciones + categoría);
+// que 1000 tokens no alcancen sugiere que parte del presupuesto se va en
+// razonamiento previo del modelo (esos tokens cuentan contra max_tokens) — de
+// ahí lo intermitente: depende del criterio y de cuánto "piense" esa vez.
+// (Hipótesis: el log nuevo imprime output_tokens y los tipos de bloque de la
+// respuesta cortada para confirmarla o descartarla.)
+// Fix: topes escalonados TOPES_TOKENS_IDEA_ACTIVISMO = [4000, 8000]. Se
+// intenta con 4000 (el mismo tope que ya usa el caso "total"); si aun así se
+// corta, se reintenta UNA vez con 8000; solo si también falla se lanza el
+// error. Un tope alto no cuesta más: solo se pagan los tokens realmente usados.
+// Pendiente (vive en el llamador, generarPresentacionPDF.js): que el fallo de
+// UN criterio no aborte la presentación completa.
+// Nota: desde generarReportePDF.js v4.1.2, datos.puntaje ya no es null cuando
+// no hay SÍ plenos (solo si ningún criterio es aplicable); el recálculo de
+// respaldo en calcularAlineacionParaSeleccion() sigue funcionando igual.
 'use strict';
 
 const Anthropic = require('@anthropic-ai/sdk');
@@ -341,8 +363,8 @@ function valorPositivoCriterio(criterio) {
 // Reporte) cuando existe — nunca grafo_datos/enlaces, a propósito: esto
 // es lo que hace que el bug de raíz (reconocimiento de artículos fallido)
 // ya no pueda volver a afectar ni al Podcast ni a la Presentación. Solo
-// si datos.puntaje viene null (caso raro: documento sin ningún SÍ pleno,
-// la fórmula del Reporte lo exige) se recalcula acá con el mismo criterio
+// si datos.puntaje viene null (desde generarReportePDF.js v4.1.2, solo si ningún
+// criterio es aplicable; antes también cuando no había ningún SÍ pleno) se recalcula acá con el mismo criterio
 // de ponderación pero sin esa restricción, para que la selección nunca se
 // quede sin base.
 function calcularAlineacionParaSeleccion(datos, pesosCriterios) {
@@ -451,29 +473,49 @@ Genera UNA idea concreta de activismo cívico no violento para ${accionPorTipo[t
 Nunca sugieras violencia, daño a personas o propiedad, ni acciones ilegales. Nunca sugieras fabricar testimonios, relatos personales o citas atribuidas a personas que no sean reales y presentarlos como si lo fueran — el contenido debe ser siempre veraz y transparente sobre su origen, aunque se use IA para producirlo (videos explicativos, infografías o resúmenes son apropiados; testimonios inventados o "compuestos" presentados como reales no lo son).`;
 }
 
+// v9 (24 sep 2026): topes escalonados. Ver el changelog v9 arriba.
+const TOPES_TOKENS_IDEA_ACTIVISMO = [4000, 8000];
+
 async function generarIdeaActivismoCriterio(criterio, categoriaDoctrinal, metadatos, tipo, auditoria_id = 'N/A', estiloPersona = null, reglasGeneracion = null) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const prompt = construirPromptIdeaActivismoCriterio(criterio, categoriaDoctrinal, metadatos, tipo, estiloPersona, reglasGeneracion);
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-5',
-    max_tokens: 1000,
-    messages: [{ role: 'user', content: prompt }],
-    output_config: {
-      format: { type: 'json_schema', schema: SCHEMA_IDEA_ACTIVISMO_UNICA },
-    },
-  });
+  for (let intento = 0; intento < TOPES_TOKENS_IDEA_ACTIVISMO.length; intento++) {
+    const tope = TOPES_TOKENS_IDEA_ACTIVISMO[intento];
+    const hayOtroIntento = intento < TOPES_TOKENS_IDEA_ACTIVISMO.length - 1;
 
-  if (response.stop_reason === 'max_tokens') {
-    throw new Error(`generarIdeaActivismoCriterio [${auditoria_id}] (${criterio.id}): respuesta cortada por max_tokens (1000) — subir el límite.`);
-  }
-  if (response.stop_reason === 'refusal') {
-    throw new Error(`generarIdeaActivismoCriterio [${auditoria_id}] (${criterio.id}): Claude rehusó generar la idea (stop_reason: refusal).`);
-  }
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: tope,
+      messages: [{ role: 'user', content: prompt }],
+      output_config: {
+        format: { type: 'json_schema', schema: SCHEMA_IDEA_ACTIVISMO_UNICA },
+      },
+    });
 
-  const texto = extraerTextoRespuesta(response);
-  const idea = JSON.parse(texto);
-  return { criterioId: criterio.id, resultado: criterio.resultado, idea };
+    if (response.stop_reason === 'max_tokens') {
+      // Diagnóstico: tokens de salida usados y tipos de bloque recibidos (si
+      // hay un bloque de razonamiento y ningún texto, el presupuesto se fue
+      // pensando, no escribiendo la idea).
+      const bloques = (response.content || []).map(b => b.type).join(', ') || '(vacío)';
+      const salida  = response.usage && response.usage.output_tokens !== undefined ? response.usage.output_tokens : '?';
+      console.warn(`   ⚠️ [${auditoria_id}] Idea de activismo ${criterio.id}: cortada por max_tokens (tope ${tope}; salida ${salida}; bloques: ${bloques})${hayOtroIntento ? ` — reintentando con tope ${TOPES_TOKENS_IDEA_ACTIVISMO[intento + 1]}` : ''}`);
+      if (hayOtroIntento) continue;
+      throw new Error(`generarIdeaActivismoCriterio [${auditoria_id}] (${criterio.id}): respuesta cortada por max_tokens (${tope}) incluso tras ${TOPES_TOKENS_IDEA_ACTIVISMO.length} intentos — revisar si el razonamiento del modelo está consumiendo el presupuesto.`);
+    }
+    if (response.stop_reason === 'refusal') {
+      throw new Error(`generarIdeaActivismoCriterio [${auditoria_id}] (${criterio.id}): Claude rehusó generar la idea (stop_reason: refusal).`);
+    }
+
+    const texto = extraerTextoRespuesta(response);
+    const idea = JSON.parse(texto);
+    if (intento > 0) {
+      console.log(`   ✅ [${auditoria_id}] Idea de activismo ${criterio.id} generada en el intento ${intento + 1} (tope ${tope})`);
+    }
+    return { criterioId: criterio.id, resultado: criterio.resultado, idea };
+  }
+  // Inalcanzable: el bucle siempre retorna o lanza. Red de seguridad.
+  throw new Error(`generarIdeaActivismoCriterio [${auditoria_id}] (${criterio.id}): estado inesperado tras los reintentos.`);
 }
 
 // ── Lámina de contacto — RESPALDO, ya no es la fuente principal ─────────
