@@ -1,6 +1,34 @@
-// worker.js — ACL Worker v3.38
+// worker.js — ACL Worker v3.39
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
+//
+// v3.39 (1 oct 2026) — CORREGIR TÍTULOS A MANO + FIX DE "DOCUMENTO SIN
+// TÍTULO" EN GACETAS CON VARIAS LEYES. Caso real: una Gaceta Oficial cuya
+// primera página era un sumario con muchas leyes y decretos quedó con el
+// título "Documento sin título" — el análisis de los 39 criterios sí se
+// hizo bien (usa el texto completo), pero extraerMetadatos() solo leía los
+// primeros 3000 caracteres y su prompt no decía qué hacer con un sumario
+// de varios instrumentos.
+// (1) NUEVO POST /editar-titulo-auditoria — corrige titulo_documento a mano
+//     desde /admin/auditorias (lápiz junto al título). Cualquier admin con
+//     sesión válida (Superadmin o Editor), mismo criterio que
+//     /eliminar-auditoria y /pesos/actualizar: exigirAdminValido() —
+//     requiere x-worker-secret Y x-admin-token. Se rechaza si la auditoría
+//     todavía está en proceso (el PASO 4 reescribiría el título encima).
+//     Solo cambia titulo_documento en la base de datos: el PDF del
+//     Reporte, la Presentación y el nombre de los archivos en Drive ya
+//     generados conservan el título anterior hasta que se regeneren.
+// (2) extraerMetadatos(): muestra de 3000 → 12000 caracteres, y regla
+//     nueva en el prompt para documentos con varios instrumentos: el
+//     título sale del primer instrumento cuyo texto aparezca desarrollado
+//     (con su articulado), nunca de la lista del sumario; si el fragmento
+//     solo trae el sumario, devuelve "Documento sin título" (mejor que
+//     elegir uno al azar — ahí entra el lápiz del punto 1).
+//
+// Nota: /reclasificar-metadatos vuelve a correr extraerMetadatos() sobre
+// el PDF guardado — sirve para repetir la extracción de una auditoría
+// vieja con el prompt nuevo (OJO: sobreescribe título, país, categoría,
+// tipo y materia, incluido un título corregido a mano).
 //
 // v3.38 (24 sep 2026) — EL NOMBRE DE LOS ARCHIVOS SIEMPRE INCLUYE EL NOMBRE
 // DE LA LEY. Los archivos de una auditoría (Auditoria_de_X.pdf, Dialogo_X.mp3,
@@ -1821,7 +1849,7 @@ app.post('/cupos/reservar', async (req, res) => {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.36', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.39', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — reclasifica tipo_instrumento/materia (y de
@@ -3792,6 +3820,63 @@ app.post('/eliminar-auditoria', async (req, res) => {
   }
 });
 
+// ── Corregir el título de una auditoría a mano (1 oct 2026, v3.39) ────────
+// Cuando extraerMetadatos() no logra identificar el título (queda "Documento
+// sin título"), un admin puede corregirlo desde /admin/auditorias.
+//
+// Permisos: cualquier admin con sesión válida (Superadmin o Editor) — mismo
+// criterio que /eliminar-auditoria (moderar lo que se muestra públicamente
+// no pone en riesgo el pipeline). Usa exigirAdminValido(), así que exige
+// x-worker-secret Y x-admin-token (el JWT de la sesión).
+//
+// Solo cambia auditorias.titulo_documento. NO regenera nada: el PDF del
+// Reporte, la Presentación y los nombres de archivo en Drive conservan el
+// título anterior hasta que se regeneren por separado.
+//
+// Se rechaza si la auditoría sigue en proceso: el PASO 4 de
+// procesarAuditoria() sobreescribe titulo_documento, así que la edición
+// se perdería (o peor, parecería guardada y no lo estaría).
+app.post('/editar-titulo-auditoria', async (req, res) => {
+  const payload = exigirAdminValido(req, res);
+  if (!payload) return;
+
+  const { auditoria_id, titulo } = req.body || {};
+  if (!auditoria_id) {
+    return res.status(400).json({ error: 'Falta auditoria_id' });
+  }
+  const tituloLimpio = String(titulo || '').replace(/\s+/g, ' ').trim();
+  if (tituloLimpio.length < 3) {
+    return res.status(400).json({ error: 'El título es demasiado corto (mínimo 3 caracteres).' });
+  }
+  if (tituloLimpio.length > 300) {
+    return res.status(400).json({ error: 'El título es demasiado largo (máximo 300 caracteres).' });
+  }
+
+  try {
+    const actual = await db.query(
+      `SELECT titulo_documento, estado FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (actual.rows.length === 0) {
+      return res.status(404).json({ error: 'Auditoría no encontrada' });
+    }
+    const { titulo_documento: tituloAnterior, estado } = actual.rows[0];
+
+    if (!ESTADOS_TERMINALES.includes(estado)) {
+      return res.status(409).json({ error: `Esta auditoría todavía está en proceso (estado: ${estado}) — el sistema reescribiría el título. Espera a que termine e inténtalo de nuevo.` });
+    }
+
+    await db.query(`UPDATE auditorias SET titulo_documento = $1 WHERE id = $2`, [tituloLimpio, auditoria_id]);
+
+    console.log(`   [editar-titulo-auditoria] ✅ [${auditoria_id}] "${tituloAnterior}" → "${tituloLimpio}" (por ${payload.email || payload.id})`);
+    res.json({ ok: true, titulo: tituloLimpio });
+
+  } catch (error) {
+    console.error(`❌ [${auditoria_id}] Error editando título:`, error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Módulo: Manual Cívico Liberal (documento vivo, versionado) ──────────────
 
 app.get('/manual/versiones', async (req, res) => {
@@ -5197,7 +5282,12 @@ async function descargarYExtraerTexto(drive, fileId, dir) {
 }
 
 async function extraerMetadatos(textoPDF) {
-  const muestra = textoPDF.slice(0, 3000);
+  // v3.39 (1 oct 2026): la muestra pasó de 3000 a 12000 caracteres. Con 3000,
+  // una Gaceta cuya primera página es un sumario de varias leyes/decretos
+  // ocupaba todo el fragmento y Claude no llegaba a ver el texto desarrollado
+  // de ningún instrumento (el análisis de los 39 criterios sí usa el texto
+  // completo — solo esta extracción de metadatos estaba corta de vista).
+  const muestra = textoPDF.slice(0, 12000);
 
   const listaTipos = TIPOS_INSTRUMENTO.map(t => `- "${t.id}": ${t.nombre} — ${t.ejemplos}`).join('\n');
   const listaMaterias = MATERIAS.map(m => `- "${m.id}": ${m.nombre} — ${m.ejemplos}`).join('\n');
@@ -5212,6 +5302,8 @@ async function extraerMetadatos(textoPDF) {
 {"titulo":"título oficial completo","identificador":"nombre corto para nombrar archivos, máx. 8 palabras: el número oficial (decreto/ley/gaceta) si existe MÁS el nombre propio del instrumento en palabras clave (su tema o materia), ej: 'Decreto 5364 Gaceta 7039 Reforma Ley Hidrocarburos'. Nunca solo números ni solo 'Gaceta N'","pais":"país o General","categoria":"pais|comparativo|doctrinal","numero_oficial":"el número de decreto, ley, resolución o gaceta EXACTO tal como aparece en el documento, solo si el documento lo declara explícitamente, o null si no tiene numeración oficial (ej: un plan o programa de gobierno sin número)","institucion_emisora":"nombre del ministerio, organismo o institución que emite el documento, o null si no se identifica con claridad","periodo":"el período, año o rango de años que cubre el documento tal como se declara (ej. '2025-2031'), o null si no se especifica","tipo_instrumento":"uno de los ids de la lista TIPO DE INSTRUMENTO de abajo","materia":"uno de los ids de la lista MATERIA de abajo, o null si tipo_instrumento es 'discursos_narrativas' (a esa categoría nunca le corresponde materia)"}
 
 IMPORTANTE sobre "titulo": debe ser el nombre PROPIO del instrumento o documento (ej. "Ley Orgánica de...", "Decreto N° 1.234 mediante el cual se...", "Plan de la Patria 2025-2031"). NUNCA uses como título la referencia de la Gaceta Oficial en la que se publicó (ej. NO escribas "Gaceta Oficial Extraordinaria N° 7.018" como título), aunque esa referencia aparezca primero o en letra más grande que el resto del documento — sigue leyendo hasta encontrar el nombre real del instrumento que esa gaceta está publicando. Ese número de gaceta va en "numero_oficial", no en "titulo".
+
+IMPORTANTE sobre documentos que contienen VARIOS instrumentos (por ejemplo, una Gaceta Oficial cuya primera página es un sumario que enumera varias leyes, decretos o resoluciones): NO tomes el título de esa lista ni de los encabezados del sumario. Sigue leyendo el fragmento hasta encontrar el texto desarrollado de un instrumento (con su articulado o su contenido completo) y usa el nombre propio de ESE instrumento como título. Si hay varios instrumentos con texto desarrollado, usa el primero que aparezca así. Si el fragmento solo trae el sumario y no permite saber cuál instrumento se desarrolla, responde exactamente "Documento sin título" en el campo "titulo" — es preferible a elegir uno al azar. Los campos "identificador", "tipo_instrumento" y "materia" deben referirse a ese mismo instrumento que elegiste para el título.
 
 IMPORTANTE sobre "tipo_instrumento" — dos aclaraciones:
 - Un "Proyecto de Ley" o anteproyecto (todavía sin aprobación final) va en "leyes_marcos", NO en "discursos_narrativas": lo que importa es que el texto esté estructurado como un instrumento normativo (con artículos y disposiciones), no si ya entró en vigor.
@@ -5633,7 +5725,9 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.38 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.39 corriendo en puerto ${PORT}`);
+  console.log(`   NUEVO 1 oct (v3.39): POST /editar-titulo-auditoria (Superadmin y Editor) y`);
+  console.log(`   extraerMetadatos() lee 12000 caracteres y maneja Gacetas con varios instrumentos`);
   console.log(`   NUEVO 24 sep (v3.38): los nombres de archivo (Auditoria_de_…, Dialogo_…, Activismo_…) siempre`);
   console.log(`   incluyen el nombre de la ley — prompt de identificador + construirIdentificadorArchivo()`);
   console.log(`   NUEVO 24 sep: analizarConClaude() valida que lleguen los 39 criterios y reintenta hasta`);
