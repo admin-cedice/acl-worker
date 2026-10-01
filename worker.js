@@ -1,4 +1,4 @@
-// worker.js — ACL Worker v3.41
+// worker.js — ACL Worker v3.42
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
 //
@@ -1849,7 +1849,7 @@ app.post('/cupos/reservar', async (req, res) => {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.41', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.42', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — regenera solo el Reporte (PDF) de una auditoría
@@ -2295,14 +2295,74 @@ app.get('/regenerar-presentacion', async (req, res) => {
   }
 });
 
+// ── Regeneración del Podcast: candado + aviso por correo (v3.42) ──────────
+// Candado en memoria: guarda el id de la auditoría cuyo podcast se está
+// regenerando ahora mismo (o null si ninguna). Una sola a la vez en todo el
+// worker — el plan de ElevenLabs solo admite 3 solicitudes simultáneas, y
+// dos regeneraciones juntas ya se pisaron una vez.
+let regenerandoPodcastAuditoriaId = null;
+
+// Correo de resultado (éxito o fallo) de una regeneración que corre en
+// segundo plano. Mismos destinatarios que enviarEmailErrorInterno():
+// configuracion_alertas (tipo 'error_procesamiento'), o admin@liberalmente.app
+// si no hay ninguno. Nunca lanza: un fallo acá solo queda en el log.
+async function avisarResultadoRegeneracion({ producto, auditoria_id, titulo, ok, detalle }) {
+  try {
+    let destinatarios = [];
+    try {
+      const { rows } = await db.query(
+        `SELECT email FROM configuracion_alertas WHERE tipo = 'error_procesamiento' AND activo = true`
+      );
+      destinatarios = rows.map(r => r.email);
+    } catch {
+      // si la tabla falla por cualquier razón, seguimos al respaldo de abajo
+    }
+    if (destinatarios.length === 0) destinatarios = ['admin@liberalmente.app'];
+
+    const nombre = titulo || auditoria_id;
+    const asunto = ok
+      ? `✅ ${producto} regenerado — ${nombre}`
+      : `⚠️ Falló la regeneración del ${producto} — ${nombre}`;
+    const cuerpo = `<p>${ok ? 'Se regeneró correctamente' : 'No se pudo regenerar'} el <strong>${esc(producto)}</strong> de la auditoría <strong>${esc(nombre)}</strong>.</p>
+      <p>${esc(detalle)}</p>
+      <p><a href="https://liberalmente.app/admin/auditorias">Ver en el panel de administración →</a></p>`;
+
+    for (const email of destinatarios) {
+      const r = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+        body: JSON.stringify({
+          from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+          to: email,
+          subject: asunto,
+          html: cuerpo,
+        }),
+      });
+      if (!r.ok) {
+        console.error(`   [avisarResultadoRegeneracion] No se pudo avisar a ${email}: ${await r.text()}`);
+      } else {
+        console.log(`   [avisarResultadoRegeneracion] ✅ Aviso enviado a ${email}`);
+      }
+    }
+  } catch (err) {
+    console.error('   [avisarResultadoRegeneracion] No se pudo enviar el aviso (no bloqueante):', err.message);
+  }
+}
+
 // ENDPOINT DE RECUPERACIÓN — regenera solo el Podcast de una auditoría ya
 // terminada, sin repetir el análisis de los 39 criterios. Usa el título
 // ACTUAL de la base de datos (que se dice en voz alta en la apertura y
 // también se le da al generador del guion). Genera un guion NUEVO, no el
-// mismo diálogo con el título cambiado. v3.41: el mp3 nuevo REEMPLAZA al
-// viejo en Drive (mismo link) y el bug de pesosCriterios quedó corregido.
+// mismo diálogo con el título cambiado. El mp3 nuevo REEMPLAZA al viejo en
+// Drive (mismo link).
 //
-// En el navegador:
+// v3.42: responde AL INSTANTE y trabaja en segundo plano (el podcast tarda
+// ~5-8 min, más de lo que Railway deja abierta una conexión sin datos); con
+// candado (una sola regeneración a la vez) y carpeta temporal única. El
+// resultado llega por correo (avisarResultadoRegeneracion) y queda en los
+// logs bajo [REGENERAR-PODCAST].
+//
+// En el navegador (UNA sola vez — no recargues ni repitas el enlace):
 //   https://acl-worker-production.up.railway.app/regenerar-podcast?secret=TU_SECRETO_NUEVO&auditoria_id=ID_AQUI
 app.get('/regenerar-podcast', async (req, res) => {
   if (req.query.secret !== WORKER_SECRET) {
@@ -2313,8 +2373,25 @@ app.get('/regenerar-podcast', async (req, res) => {
     return res.status(400).type('text/plain').send('Falta ?auditoria_id en la URL');
   }
 
-  const dir = path.join(DIRECTORIO_TEMP, `regenerar-podcast-${auditoria_id}`);
-  fs.mkdirSync(dir, { recursive: true });
+  // Candados. Se revisan y se toman SIN ningún "await" en medio, para que
+  // dos solicitudes casi simultáneas no puedan pasar las dos.
+  if (regenerandoPodcastAuditoriaId) {
+    return res.status(409).type('text/plain').send(
+      `Ya hay una regeneración de podcast en curso (auditoría ${regenerandoPodcastAuditoriaId}). ` +
+      'Espera a que termine (te llegará un correo) y NO repitas este enlace: dos a la vez se pisan y fallan las dos.'
+    );
+  }
+  if (procesandoEnEstaReplica) {
+    return res.status(409).type('text/plain').send(
+      'Hay una auditoría procesándose ahora mismo, y también usa ElevenLabs (que solo admite 3 solicitudes simultáneas en tu plan). ' +
+      'Espera a que termine e inténtalo de nuevo.'
+    );
+  }
+  regenerandoPodcastAuditoriaId = auditoria_id;
+
+  let dir = null;
+  let respuestaEnviada = false;
+  let tituloParaAviso = null;
 
   try {
     const result = await db.query(
@@ -2326,6 +2403,7 @@ app.get('/regenerar-podcast', async (req, res) => {
       return res.status(404).type('text/plain').send('Auditoría no encontrada.');
     }
     const fila = result.rows[0];
+    tituloParaAviso = fila.titulo_documento;
     if (!fila.reporte_texto) {
       return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría — el análisis nunca terminó, no hay nada que regenerar.');
     }
@@ -2336,15 +2414,21 @@ app.get('/regenerar-podcast', async (req, res) => {
       return res.status(400).type('text/plain').send('Esta auditoría no tiene ni link_podcast ni drive_carpeta_id guardados — no hay dónde dejar el audio nuevo.');
     }
 
-    // FIX v3.41: antes esta variable no se declaraba aquí y se usaba más
-    // abajo (generarYRevisarGuion) — "pesosCriterios is not defined".
+    // Validaciones superadas: se responde ya, y el resto corre en segundo plano.
+    res.type('text/plain').send(
+      `✅ Recibido — el podcast de "${fila.titulo_documento}" se está regenerando en segundo plano.\n\n` +
+      'Tarda unos 5 a 8 minutos. NO recargues esta página ni repitas el enlace.\n' +
+      'Cuando termine (o si falla) llegará un correo al equipo; también queda en los logs de Railway bajo [REGENERAR-PODCAST].'
+    );
+    respuestaEnviada = true;
+
+    // Carpeta temporal ÚNICA por ejecución (antes era una fija por auditoría).
+    dir = path.join(DIRECTORIO_TEMP, `regenerar-podcast-${auditoria_id}-${Date.now()}`);
+    fs.mkdirSync(dir, { recursive: true });
+
     const pesosCriterios = await obtenerPesosCriterios();
     const datosReporte = normalizarDatosEstructurados(fila.reporte_texto, auditoria_id, pesosCriterios);
 
-    // 4 ago 2026: los 3 textos de estilo del podcast (voces, reglas del
-    // generador, criterios del revisor) — si prompts_productos no tiene
-    // todavía alguna de las 3 claves, generarYRevisarGuion() usa su
-    // propio respaldo para esa pieza específica.
     const [textoVoces, textoReglas, textoCriteriosRevisor] = await Promise.all([
       obtenerPromptProducto('podcast_generador_voces'),
       obtenerPromptProducto('podcast_generador_reglas'),
@@ -2380,17 +2464,24 @@ app.get('/regenerar-podcast', async (req, res) => {
 
     await db.query(`UPDATE auditorias SET link_podcast = $1 WHERE id = $2`, [link, auditoria_id]);
 
-    console.log(`   [REGENERAR-PODCAST] ✅ [${auditoria_id}] Podcast regenerado`);
-    res.type('text/plain').send(
-      `✅ Listo — "${fila.titulo_documento}": Podcast regenerado (veredicto del revisor: ${resultadoGuion.veredicto}).\n` +
-      `Archivo: ${nombreArchivo} — ${modo}.\n${link}`
-    );
+    console.log(`   [REGENERAR-PODCAST] ✅ [${auditoria_id}] Podcast regenerado — ${nombreArchivo} (${modo})`);
+    await avisarResultadoRegeneracion({
+      producto: 'Podcast', auditoria_id, titulo: fila.titulo_documento, ok: true,
+      detalle: `Archivo: ${nombreArchivo} — ${modo}. Veredicto del revisor del guion: ${resultadoGuion.veredicto}. Link: ${link}`,
+    });
 
   } catch (error) {
     console.error(`   [REGENERAR-PODCAST] ❌ [${auditoria_id}] Error:`, error.message);
-    res.status(500).type('text/plain').send('Error: ' + error.message);
+    if (!respuestaEnviada) {
+      res.status(500).type('text/plain').send('Error: ' + error.message);
+    } else {
+      await avisarResultadoRegeneracion({
+        producto: 'Podcast', auditoria_id, titulo: tituloParaAviso, ok: false, detalle: error.message,
+      });
+    }
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    regenerandoPodcastAuditoriaId = null;
   }
 });
 
@@ -4033,6 +4124,22 @@ app.post('/eliminar-auditoria', async (req, res) => {
   }
 });
 
+// v3.42 (1 oct 2026) — /regenerar-podcast EN SEGUNDO PLANO + CANDADO. Los
+// logs mostraron dos problemas encadenados: (1) un podcast tarda ~5-8 min,
+// más de lo que Railway deja abierta una conexión HTTP sin datos (~5 min), así
+// que la pestaña veía "conexión cerrada" y se reintentaba; (2) cada reintento
+// lanzaba OTRA regeneración completa en paralelo, y las ejecuciones se
+// pisaban: compartían la misma carpeta temporal (la primera en fallar borraba
+// los archivos de las demás -> ENOENT lote-N.mp3) y juntas superaban el
+// límite de 3 solicitudes simultáneas de ElevenLabs (429
+// concurrent_limit_exceeded). Ninguna terminó. Fix: el endpoint responde de
+// inmediato y trabaja en segundo plano; candado en memoria (una sola
+// regeneración de podcast a la vez, y ninguna si hay una auditoría
+// procesándose); carpeta temporal única por ejecución; y al terminar o fallar
+// avisa por correo (avisarResultadoRegeneracion, mismos destinatarios que
+// enviarEmailErrorInterno). Solo cambia /regenerar-podcast; el Reporte y la
+// Presentación siguen como estaban.
+//
 // v3.41 (1 oct 2026) — FIX GET /regenerar-podcast + REEMPLAZO EN DRIVE.
 // (1) BUG: /regenerar-podcast usaba la variable pesosCriterios (la pasaba a
 //     generarYRevisarGuion) sin declararla en ese endpoint — fallaba siempre
@@ -5984,7 +6091,9 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.41 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.42 corriendo en puerto ${PORT}`);
+  console.log(`   NUEVO 1 oct (v3.42): /regenerar-podcast responde al instante y trabaja en segundo plano,`);
+  console.log(`   con candado (una a la vez), carpeta temporal única y aviso por correo al terminar`);
   console.log(`   NUEVO 1 oct (v3.41): FIX /regenerar-podcast (pesosCriterios sin declarar) y los endpoints`);
   console.log(`   /regenerar-podcast y /regenerar-presentacion reemplazan el archivo en Drive (mismo link)`);
   console.log(`   NUEVO 1 oct (v3.40): GET /regenerar-reporte — regenera el PDF del Reporte con el título`);
