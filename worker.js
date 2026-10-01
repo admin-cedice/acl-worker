@@ -1,4 +1,4 @@
-// worker.js — ACL Worker v3.40
+// worker.js — ACL Worker v3.41
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
 //
@@ -1849,7 +1849,7 @@ app.post('/cupos/reservar', async (req, res) => {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.40', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.41', timestamp: new Date().toISOString() });
 });
 
 // ENDPOINT DE RECUPERACIÓN — regenera solo el Reporte (PDF) de una auditoría
@@ -1867,6 +1867,41 @@ function extraerIdArchivoDrive(link) {
   if (!link) return null;
   const m = /\/d\/([a-zA-Z0-9_-]+)/.exec(link) || /[?&]id=([a-zA-Z0-9_-]+)/.exec(link);
   return m ? m[1] : null;
+}
+
+// Reemplaza el contenido de un archivo de Drive que ya existe (mismo link,
+// mismo ID — los correos ya enviados siguen funcionando) o, si no se puede,
+// sube uno nuevo a la carpeta de la auditoría. Devuelve { link, modo }.
+// Usada por /regenerar-podcast y /regenerar-presentacion (v3.41).
+async function reemplazarOSubirArchivoDrive(drive, { linkExistente, carpetaId, rutaArchivo, nombre, mime }) {
+  const idExistente = extraerIdArchivoDrive(linkExistente);
+
+  if (idExistente) {
+    try {
+      await drive.files.update({
+        fileId: idExistente,
+        requestBody: { name: nombre },
+        media: { mimeType: mime, body: fs.createReadStream(rutaArchivo) },
+        fields: 'id',
+      });
+      console.log(`   [reemplazarOSubirArchivoDrive] ✅ Archivo existente actualizado en Drive: ${nombre}`);
+      return {
+        link: linkExistente,
+        modo: 'reemplazado en el mismo archivo de Drive (el link de los correos ya enviados sigue funcionando y muestra la versión nueva)',
+      };
+    } catch (errorUpdate) {
+      console.error(`   [reemplazarOSubirArchivoDrive] ⚠️ No se pudo actualizar el archivo existente (${errorUpdate.message}) — se sube uno nuevo`);
+    }
+  }
+
+  if (!carpetaId) {
+    throw new Error('No se pudo actualizar el archivo existente en Drive y esta auditoría no tiene drive_carpeta_id para subir uno nuevo.');
+  }
+  const link = await subirArchivo(drive, rutaArchivo, nombre, mime, carpetaId);
+  return {
+    link,
+    modo: 'subido como archivo NUEVO a la carpeta de la auditoría (si había uno anterior sigue en Drive, y los correos ya enviados apuntan a él)',
+  };
 }
 
 app.get('/regenerar-reporte', async (req, res) => {
@@ -2157,8 +2192,10 @@ app.get('/regenerar-grafo', async (req, res) => {
   }
 });
 
-// ENDPOINT DE RECUPERACIÓN — regenera solo la Presentación de una
-// auditoría ya completada, sin repetir el análisis de los 28 criterios.
+// ENDPOINT DE RECUPERACIÓN — regenera solo la Presentación (Activismo) de
+// una auditoría ya terminada, sin repetir el análisis de los 39 criterios.
+// v3.41: el PDF nuevo REEMPLAZA al viejo en Drive (mismo link), y usa el
+// nombre actual Activismo_<título>.pdf.
 //
 // En el navegador:
 //   https://acl-worker-production.up.railway.app/regenerar-presentacion?secret=TU_SECRETO_NUEVO&auditoria_id=ID_AQUI
@@ -2176,19 +2213,26 @@ app.get('/regenerar-presentacion', async (req, res) => {
 
   try {
     const result = await db.query(
-      `SELECT reporte_texto, titulo_documento, pais, drive_carpeta_id, grafo_datos FROM auditorias WHERE id = $1`,
+      `SELECT reporte_texto, titulo_documento, pais, estado, drive_carpeta_id, grafo_datos, link_presentacion
+       FROM auditorias WHERE id = $1`,
       [auditoria_id]
     );
-    if (!result.rows[0]?.reporte_texto) {
-      return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría.');
+    if (result.rows.length === 0) {
+      return res.status(404).type('text/plain').send('Auditoría no encontrada.');
     }
-    const { reporte_texto, titulo_documento, pais, drive_carpeta_id, grafo_datos } = result.rows[0];
-    if (!drive_carpeta_id) {
-      return res.status(400).type('text/plain').send('Esta auditoría no tiene drive_carpeta_id guardado.');
+    const fila = result.rows[0];
+    if (!fila.reporte_texto) {
+      return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría — el análisis nunca terminó, no hay nada que regenerar.');
+    }
+    if (!ESTADOS_TERMINALES.includes(fila.estado)) {
+      return res.status(409).type('text/plain').send(`Esta auditoría todavía está en proceso (estado: ${fila.estado}) — espera a que termine antes de regenerar la Presentación.`);
+    }
+    if (!extraerIdArchivoDrive(fila.link_presentacion) && !fila.drive_carpeta_id) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene ni link_presentacion ni drive_carpeta_id guardados — no hay dónde dejar el PDF nuevo.');
     }
 
     const pesosCriterios = await obtenerPesosCriterios();
-    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, pesosCriterios);
+    const datosReporte = normalizarDatosEstructurados(fila.reporte_texto, auditoria_id, pesosCriterios);
     const rutaPDF = path.join(dir, 'presentacion.pdf');
 
     // 4 ago 2026: contactos reales de contactos_apoyo — si la tabla está
@@ -2199,39 +2243,49 @@ app.get('/regenerar-presentacion', async (req, res) => {
     // no existe en prompts_productos, generarActivismo.js usa su propio
     // respaldo para esa pieza específica.
     const [estiloPersonaActivismo, reglasGeneracionActivismo, disclaimerPresentacion] = await Promise.all([
-	  obtenerPromptProducto('presentacion_activismo_estilo'),
-	  obtenerPromptProducto('presentacion_activismo_reglas'),
-	  obtenerPromptProducto('disclaimer_presentacion'),
-	]);
+      obtenerPromptProducto('presentacion_activismo_estilo'),
+      obtenerPromptProducto('presentacion_activismo_reglas'),
+      obtenerPromptProducto('disclaimer_presentacion'),
+    ]);
 
-    console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
-
-    console.log(`   [REGENERAR-PRESENTACION] Generando para: ${titulo_documento}`);
+    console.log(`   [REGENERAR-PRESENTACION] [${auditoria_id}] Generando para: ${fila.titulo_documento}`);
     await generarPresentacionPDF(
       datosReporte,
       {
-        titulo: titulo_documento,
-        pais: pais || '',
+        titulo: fila.titulo_documento,
+        pais: fila.pais || '',
         generadoEl: new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
       },
       rutaPDF,
       auditoria_id,
-      grafo_datos,
+      fila.grafo_datos,
       pesosCriterios,
       contactosApoyo,
       { estiloPersona: estiloPersonaActivismo, reglasGeneracion: reglasGeneracionActivismo },
       disclaimerPresentacion
     );
+    if (!fs.existsSync(rutaPDF)) {
+      throw new Error('El PDF de la Presentación no se generó (no se encontró el archivo de salida) — revisa los logs de generarPresentacionPDF.');
+    }
 
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
-    const identificadorLimpio = limpiarIdentificador(titulo_documento);
-    const link = await subirArchivo(drive, rutaPDF, `Presentacion_${identificadorLimpio}.pdf`, 'application/pdf', drive_carpeta_id);
+    const nombreArchivo = `Activismo_${limpiarIdentificador(fila.titulo_documento)}.pdf`;
+    const { link, modo } = await reemplazarOSubirArchivoDrive(drive, {
+      linkExistente: fila.link_presentacion,
+      carpetaId: fila.drive_carpeta_id,
+      rutaArchivo: rutaPDF,
+      nombre: nombreArchivo,
+      mime: 'application/pdf',
+    });
 
     await db.query(`UPDATE auditorias SET link_presentacion = $1 WHERE id = $2`, [link, auditoria_id]);
 
-    console.log(`   [REGENERAR-PRESENTACION] ✅ [${auditoria_id}] link_presentacion actualizado`);
-    res.type('text/plain').send(`✅ Listo — "${titulo_documento}": Presentación regenerada y subida.\n${link}\n\n(link_presentacion actualizado — el botón de la biblioteca ya apunta acá.)`);
+    console.log(`   [REGENERAR-PRESENTACION] ✅ [${auditoria_id}] Presentación regenerada`);
+    res.type('text/plain').send(
+      `✅ Listo — "${fila.titulo_documento}": Presentación regenerada.\n` +
+      `Archivo: ${nombreArchivo} — ${modo}.\n${link}`
+    );
 
   } catch (error) {
     console.error(`   [REGENERAR-PRESENTACION] ❌ [${auditoria_id}] Error:`, error.message);
@@ -2242,7 +2296,11 @@ app.get('/regenerar-presentacion', async (req, res) => {
 });
 
 // ENDPOINT DE RECUPERACIÓN — regenera solo el Podcast de una auditoría ya
-// completada, sin repetir el análisis de los 28 criterios.
+// terminada, sin repetir el análisis de los 39 criterios. Usa el título
+// ACTUAL de la base de datos (que se dice en voz alta en la apertura y
+// también se le da al generador del guion). Genera un guion NUEVO, no el
+// mismo diálogo con el título cambiado. v3.41: el mp3 nuevo REEMPLAZA al
+// viejo en Drive (mismo link) y el bug de pesosCriterios quedó corregido.
 //
 // En el navegador:
 //   https://acl-worker-production.up.railway.app/regenerar-podcast?secret=TU_SECRETO_NUEVO&auditoria_id=ID_AQUI
@@ -2260,18 +2318,28 @@ app.get('/regenerar-podcast', async (req, res) => {
 
   try {
     const result = await db.query(
-      `SELECT reporte_texto, titulo_documento, pais, drive_carpeta_id FROM auditorias WHERE id = $1`,
+      `SELECT reporte_texto, titulo_documento, pais, estado, link_podcast, drive_carpeta_id
+       FROM auditorias WHERE id = $1`,
       [auditoria_id]
     );
-    if (!result.rows[0]?.reporte_texto) {
-      return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría.');
+    if (result.rows.length === 0) {
+      return res.status(404).type('text/plain').send('Auditoría no encontrada.');
     }
-    const { reporte_texto, titulo_documento, pais, drive_carpeta_id } = result.rows[0];
-    if (!drive_carpeta_id) {
-      return res.status(400).type('text/plain').send('Esta auditoría no tiene drive_carpeta_id guardado.');
+    const fila = result.rows[0];
+    if (!fila.reporte_texto) {
+      return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría — el análisis nunca terminó, no hay nada que regenerar.');
+    }
+    if (!ESTADOS_TERMINALES.includes(fila.estado)) {
+      return res.status(409).type('text/plain').send(`Esta auditoría todavía está en proceso (estado: ${fila.estado}) — espera a que termine antes de regenerar el Podcast.`);
+    }
+    if (!extraerIdArchivoDrive(fila.link_podcast) && !fila.drive_carpeta_id) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene ni link_podcast ni drive_carpeta_id guardados — no hay dónde dejar el audio nuevo.');
     }
 
-    const datosReporte = normalizarDatosEstructurados(reporte_texto, auditoria_id, await obtenerPesosCriterios());
+    // FIX v3.41: antes esta variable no se declaraba aquí y se usaba más
+    // abajo (generarYRevisarGuion) — "pesosCriterios is not defined".
+    const pesosCriterios = await obtenerPesosCriterios();
+    const datosReporte = normalizarDatosEstructurados(fila.reporte_texto, auditoria_id, pesosCriterios);
 
     // 4 ago 2026: los 3 textos de estilo del podcast (voces, reglas del
     // generador, criterios del revisor) — si prompts_productos no tiene
@@ -2283,27 +2351,40 @@ app.get('/regenerar-podcast', async (req, res) => {
       obtenerPromptProducto('podcast_revisor_criterios'),
     ]);
 
-    console.log(`   [REGENERAR-PODCAST] Generando guion y audio para: ${titulo_documento}`);
+    console.log(`   [REGENERAR-PODCAST] [${auditoria_id}] Generando guion y audio para: ${fila.titulo_documento}`);
     const resultadoGuion = await generarYRevisarGuion(
-	  datosReporte,
-	  { titulo: titulo_documento, pais: pais || '' },
-	  pesosCriterios,
-	  textoVoces, textoReglas, textoCriteriosRevisor
+      datosReporte,
+      { titulo: fila.titulo_documento, pais: fila.pais || '' },
+      pesosCriterios,
+      textoVoces, textoReglas, textoCriteriosRevisor
     );
+
     const rutaMp3 = path.join(dir, 'podcast.mp3');
-	const fraseDinamica = `Hoy nos ocupamos de: ${titulo_documento}.`;
-	const piezasFijas = await prepararPiezasFijasPodcast(dir);
+    const fraseDinamica = `Hoy nos ocupamos de: ${fila.titulo_documento}.`;
+    const piezasFijas = await prepararPiezasFijasPodcast(dir);
     await generarPodcastMp3(resultadoGuion.guionFinal, rutaMp3, auditoria_id, { fraseDinamica, ...piezasFijas });
+    if (!fs.existsSync(rutaMp3)) {
+      throw new Error('El mp3 del podcast no se generó (no se encontró el archivo de salida) — revisa los logs de generarPodcastMp3.');
+    }
 
     const driveAuth = autenticarDrive();
     const drive = google.drive({ version: 'v3', auth: driveAuth });
-    const identificadorLimpio = limpiarIdentificador(titulo_documento);
-    const link = await subirArchivo(drive, rutaMp3, `Podcast_${identificadorLimpio}.mp3`, 'audio/mpeg', drive_carpeta_id);
+    const nombreArchivo = `Dialogo_${limpiarIdentificador(fila.titulo_documento)}.mp3`;
+    const { link, modo } = await reemplazarOSubirArchivoDrive(drive, {
+      linkExistente: fila.link_podcast,
+      carpetaId: fila.drive_carpeta_id,
+      rutaArchivo: rutaMp3,
+      nombre: nombreArchivo,
+      mime: 'audio/mpeg',
+    });
 
     await db.query(`UPDATE auditorias SET link_podcast = $1 WHERE id = $2`, [link, auditoria_id]);
 
-    console.log(`   [REGENERAR-PODCAST] ✅ [${auditoria_id}] link_podcast actualizado`);
-    res.type('text/plain').send(`✅ Listo — "${titulo_documento}": Podcast regenerado y subido (veredicto del revisor: ${resultadoGuion.veredicto}).\n${link}\n\n(link_podcast actualizado — el botón de la biblioteca ya apunta acá.)`);
+    console.log(`   [REGENERAR-PODCAST] ✅ [${auditoria_id}] Podcast regenerado`);
+    res.type('text/plain').send(
+      `✅ Listo — "${fila.titulo_documento}": Podcast regenerado (veredicto del revisor: ${resultadoGuion.veredicto}).\n` +
+      `Archivo: ${nombreArchivo} — ${modo}.\n${link}`
+    );
 
   } catch (error) {
     console.error(`   [REGENERAR-PODCAST] ❌ [${auditoria_id}] Error:`, error.message);
@@ -3952,6 +4033,26 @@ app.post('/eliminar-auditoria', async (req, res) => {
   }
 });
 
+// v3.41 (1 oct 2026) — FIX GET /regenerar-podcast + REEMPLAZO EN DRIVE.
+// (1) BUG: /regenerar-podcast usaba la variable pesosCriterios (la pasaba a
+//     generarYRevisarGuion) sin declararla en ese endpoint — fallaba siempre
+//     con "pesosCriterios is not defined". Ahora se declara al inicio, igual
+//     que en /regenerar-presentacion.
+// (2) /regenerar-podcast y /regenerar-presentacion reemplazan el archivo
+//     existente en Drive (drive.files.update — mismo link) con el nuevo
+//     helper reemplazarOSubirArchivoDrive(), igual que /regenerar-reporte
+//     desde v3.40: los correos ya enviados apuntan al link del archivo viejo,
+//     y subir un segundo archivo los dejaba mostrando el producto con el
+//     título equivocado. Si no se puede reemplazar (link ilegible, archivo
+//     borrado, auditoría que nunca llegó a generar ese producto), cae al
+//     método de siempre: sube un archivo nuevo a la carpeta de la auditoría.
+// (3) Nombres de archivo alineados con el naming vigente en el pipeline:
+//     Dialogo_<título>.mp3 y Activismo_<título>.pdf (antes: Podcast_… y
+//     Presentacion_…). Ambos endpoints exigen estado terminal (no en proceso).
+// Nota: regenerar el podcast produce un GUION NUEVO (no el mismo diálogo con
+// el título cambiado) — el título se dice en voz alta en la apertura ("Hoy
+// nos ocupamos de: …") y también se le da al generador del guion.
+//
 // v3.40 (1 oct 2026) — NUEVO GET /regenerar-reporte. Vuelve a generar el
 // PDF del Reporte de una auditoría ya terminada usando el reporte_texto que
 // ya está guardado (no repite el análisis de los 39 criterios, no gasta
@@ -5883,7 +5984,9 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.40 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.41 corriendo en puerto ${PORT}`);
+  console.log(`   NUEVO 1 oct (v3.41): FIX /regenerar-podcast (pesosCriterios sin declarar) y los endpoints`);
+  console.log(`   /regenerar-podcast y /regenerar-presentacion reemplazan el archivo en Drive (mismo link)`);
   console.log(`   NUEVO 1 oct (v3.40): GET /regenerar-reporte — regenera el PDF del Reporte con el título`);
   console.log(`   actual, reemplazándolo en el mismo archivo de Drive (el link de los correos sigue vivo)`);
   console.log(`   NUEVO 1 oct (v3.39): POST /editar-titulo-auditoria (Superadmin y Editor) y`);
