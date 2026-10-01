@@ -1,4 +1,4 @@
-// worker.js — ACL Worker v3.39
+// worker.js — ACL Worker v3.40
 // Umbusk LLC · Auditoría Cívica Liberal
 // Railway · Node.js
 //
@@ -1849,7 +1849,139 @@ app.post('/cupos/reservar', async (req, res) => {
 // ── Rutas ────────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.39', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '3.40', timestamp: new Date().toISOString() });
+});
+
+// ENDPOINT DE RECUPERACIÓN — regenera solo el Reporte (PDF) de una auditoría
+// ya terminada, sin repetir el análisis de los 39 criterios. Usa el título
+// actual de la base de datos (útil tras corregirlo con el lápiz de Admin).
+// El PDF nuevo REEMPLAZA al viejo en Drive (mismo link) — ver v3.40.
+//
+// En el navegador:
+//   https://acl-worker-production.up.railway.app/regenerar-reporte?secret=TU_SECRETO&auditoria_id=ID_AQUI
+
+// Un webViewLink de Drive tiene la forma
+// https://drive.google.com/file/d/ID_DEL_ARCHIVO/view?usp=... — esto saca
+// el ID. Devuelve null si el link está vacío o no se reconoce.
+function extraerIdArchivoDrive(link) {
+  if (!link) return null;
+  const m = /\/d\/([a-zA-Z0-9_-]+)/.exec(link) || /[?&]id=([a-zA-Z0-9_-]+)/.exec(link);
+  return m ? m[1] : null;
+}
+
+app.get('/regenerar-reporte', async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).type('text/plain').send('No autorizado');
+  }
+  const auditoria_id = req.query.auditoria_id;
+  if (!auditoria_id) {
+    return res.status(400).type('text/plain').send('Falta ?auditoria_id en la URL');
+  }
+
+  const dir = path.join(DIRECTORIO_TEMP, `regenerar-reporte-${auditoria_id}`);
+  fs.mkdirSync(dir, { recursive: true });
+
+  try {
+    const result = await db.query(
+      `SELECT reporte_texto, titulo_documento, pais, estado, puntaje, link_reporte, drive_carpeta_id
+       FROM auditorias WHERE id = $1`,
+      [auditoria_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).type('text/plain').send('Auditoría no encontrada.');
+    }
+    const fila = result.rows[0];
+    if (!fila.reporte_texto) {
+      return res.status(404).type('text/plain').send('No se encontró reporte_texto para esta auditoría — el análisis nunca terminó, no hay nada que regenerar.');
+    }
+    if (!ESTADOS_TERMINALES.includes(fila.estado)) {
+      return res.status(409).type('text/plain').send(`Esta auditoría todavía está en proceso (estado: ${fila.estado}) — espera a que termine antes de regenerar el Reporte.`);
+    }
+    const idArchivoExistente = extraerIdArchivoDrive(fila.link_reporte);
+    if (!idArchivoExistente && !fila.drive_carpeta_id) {
+      return res.status(400).type('text/plain').send('Esta auditoría no tiene ni link_reporte ni drive_carpeta_id guardados — no hay dónde dejar el PDF nuevo.');
+    }
+
+    const pesosCriterios = await obtenerPesosCriterios();
+    const disclaimerReporte = await obtenerPromptProducto('disclaimer_reporte');
+    const rutaReportePDF = path.join(dir, 'reporte.pdf');
+
+    console.log(`   [REGENERAR-REPORTE] [${auditoria_id}] Generando Reporte para: ${fila.titulo_documento}`);
+    const datosReporte = await generarReportePDF(
+      fila.reporte_texto,
+      {
+        titulo:         fila.titulo_documento,
+        pais:           fila.pais || '',
+        fecha:          '',
+        paginas:        '',
+        marcaDoctrinal: 'Manual Cívico Liberal — CEDICE / Friedrich Naumann, 2026',
+        generadoEl:     new Date().toLocaleDateString('es-VE', { year: 'numeric', month: 'long', day: 'numeric' }),
+      },
+      rutaReportePDF, auditoria_id, pesosCriterios, disclaimerReporte
+    );
+    if (!fs.existsSync(rutaReportePDF)) {
+      throw new Error('El PDF del Reporte no se generó (no se encontró el archivo de salida) — revisa los logs de generarReportePDF.');
+    }
+
+    const driveAuth = autenticarDrive();
+    const drive = google.drive({ version: 'v3', auth: driveAuth });
+    const nombreArchivo = `Auditoria_de_${limpiarIdentificador(fila.titulo_documento)}.pdf`;
+
+    let linkFinal = fila.link_reporte;
+    let modo = null;
+
+    if (idArchivoExistente) {
+      try {
+        await drive.files.update({
+          fileId: idArchivoExistente,
+          requestBody: { name: nombreArchivo },
+          media: { mimeType: 'application/pdf', body: fs.createReadStream(rutaReportePDF) },
+          fields: 'id',
+        });
+        modo = 'reemplazado en el mismo archivo de Drive (el link de los correos ya enviados sigue funcionando y muestra la versión nueva)';
+        console.log(`   [REGENERAR-REPORTE] [${auditoria_id}] ✅ Archivo existente actualizado en Drive: ${nombreArchivo}`);
+      } catch (errorUpdate) {
+        console.error(`   [REGENERAR-REPORTE] [${auditoria_id}] ⚠️ No se pudo actualizar el archivo existente (${errorUpdate.message}) — se sube uno nuevo`);
+      }
+    }
+
+    if (!modo) {
+      if (!fila.drive_carpeta_id) {
+        throw new Error('No se pudo actualizar el archivo existente en Drive y esta auditoría no tiene drive_carpeta_id para subir uno nuevo.');
+      }
+      linkFinal = await subirArchivo(drive, rutaReportePDF, nombreArchivo, 'application/pdf', fila.drive_carpeta_id);
+      modo = 'subido como archivo NUEVO a la carpeta de la auditoría (el viejo sigue en Drive y los correos ya enviados apuntan a él)';
+    }
+
+    await db.query(
+      `UPDATE auditorias SET link_reporte = $1, puntaje = $2 WHERE id = $3`,
+      [linkFinal, datosReporte.puntaje, auditoria_id]
+    );
+
+    const puntajeAntes = (fila.puntaje !== null && fila.puntaje !== undefined) ? Number(fila.puntaje) : null;
+    const puntajeAhora = (datosReporte.puntaje !== null && datosReporte.puntaje !== undefined) ? Number(datosReporte.puntaje) : null;
+    const cambioPuntaje = puntajeAntes !== null && puntajeAhora !== null && Math.abs(puntajeAntes - puntajeAhora) >= 0.5;
+
+    const lineas = [
+      `✅ Listo — "${fila.titulo_documento}": Reporte regenerado.`,
+      `Archivo: ${nombreArchivo} — ${modo}.`,
+      linkFinal,
+      '',
+      `Puntaje: ${puntajeAntes !== null ? puntajeAntes + '%' : 'sin total'} → ${puntajeAhora !== null ? puntajeAhora + '%' : 'sin total'}`,
+    ];
+    if (cambioPuntaje) {
+      lineas.push('', '⚠️ El puntaje cambió: los pesos de criterios vigentes hoy no son los mismos que cuando se hizo esta auditoría. La Presentación, el Podcast y el Mapa Mental ya generados usaron los pesos anteriores — regénéralos (/regenerar-presentacion, /regenerar-podcast, /regenerar-grafo) si quieres que todo coincida.');
+    }
+
+    console.log(`   [REGENERAR-REPORTE] ✅ [${auditoria_id}] Reporte regenerado — puntaje ${puntajeAntes} → ${puntajeAhora}`);
+    res.type('text/plain').send(lineas.join('\n'));
+
+  } catch (error) {
+    console.error(`   [REGENERAR-REPORTE] ❌ [${auditoria_id}] Error:`, error.message);
+    res.status(500).type('text/plain').send('Error: ' + error.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ENDPOINT DE RECUPERACIÓN — reclasifica tipo_instrumento/materia (y de
@@ -3820,6 +3952,32 @@ app.post('/eliminar-auditoria', async (req, res) => {
   }
 });
 
+// v3.40 (1 oct 2026) — NUEVO GET /regenerar-reporte. Vuelve a generar el
+// PDF del Reporte de una auditoría ya terminada usando el reporte_texto que
+// ya está guardado (no repite el análisis de los 39 criterios, no gasta
+// Claude — solo CloudConvert) y el titulo_documento ACTUAL de la base de
+// datos. Pensado para después de corregir un título con el lápiz de
+// /admin/auditorias (v3.39): el PDF del Reporte llevaba impreso el título
+// viejo en la portada.
+// DECISIÓN DE DISEÑO: el PDF nuevo REEMPLAZA al viejo dentro de Drive
+// (mismo archivo, mismo link — drive.files.update), en vez de subir un
+// segundo archivo como hacen /regenerar-presentacion y /regenerar-podcast.
+// Motivo: los correos ya enviados ("Tu auditoría está lista" y el aviso
+// masivo) apuntan al link del archivo viejo — si se dejara aparte, esos
+// correos seguirían mostrando el Reporte con el título equivocado. De paso
+// se renombra el archivo con el título nuevo. Si el link guardado no se
+// puede leer, o Drive no deja actualizarlo (archivo borrado, p. ej.), cae
+// al método de siempre: sube un archivo nuevo a la carpeta de la auditoría
+// y actualiza link_reporte.
+// OJO: el Reporte se regenera con los PESOS DE CRITERIOS VIGENTES HOY. Si
+// los pesos cambiaron desde que se hizo la auditoría, el puntaje puede ser
+// distinto — se guarda el nuevo en auditorias.puntaje (para que la
+// Biblioteca coincida con el PDF) y el endpoint avisa si cambió, porque la
+// Presentación, el Podcast y el Mapa Mental ya generados usaron los pesos
+// anteriores. La fecha de portada ("generado el") pasa a ser la de hoy.
+// Solo se permite sobre auditorías en estado terminal (completada,
+// parcialmente_completada, rechazada, fallida, error), nunca en proceso.
+//
 // ── Corregir el título de una auditoría a mano (1 oct 2026, v3.39) ────────
 // Cuando extraerMetadatos() no logra identificar el título (queda "Documento
 // sin título"), un admin puede corregirlo desde /admin/auditorias.
@@ -5725,7 +5883,9 @@ async function enviarEmailErrorInterno(auditoria_id, titulo, mensajeError) {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n⚙️  ACL Worker v3.39 corriendo en puerto ${PORT}`);
+  console.log(`\n⚙️  ACL Worker v3.40 corriendo en puerto ${PORT}`);
+  console.log(`   NUEVO 1 oct (v3.40): GET /regenerar-reporte — regenera el PDF del Reporte con el título`);
+  console.log(`   actual, reemplazándolo en el mismo archivo de Drive (el link de los correos sigue vivo)`);
   console.log(`   NUEVO 1 oct (v3.39): POST /editar-titulo-auditoria (Superadmin y Editor) y`);
   console.log(`   extraerMetadatos() lee 12000 caracteres y maneja Gacetas con varios instrumentos`);
   console.log(`   NUEVO 24 sep (v3.38): los nombres de archivo (Auditoria_de_…, Dialogo_…, Activismo_…) siempre`);
