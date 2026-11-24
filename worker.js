@@ -1764,6 +1764,17 @@ async function verificarYReservarCupo(ciudadanoId, auditoriaId) {
 // resto del pipeline (mismo criterio que el resto de los chequeos "no
 // bloqueantes" de este archivo).
 async function devolverCupoPorAuditoria(auditoriaId) {
+    // ENTREGA 2 (24 nov 2026): devuelve también el cupo del sistema nuevo
+    // (tabla cupo_uso). Independiente del cupo viejo de abajo; si falla,
+    // solo queda en el log.
+    try {
+      const rNuevo = await db.query('SELECT devolver_cupo($1) AS n', [auditoriaId]);
+      if (rNuevo.rows[0]?.n > 0) {
+        console.log(`   [devolverCupoPorAuditoria] ✅ Cupo nuevo devuelto — auditoría ${auditoriaId}`);
+      }
+    } catch (errNuevo) {
+      console.error(`   [devolverCupoPorAuditoria] ⚠️ No se pudo devolver el cupo nuevo de ${auditoriaId} (no bloqueante):`, errNuevo.message);
+  }
   const client = await db.connect();
   try {
     await client.query('BEGIN');
@@ -5025,6 +5036,121 @@ app.get('/ciudadano/darse-de-baja', async (req, res) => {
   }
 });
 
+// ── MODO PROPUESTA (ENTREGA 2, 24 nov 2026) ──────────────────────────────
+// decidirSiEsPropuesta(): se llama en el PASO 4.9 de procesarAuditoria(),
+// después del filtro, los metadatos y los duplicados, y ANTES del análisis
+// (lo caro). Devuelve true si hay que detenerse y guardar como propuesta.
+//
+// Orden de la decisión:
+//   1. estado_propuesta = 'convertida' → un admin la aprobó: se audita.
+//   2. estado_propuesta con otro valor (Next.js la marcó propuesta, o
+//      está en revisión/descartada) → propuesta, SIEMPRE, aunque el
+//      interruptor de este worker esté apagado.
+//   3. Interruptor apagado → como hoy: se audita.
+//   4. Interruptor encendido → segundo control: puedeAuditar() en la
+//      base de datos. Si no puede, propuesta.
+// Si la lectura falla: con el interruptor encendido, propuesta
+// (fail-closed); apagado, como hoy.
+async function decidirSiEsPropuesta(auditoriaId) {
+  let fila;
+  try {
+    const { rows } = await db.query(
+      `SELECT ciudadano_id, estado_propuesta FROM auditorias WHERE id = $1`,
+      [auditoriaId]
+    );
+    fila = rows[0];
+  } catch (err) {
+    console.error(`⚠️ [${auditoriaId}] decidirSiEsPropuesta: no se pudo leer la auditoría:`, err.message);
+    return PROPUESTAS_ACTIVO;
+  }
+  if (!fila) return PROPUESTAS_ACTIVO;
+  if (fila.estado_propuesta === 'convertida') return false;
+  if (fila.estado_propuesta) return true;
+  if (!PROPUESTAS_ACTIVO) return false;
+  return !(await puedeAuditar(fila.ciudadano_id));
+}
+
+// Texto que viene de documentos de terceros (títulos extraídos) → se
+// muestra siempre como texto, nunca como HTML.
+function escaparHTML(texto) {
+  return String(texto ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function enviarEmailPropuestaAdmitida(email, titulo) {
+  const tituloSeguro = escaparHTML(titulo || 'el documento que propusiste');
+  const cuerpo = `<p>Hola,</p>
+    <p>Revisamos el documento que propusiste, <strong>${tituloSeguro}</strong>, y cumple con los requisitos para ser auditado: es un instrumento legal o de política pública venezolana y todavía no ha sido auditado en la plataforma.</p>
+    <p>Tu propuesta queda ahora en revisión del equipo de Liberalmente, que decide qué documentos se auditan y en qué orden. Si se aprueba, te escribiremos cuando la auditoría esté lista.</p>
+    <p>Gracias por contribuir a la fiscalización ciudadana.</p>
+    <p style="font-size:12px;color:#888">Auditoría Cívica Liberal · <a href="https://liberalmente.app">liberalmente.app</a></p>`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+    body: JSON.stringify({
+      from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+      to: email,
+      subject: 'Tu propuesta fue admitida y está en revisión',
+      html: cuerpo,
+    }),
+  });
+  if (!res.ok) throw new Error(`Error enviando email de propuesta admitida: ${await res.text()}`);
+  console.log(`   ✅ Email de propuesta admitida enviado a ${email}`);
+}
+
+// Aviso al equipo, solo para propuestas CON documento ya admitido.
+// Destinatarios: configuracion_alertas tipo 'nueva_propuesta'; si no hay
+// ninguno, los mismos de 'error_procesamiento'; si tampoco, el respaldo
+// admin@liberalmente.app (mismo criterio que enviarEmailErrorInterno).
+async function avisarPropuestaAdmitidaAlEquipo(auditoria_id, metadatos) {
+  let destinatarios = [];
+  try {
+    const { rows } = await db.query(
+      `SELECT email FROM configuracion_alertas WHERE tipo = 'nueva_propuesta' AND activo = true`
+    );
+    destinatarios = rows.map(r => r.email);
+    if (destinatarios.length === 0) {
+      const respaldo = await db.query(
+        `SELECT email FROM configuracion_alertas WHERE tipo = 'error_procesamiento' AND activo = true`
+      );
+      destinatarios = respaldo.rows.map(r => r.email);
+    }
+  } catch {
+    // si la tabla falla, seguimos al respaldo de abajo
+  }
+  if (destinatarios.length === 0) destinatarios = ['admin@liberalmente.app'];
+
+  const cuerpo = `<p>Llegó una propuesta nueva, ya admitida por el filtro.</p>
+    <ul>
+      <li><strong>Documento:</strong> ${escaparHTML(metadatos?.titulo || '(sin título)')}</li>
+      <li><strong>País:</strong> ${escaparHTML(metadatos?.pais || '—')}</li>
+      <li><strong>Categoría:</strong> ${escaparHTML(metadatos?.categoria || '—')}</li>
+      <li><strong>Tipo:</strong> ${escaparHTML(metadatos?.tipoInstrumento || '—')}</li>
+      <li><strong>ID:</strong> ${auditoria_id}</li>
+    </ul>
+    <p><a href="https://liberalmente.app/admin/auditorias">Ver en el panel de administración →</a></p>`;
+
+  for (const email of destinatarios) {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RESEND_API_KEY}` },
+      body: JSON.stringify({
+        from: 'Auditoría Cívica Liberal <no-reply@liberalmente.app>',
+        to: email,
+        subject: `📮 Nueva propuesta admitida — ${String(metadatos?.titulo || auditoria_id).slice(0, 120)}`,
+        html: cuerpo,
+      }),
+    });
+    if (!res.ok) {
+      console.error(`   No se pudo avisar de la propuesta a ${email}: ${await res.text()}`);
+    } else {
+      console.log(`   ✅ Aviso de propuesta enviado a ${email}`);
+    }
+  }
+}
+
 // ── Función principal ────────────────────────────────────────────────────────
 
 async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, saltarFiltro = false, saltarDuplicados = false) {
@@ -5130,7 +5256,7 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
 	            `UPDATE auditorias
 	             SET estado = 'rechazada', razon_rechazo = $1, motivo_rechazo_tipo = 'documento_en_proceso', rechazada_en = NOW()
 	             WHERE id = $2`,
-	            [`El mismo documento ya se está procesando en la auditoría ${duplicadoEnProceso.id}.`, auditoria_id]
+	            [`El mismo documento yaEsperando ventana de rate se está procesando en la auditoría ${duplicadoEnProceso.id}.`, auditoria_id]
 	          );
 	          await enviarEmailDocumentoEnProceso(ciudadano_email, duplicadoEnProceso.titulo_documento);
 	          console.log(`🔁 [${auditoria_id}] Rechazada — el mismo documento ya se está procesando en ${duplicadoEnProceso.id}`);
@@ -5253,6 +5379,27 @@ async function procesarAuditoria(auditoria_id, ciudadano_email, pdf_drive_id, sa
       } catch (errorDuplicadoSemantico) {
         console.error(`⚠️  [${auditoria_id}] No se pudo verificar similitud semántica (no bloqueante — ¿falta migracion-duplicados-semanticos.sql?):`, errorDuplicadoSemantico.message);
       }
+    }
+
+        // ── PASO 4.9: ¿auditoría completa o propuesta? (ENTREGA 2) ───────────
+	    // Ya pasó el filtro, los metadatos y los duplicados. Si es propuesta,
+	    // se detiene AQUÍ: no se gastan los tokens del análisis ni nada de lo
+	    // que sigue. El cupo NO se devuelve (la propuesta fue admitida).
+	    if (await decidirSiEsPropuesta(auditoria_id)) {
+	      await db.query(
+	        `UPDATE auditorias
+	         SET estado = 'propuesta', estado_propuesta = COALESCE(estado_propuesta, 'nueva')
+	         WHERE id = $1`,
+	        [auditoria_id]
+	      );
+	      console.log(`📮 [${auditoria_id}] PASO 4.9: Guardada como PROPUESTA (admitida, sin análisis) — "${metadatos.titulo}"`);
+	      await enviarEmailPropuestaAdmitida(ciudadano_email, metadatos.titulo).catch(err => {
+	        console.error(`   [${auditoria_id}] No se pudo enviar el email de propuesta admitida:`, err.message);
+	      });
+	      await avisarPropuestaAdmitidaAlEquipo(auditoria_id, metadatos).catch(err => {
+	        console.error(`   [${auditoria_id}] No se pudo avisar al equipo de la propuesta:`, err.message);
+	      });
+	      return;
     }
 
     console.log(`⏳ [${auditoria_id}] Esperando ventana de rate limit...`);
