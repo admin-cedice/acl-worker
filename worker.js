@@ -1792,6 +1792,47 @@ async function devolverCupoPorAuditoria(auditoriaId) {
   }
 }
 
+// ── PERMISO PARA AUDITAR (modo propuesta) ─────────────────────────────────
+// 24 nov 2026 — ENTREGA 1. Requiere migracion-e1-propuestas.sql corrida en
+// Neon ANTES de desplegar esto.
+//
+// Quién puede auditar se decide en la base de datos (función
+// puede_auditar). Next.js hace la misma consulta (lib/permisos.js), así
+// que los dos controles nunca pueden contradecirse.
+//
+// FAIL-CLOSED: si la consulta falla, la respuesta es "no puede auditar"
+// → modo propuesta. Esto es el PERMISO; el cupo se revisa aparte.
+//
+// INTERRUPTOR DE LANZAMIENTO: PROPUESTAS_ACTIVO=true en Railway. Apagado
+// por defecto (al revés que CUPOS_ACTIVOS): mientras no sea exactamente
+// 'true', el pipeline se comporta como hoy.
+//
+// TODAVÍA NADIE LLAMA ESTAS FUNCIONES — se conectan en la Entrega 2.
+
+const PROPUESTAS_ACTIVO = process.env.PROPUESTAS_ACTIVO === 'true';
+
+async function puedeAuditar(ciudadanoId) {
+  if (!ciudadanoId) return false;
+  try {
+    const r = await db.query('SELECT puede_auditar($1) AS ok', [ciudadanoId]);
+    return r.rows[0]?.ok === true;
+  } catch (err) {
+    console.error('⚠️ puedeAuditar: falló la consulta, se trata como modo propuesta (fail-closed):', err.message);
+    return false;
+  }
+}
+
+async function rolEfectivo(ciudadanoId) {
+  if (!ciudadanoId) return 'ciudadano';
+  try {
+    const r = await db.query('SELECT rol_efectivo($1) AS rol', [ciudadanoId]);
+    return r.rows[0]?.rol || 'ciudadano';
+  } catch (err) {
+    console.error('⚠️ rolEfectivo: falló la consulta, se trata como ciudadano (fail-closed):', err.message);
+    return 'ciudadano';
+  }
+}
+
 // GET /cupos/estado?ciudadano_id=... — solo lectura. Requiere
 // x-worker-secret (solo se llama server-to-server, desde Next.js).
 app.get('/cupos/estado', async (req, res) => {
